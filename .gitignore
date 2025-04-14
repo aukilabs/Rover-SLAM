@@ -78,3 +78,7 @@ Vocabulary/superpoint_voc.yml.gz
 *.pyc
 *.osa
 .vscode/settings.json
+
+#CUSTOM
+/opencv/
+/Examples/
