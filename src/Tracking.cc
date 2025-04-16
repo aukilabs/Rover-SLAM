@@ -3960,47 +3960,29 @@ bool Tracking::NeedNewKeyFrame()
  */
 void Tracking::CreateNewKeyFrame()
 {
-    cout << "CreateNewKeyFrame" << endl;
     // 如果局部建图线程正在初始化且没做完或关闭了,就无法插入关键帧
     if(mpLocalMapper->IsInitializing() && !mpAtlas->isImuInitialized())
-    {
-        cout << "early return 1" << endl;
         return;
-    }
     if(!mpLocalMapper->AcceptKeyFrames())
-    {
-        cout << "early return 2" << endl;
         return;
-    }
     if(!mpLocalMapper->SetNotStop(true))
-    {
-        cout << "early return 3" << endl;
         return;
-    }
 
     // Step 1：将当前帧构造成关键帧
     KeyFrame* pKF = new KeyFrame(mCurrentFrame,mpAtlas->GetCurrentMap(),mpKeyFrameDB);
-    cout << "Step 1. pKF created" << endl;
 
     if(mpAtlas->isImuInitialized()) //  || mpLocalMapper->IsInitializing())
-    {
-        cout << "Set pKF->bImu = true" << endl;
         pKF->bImu = true;
-    }
 
     pKF->SetNewBias(mCurrentFrame.mImuBias);
-
     // Step 2：将当前关键帧设置为当前帧的参考关键帧
     // 在UpdateLocalKeyFrames函数中会将与当前关键帧共视程度最高的关键帧设定为当前帧的参考关键帧
     mpReferenceKF = pKF;
     mCurrentFrame.mpReferenceKF = pKF;
-    cout << "Set mCurrentFrame.mpReferenceKF = pKF" << endl;
 
     if(mpLastKeyFrame)
     {
-        cout << "Set pKF->mPrevKF = mpLastKeyFrame" << endl;
         pKF->mPrevKF = mpLastKeyFrame;
-        cout << "Set mpLastKeyFrame->mNextKF = pKF" << endl;
         mpLastKeyFrame->mNextKF = pKF;
     }
     else

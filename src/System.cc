@@ -109,6 +109,11 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
         }
     }
 
+    if (mStrSaveAtlasToFile.empty() && !saveFolderPath.empty())
+    {
+        mStrSaveAtlasToFile = saveFolderPath + "/Atlas.osa";
+    }
+
     // 是否激活回环，默认是开着的
     node = fsSettings["loopClosing"];
     bool activeLC = true;
@@ -624,7 +629,7 @@ void System::Shutdown()
 
     if(!mStrSaveAtlasToFile.empty())
     {
-        std::cout << "开始保存地图" << std::endl;
+        //std::cout << "开始保存地图" << std::endl;
         Verbose::PrintMess("Atlas saving to file " + mStrSaveAtlasToFile, Verbose::VERBOSITY_NORMAL);
         SaveAtlas(FileType::BINARY_FILE);
     }
