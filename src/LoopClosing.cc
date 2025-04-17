@@ -1175,7 +1175,8 @@ bool LoopClosing::DetectCommonRegionsFromBoW_sp(
 
     // CUSTOM
     nBoWMatches *= 5;
-    nBoWInliers *= 500;
+    nBoWInliers *= 5;
+    nSim3Inliers = 20;
 
     // 1. 获取当前帧的共视帧(在共同区域检测中应该避免当前关键帧的共视关键帧中)
     set<KeyFrame*> spConnectedKeyFrames = mpCurrentKF->GetConnectedKeyFrames();
@@ -1478,7 +1479,10 @@ bool LoopClosing::DetectCommonRegionsFromBoW_sp(
 
                 // 3.3.1 重新利用之前计算的mScw信息, 通过投影寻找更多的匹配点
                 //int numProjMatches = matcher.SearchByProjection(mpCurrentKF, mScw, vpMapPoints, vpKeyFrames, vpMatchedMP, vpMatchedKF, 8, 1.5);
-                int numProjMatches = mspmatcher.SearchByProjection(mpCurrentKF, mScw, vpMapPoints, vpKeyFrames, vpMatchedMP, vpMatchedKF, 10, 1.5);
+                //int numProjMatches = mspmatcher.SearchByProjection(mpCurrentKF, mScw, vpMapPoints, vpKeyFrames, vpMatchedMP, vpMatchedKF, 10, 1.5);
+                
+                //CUSTOM
+                int numProjMatches = mspmatcher.SearchByProjection(mpCurrentKF, mScw, vpMapPoints, vpKeyFrames, vpMatchedMP, vpMatchedKF, 8, 1.5);
 
                
 

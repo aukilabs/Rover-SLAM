@@ -1719,7 +1719,7 @@ Sophus::SE3f Tracking::GrabImageMonocular(
     } else {
         GeometricCamera* cam = new Pinhole(frameIntrinsics);
         cam = mpAtlas->AddCamera(cam);
-        //cout << "Added pinhole cam for timestamp " << timestamp << ", intrinsics: ";
+        cout << "Added pinhole cam for timestamp " << timestamp << ", intrinsics: ";
         for(size_t i = 0; i < frameIntrinsics.size(); i++) {
             cout << frameIntrinsics[i];
             if(i < frameIntrinsics.size() - 1) cout << ", ";
@@ -1740,10 +1740,12 @@ Sophus::SE3f Tracking::GrabImageMonocular(
 
     if (mSensor == System::MONOCULAR)
     {
+        GeometricCamera* cam = mFrameCameras.count(timestamp) ? mFrameCameras[timestamp] : mpCamera;
+
         if(mState==NOT_INITIALIZED || mState==NO_IMAGES_YET ||(lastID - initID) < mMaxFrames)
-            mCurrentFrame = Frame(mImGray,timestamp,mpIniExtractor,mpSPVocabulary,mpCamera,mDistCoef,mbf,mThDepth);
+            mCurrentFrame = Frame(mImGray,timestamp,mpIniExtractor,mpSPVocabulary,cam,mDistCoef,mbf,mThDepth);
         else
-            mCurrentFrame = Frame(mImGray,timestamp,mpExtractorLeft,mpSPVocabulary,mpCamera,mDistCoef,mbf,mThDepth);
+            mCurrentFrame = Frame(mImGray,timestamp,mpExtractorLeft,mpSPVocabulary,cam,mDistCoef,mbf,mThDepth);
     }
 
     else if(mSensor == System::IMU_MONOCULAR)

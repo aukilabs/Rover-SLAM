@@ -111,7 +111,7 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
 
     if (mStrSaveAtlasToFile.empty() && !saveFolderPath.empty())
     {
-        mStrSaveAtlasToFile = saveFolderPath + "/Atlas.osa";
+        mStrSaveAtlasToFile = "Atlas";
     }
 
     // 是否激活回环，默认是开着的
@@ -1501,7 +1501,7 @@ void System::SaveAtlas(int type)
         mpAtlas->PreSave();
 
         // 2. 确定文件名字
-        string pathSaveFileName = mSaveFolderPath.empty() ? "./" : mSaveFolderPath;
+        string pathSaveFileName = mSaveFolderPath.empty() ? "./" : mSaveFolderPath + "/";
         pathSaveFileName = pathSaveFileName.append(mStrSaveAtlasToFile);
         pathSaveFileName = pathSaveFileName.append(".osa");
 
