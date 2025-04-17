@@ -84,6 +84,14 @@ namespace ORB_SLAM3 {
         bool needToResize() {return bNeedToResize1_;}
         bool needToRectify() {return bNeedToRectify_;}
 
+        // CUSTOM
+        float resizeWidthFactor() {
+            return bNeedToResize1_ ? (float)newImSize_.width / (float)originalImSize_.width : 1.0f;
+        }
+        float resizeHeightFactor() {
+            return bNeedToResize1_ ? (float)newImSize_.height / (float)originalImSize_.height : 1.0f;
+        }
+
         float noiseGyro() {return noiseGyro_;}
         float noiseAcc() {return noiseAcc_;}
         float gyroWalk() {return gyroWalk_;}

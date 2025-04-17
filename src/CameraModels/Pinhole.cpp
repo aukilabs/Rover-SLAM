@@ -139,7 +139,8 @@ Eigen::Matrix<double, 2, 3> Pinhole::projectJac(const Eigen::Vector3d &v3D)
  * @param vbTriangulated 是否三角化成功，用于统计匹配点数量
  */
 bool Pinhole::ReconstructWithTwoViews(const std::vector<cv::KeyPoint> &vKeys1, const std::vector<cv::KeyPoint> &vKeys2, const std::vector<int> &vMatches12,
-                                        Sophus::SE3f &T21, std::vector<cv::Point3f> &vP3D, std::vector<bool> &vbTriangulated)
+                                        Sophus::SE3f &T21, std::vector<cv::Point3f> &vP3D, std::vector<bool> &vbTriangulated,
+                                        const Eigen::Matrix3f &mK2) // CUSTOM
 {
     if (!tvr)
     {
@@ -147,7 +148,7 @@ bool Pinhole::ReconstructWithTwoViews(const std::vector<cv::KeyPoint> &vKeys1, c
         tvr = new TwoViewReconstruction(K);
     }
 
-    return tvr->Reconstruct(vKeys1, vKeys2, vMatches12, T21, vP3D, vbTriangulated);
+    return tvr->Reconstruct(vKeys1, vKeys2, vMatches12, T21, vP3D, vbTriangulated, mK2);
 }
 
 /**

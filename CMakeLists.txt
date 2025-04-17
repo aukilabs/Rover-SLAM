@@ -8,8 +8,8 @@ ENDIF()
 MESSAGE("Build type: " ${CMAKE_BUILD_TYPE})
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  -Wall   -O3") #其中${CMAKE_C_FLAGS}表示先前在CMake中定义的C语言编译器标志，而-Wall -O3是额外添加到这个变量中的编译器标志。
-#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall   -O3")
-set(CMAKE_CXX_FLAGS "-std=c++14 -Wall -fopenmp -march=native -pthread")
+#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w   -O3")
+set(CMAKE_CXX_FLAGS "-std=c++14 -w -fopenmp -march=native -pthread")
 set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -march=native")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native -O3")
 set(CMAKE_CXX_FLAGS_DEBUG  "${CMAKE_CXX_FLAGS} -g")
@@ -197,6 +197,10 @@ add_executable(mono_inertial_tum_vi
         Examples/Monocular-Inertial/mono_inertial_tum_vi.cc)
 target_link_libraries(mono_inertial_tum_vi ${PROJECT_NAME})
 
+# CUSTOM
+add_executable(mono_inertial_dmt
+        Examples/Monocular-Inertial/mono_inertial_dmt.cc)
+target_link_libraries(mono_inertial_dmt ${PROJECT_NAME})
 
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/Examples/Stereo-Inertial)

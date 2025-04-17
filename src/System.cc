@@ -48,9 +48,11 @@ Verbose::eLevel Verbose::th = Verbose::VERBOSITY_QUIET;
  * @param strSequence 序列名,在跟踪线程和局部建图线程用得到
  */
 System::System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor,
-               const bool bUseViewer, const int initFr, const string &strSequence):
+               const bool bUseViewer, const int initFr, const string &strSequence,
+               const string &saveFolderPath): // CUSTOM
     mSensor(sensor), mpViewer(static_cast<Viewer*>(NULL)), mbReset(false), mbResetActiveMap(false),
-    mbActivateLocalizationMode(false), mbDeactivateLocalizationMode(false), mbShutDown(false)
+    mbActivateLocalizationMode(false), mbDeactivateLocalizationMode(false), mbShutDown(false),
+    mSaveFolderPath(saveFolderPath)
 {
     // Output welcome message
 
@@ -445,7 +447,9 @@ Sophus::SE3f System::TrackRGBD(const cv::Mat &im, const cv::Mat &depthmap, const
  * @param[in] filename          调试用的文件名
  * @return Sophus::SE3f         当前帧位姿Tcw
  */
-Sophus::SE3f System::TrackMonocular(const cv::Mat &im, const double &timestamp, const vector<IMU::Point>& vImuMeas, string filename)
+Sophus::SE3f System::TrackMonocular(const cv::Mat &im, const double &timestamp,
+                                    const vector<IMU::Point>& vImuMeas, string filename,
+                                    std::vector<float> frameIntrinsics)
 {
 
     //cout<<"TrackMonocular(const cv::Mat &im, const double &timestamp"<<endl;
@@ -519,7 +523,14 @@ Sophus::SE3f System::TrackMonocular(const cv::Mat &im, const double &timestamp, 
 
     // 计算相机位姿
     //cout<<"mpTracker->GrabImageMonocular(imToFeed,timestamp,filename);"<<endl;
-    Sophus::SE3f Tcw = mpTracker->GrabImageMonocular(imToFeed,timestamp,filename);
+    if (frameIntrinsics.size() == 4 && settings_->needToResize()) {
+        frameIntrinsics[0] *= settings_->resizeWidthFactor();
+        frameIntrinsics[1] *= settings_->resizeHeightFactor();
+        frameIntrinsics[2] *= settings_->resizeWidthFactor();
+        frameIntrinsics[3] *= settings_->resizeHeightFactor();
+    }
+
+    Sophus::SE3f Tcw = mpTracker->GrabImageMonocular(imToFeed, timestamp, filename, frameIntrinsics);
 
     // 更新跟踪状态和参数
     unique_lock<mutex> lock2(mMutexState);
@@ -1485,7 +1496,7 @@ void System::SaveAtlas(int type)
         mpAtlas->PreSave();
 
         // 2. 确定文件名字
-        string pathSaveFileName = "./";
+        string pathSaveFileName = mSaveFolderPath.empty() ? "./" : mSaveFolderPath;
         pathSaveFileName = pathSaveFileName.append(mStrSaveAtlasToFile);
         pathSaveFileName = pathSaveFileName.append(".osa");
 

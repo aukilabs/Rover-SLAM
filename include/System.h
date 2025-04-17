@@ -103,7 +103,9 @@ public:
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     // Initialize the SLAM system. It launches the Local Mapping, Loop Closing and Viewer threads.
-    System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor, const bool bUseViewer = true, const int initFr = 0, const string &strSequence = std::string());
+    System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor, 
+           const bool bUseViewer = true, const int initFr = 0, const string &strSequence = std::string(),
+           const string &saveFolderPath = std::string()); // CUSTOM
 
     // Proccess the given stereo frame. Images must be synchronized and rectified.
     // Input images: RGB (CV_8UC3) or grayscale (CV_8U). RGB is converted to grayscale.
@@ -119,7 +121,7 @@ public:
     // Proccess the given monocular frame and optionally imu data
     // Input images: RGB (CV_8UC3) or grayscale (CV_8U). RGB is converted to grayscale.
     // Returns the camera pose (empty if tracking fails).
-    Sophus::SE3f TrackMonocular(const cv::Mat &im, const double &timestamp, const vector<IMU::Point>& vImuMeas = vector<IMU::Point>(), string filename="");
+    Sophus::SE3f TrackMonocular(const cv::Mat &im, const double &timestamp, const vector<IMU::Point>& vImuMeas = vector<IMU::Point>(), string filename="", std::vector<float> frameIntrinsics={});
 
 
     // This stops local mapping thread (map building) and performs only camera tracking.
@@ -208,6 +210,9 @@ private:
     SPVocabulary* mpVocabulary_sp;
     // KeyFrame database for place recognition (relocalization and loop detection).
     KeyFrameDatabase* mpKeyFrameDatabase;
+
+    // Save folder path
+    string mSaveFolderPath;
 
     // Map structure that stores the pointers to all KeyFrames and MapPoints.
     //Map* mpMap;

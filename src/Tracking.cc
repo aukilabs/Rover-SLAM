@@ -1691,7 +1691,9 @@ Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, co
  * Step 2 ：构造Frame
  * Step 3 ：跟踪
  */
-Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &timestamp, string filename)
+Sophus::SE3f Tracking::GrabImageMonocular(
+    const cv::Mat &im, const double &timestamp, string filename,
+    std::vector<float> frameIntrinsics) // CUSTOM
 {
     mImGray = im;
     // Step 1 ：将彩色图像转为灰度图像
@@ -1709,6 +1711,22 @@ Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &times
             cvtColor(mImGray,mImGray,cv::COLOR_RGBA2GRAY);
         else
             cvtColor(mImGray,mImGray,cv::COLOR_BGRA2GRAY);
+    }
+
+    // CUSTOM
+    if (frameIntrinsics.empty()) {
+        mFrameCameras[timestamp] = mpCamera;
+    } else {
+        GeometricCamera* cam = new Pinhole(frameIntrinsics);
+        cam = mpAtlas->AddCamera(cam);
+        //cout << "Added pinhole cam for timestamp " << timestamp << ", intrinsics: ";
+        for(size_t i = 0; i < frameIntrinsics.size(); i++) {
+            cout << frameIntrinsics[i];
+            if(i < frameIntrinsics.size() - 1) cout << ", ";
+        }
+        cout << endl;
+
+        mFrameCameras[timestamp] = cam;
     }
 
     // Step 2 ：构造Frame类
@@ -1730,13 +1748,16 @@ Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &times
 
     else if(mSensor == System::IMU_MONOCULAR)
     {
+        GeometricCamera* cam = mFrameCameras.count(timestamp) ? mFrameCameras[timestamp] : mpCamera;
+
         // 判断该帧是不是初始化
         if(mState==NOT_INITIALIZED || mState==NO_IMAGES_YET)  //没有成功初始化的前一个状态就是NO_IMAGES_YET
         {
-            mCurrentFrame = Frame(mImGray,timestamp,mpIniExtractor,mpSPVocabulary,mpCamera,mDistCoef,mbf,mThDepth,&mLastFrame,*mpImuCalib);
+            // Use frame-by-frame camera instead of mpCamera
+            mCurrentFrame = Frame(mImGray,timestamp,mpIniExtractor,mpSPVocabulary,cam,mDistCoef,mbf,mThDepth,&mLastFrame,*mpImuCalib);
         }
         else
-            mCurrentFrame = Frame(mImGray,timestamp,mpIniExtractor,mpSPVocabulary,mpCamera,mDistCoef,mbf,mThDepth,&mLastFrame,*mpImuCalib);
+            mCurrentFrame = Frame(mImGray,timestamp,mpIniExtractor,mpSPVocabulary,cam,mDistCoef,mbf,mThDepth,&mLastFrame,*mpImuCalib);
     }
 
     // t0存储未初始化时的第1帧图像时间戳
@@ -2958,8 +2979,8 @@ void Tracking::MonocularInitialization()
         // Step 5 通过H模型或F模型进行单目初始化，得到两帧间相对运动、初始MapPoints
         Sophus::SE3f Tcw;
         vector<bool> vbTriangulated; // Triangulated Correspondences (mvIniMatches)
-
-        if(mpCamera->ReconstructWithTwoViews(mInitialFrame.mvKeysUn,mCurrentFrame.mvKeysUn,mvIniMatches,Tcw,mvIniP3D,vbTriangulated))
+        auto currentFrameIntrinsics = mCurrentFrame.mpCamera->toK_();
+        if(mCurrentFrame.mpCamera->ReconstructWithTwoViews(mInitialFrame.mvKeysUn,mCurrentFrame.mvKeysUn,mvIniMatches,Tcw,mvIniP3D,vbTriangulated, currentFrameIntrinsics))
         {
             // Step 6 初始化成功后，删除那些无法进行三角化的匹配点
             for(size_t i=0, iend=mvIniMatches.size(); i<iend;i++)
@@ -3939,29 +3960,47 @@ bool Tracking::NeedNewKeyFrame()
  */
 void Tracking::CreateNewKeyFrame()
 {
+    cout << "CreateNewKeyFrame" << endl;
     // 如果局部建图线程正在初始化且没做完或关闭了,就无法插入关键帧
     if(mpLocalMapper->IsInitializing() && !mpAtlas->isImuInitialized())
+    {
+        cout << "early return 1" << endl;
         return;
+    }
     if(!mpLocalMapper->AcceptKeyFrames())
+    {
+        cout << "early return 2" << endl;
         return;
+    }
     if(!mpLocalMapper->SetNotStop(true))
+    {
+        cout << "early return 3" << endl;
         return;
+    }
 
     // Step 1：将当前帧构造成关键帧
     KeyFrame* pKF = new KeyFrame(mCurrentFrame,mpAtlas->GetCurrentMap(),mpKeyFrameDB);
+    cout << "Step 1. pKF created" << endl;
 
     if(mpAtlas->isImuInitialized()) //  || mpLocalMapper->IsInitializing())
+    {
+        cout << "Set pKF->bImu = true" << endl;
         pKF->bImu = true;
+    }
 
     pKF->SetNewBias(mCurrentFrame.mImuBias);
+
     // Step 2：将当前关键帧设置为当前帧的参考关键帧
     // 在UpdateLocalKeyFrames函数中会将与当前关键帧共视程度最高的关键帧设定为当前帧的参考关键帧
     mpReferenceKF = pKF;
     mCurrentFrame.mpReferenceKF = pKF;
+    cout << "Set mCurrentFrame.mpReferenceKF = pKF" << endl;
 
     if(mpLastKeyFrame)
     {
+        cout << "Set pKF->mPrevKF = mpLastKeyFrame" << endl;
         pKF->mPrevKF = mpLastKeyFrame;
+        cout << "Set mpLastKeyFrame->mNextKF = pKF" << endl;
         mpLastKeyFrame->mNextKF = pKF;
     }
     else

@@ -269,7 +269,8 @@ Eigen::Matrix<double, 2, 3> KannalaBrandt8::projectJac(const Eigen::Vector3d &v3
  */
 bool KannalaBrandt8::ReconstructWithTwoViews(
     const std::vector<cv::KeyPoint> &vKeys1, const std::vector<cv::KeyPoint> &vKeys2, const std::vector<int> &vMatches12,
-    Sophus::SE3f &T21, std::vector<cv::Point3f> &vP3D, std::vector<bool> &vbTriangulated)
+    Sophus::SE3f &T21, std::vector<cv::Point3f> &vP3D, std::vector<bool> &vbTriangulated,
+    const Eigen::Matrix3f &mK2) // CUSTOM
 {
     if (!tvr)
     {
@@ -297,7 +298,7 @@ bool KannalaBrandt8::ReconstructWithTwoViews(
     for (size_t i = 0; i < vKeys2.size(); i++)
         vKeysUn2[i].pt = vPts2[i];
 
-    return tvr->Reconstruct(vKeysUn1, vKeysUn2, vMatches12, T21, vP3D, vbTriangulated);
+    return tvr->Reconstruct(vKeysUn1, vKeysUn2, vMatches12, T21, vP3D, vbTriangulated, mK2);
 }
 
 /**

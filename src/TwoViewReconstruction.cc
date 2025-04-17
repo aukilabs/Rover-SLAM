@@ -48,7 +48,8 @@ TwoViewReconstruction::TwoViewReconstruction(const Eigen::Matrix3f &k, float sig
  */
 bool TwoViewReconstruction::Reconstruct(
     const std::vector<cv::KeyPoint> &vKeys1, const std::vector<cv::KeyPoint> &vKeys2, const vector<int> &vMatches12,
-    Sophus::SE3f &T21, vector<cv::Point3f> &vP3D, vector<bool> &vbTriangulated)
+    Sophus::SE3f &T21, vector<cv::Point3f> &vP3D, vector<bool> &vbTriangulated,
+    const Eigen::Matrix3f &mK2) // CUSTOM
 {
     // 1. 准备工作，提取匹配关系及准备RANSAC
     mvKeys1.clear();
@@ -141,12 +142,12 @@ bool TwoViewReconstruction::Reconstruct(
     if (RH > 0.50) // if(RH>0.40)
     {
         // cout << "Initialization from Homography" << endl;
-        return ReconstructH(vbMatchesInliersH, H, mK, T21, vP3D, vbTriangulated, minParallax, 50);
+        return ReconstructH(vbMatchesInliersH, H, mK, T21, vP3D, vbTriangulated, minParallax, 50, mK2);
     }
     else // if(pF_HF>0.6)
     {
         // cout << "Initialization from Fundamental" << endl;
-        return ReconstructF(vbMatchesInliersF, F, mK, T21, vP3D, vbTriangulated, minParallax, 50);
+        return ReconstructF(vbMatchesInliersF, F, mK, T21, vP3D, vbTriangulated, minParallax, 50, mK2);
     }
 }
 
@@ -568,7 +569,8 @@ float TwoViewReconstruction::CheckFundamental(const Eigen::Matrix3f &F21, vector
  */
 bool TwoViewReconstruction::ReconstructF(
     vector<bool> &vbMatchesInliers, Eigen::Matrix3f &F21, Eigen::Matrix3f &K,
-    Sophus::SE3f &T21, vector<cv::Point3f> &vP3D, vector<bool> &vbTriangulated, float minParallax, int minTriangulated)
+    Sophus::SE3f &T21, vector<cv::Point3f> &vP3D, vector<bool> &vbTriangulated, float minParallax, int minTriangulated,
+    const Eigen::Matrix3f &mK2) // CUSTOM
 {
     // 统计了合法的匹配，后面用于对比重建出的点数
     int N = 0;
@@ -596,10 +598,10 @@ bool TwoViewReconstruction::ReconstructF(
     vector<bool> vbTriangulated1, vbTriangulated2, vbTriangulated3, vbTriangulated4;
     float parallax1, parallax2, parallax3, parallax4;
 
-    int nGood1 = CheckRT(R1, t1, mvKeys1, mvKeys2, mvMatches12, vbMatchesInliers, K, vP3D1, 4.0 * mSigma2, vbTriangulated1, parallax1);
-    int nGood2 = CheckRT(R2, t1, mvKeys1, mvKeys2, mvMatches12, vbMatchesInliers, K, vP3D2, 4.0 * mSigma2, vbTriangulated2, parallax2);
-    int nGood3 = CheckRT(R1, t2, mvKeys1, mvKeys2, mvMatches12, vbMatchesInliers, K, vP3D3, 4.0 * mSigma2, vbTriangulated3, parallax3);
-    int nGood4 = CheckRT(R2, t2, mvKeys1, mvKeys2, mvMatches12, vbMatchesInliers, K, vP3D4, 4.0 * mSigma2, vbTriangulated4, parallax4);
+    int nGood1 = CheckRT(R1, t1, mvKeys1, mvKeys2, mvMatches12, vbMatchesInliers, K, vP3D1, 4.0 * mSigma2, vbTriangulated1, parallax1, mK2);
+    int nGood2 = CheckRT(R2, t1, mvKeys1, mvKeys2, mvMatches12, vbMatchesInliers, K, vP3D2, 4.0 * mSigma2, vbTriangulated2, parallax2, mK2);
+    int nGood3 = CheckRT(R1, t2, mvKeys1, mvKeys2, mvMatches12, vbMatchesInliers, K, vP3D3, 4.0 * mSigma2, vbTriangulated3, parallax3, mK2);
+    int nGood4 = CheckRT(R2, t2, mvKeys1, mvKeys2, mvMatches12, vbMatchesInliers, K, vP3D4, 4.0 * mSigma2, vbTriangulated4, parallax4, mK2);
     // 统计重建出点的数量最大值
     int maxGood = max(nGood1, max(nGood2, max(nGood3, nGood4)));
     // 起码要重建出超过百分之90的匹配点
@@ -745,7 +747,8 @@ bool TwoViewReconstruction::ReconstructF(
  */
 bool TwoViewReconstruction::ReconstructH(
     vector<bool> &vbMatchesInliers, Eigen::Matrix3f &H21, Eigen::Matrix3f &K,
-    Sophus::SE3f &T21, vector<cv::Point3f> &vP3D, vector<bool> &vbTriangulated, float minParallax, int minTriangulated)
+    Sophus::SE3f &T21, vector<cv::Point3f> &vP3D, vector<bool> &vbTriangulated, float minParallax, int minTriangulated,
+    const Eigen::Matrix3f &mK2) // CUSTOM
 {
     // 统计了合法的匹配，后面用于对比重建出的点数
     int N = 0;
@@ -910,7 +913,8 @@ bool TwoViewReconstruction::ReconstructH(
         float parallaxi;
         vector<cv::Point3f> vP3Di;
         vector<bool> vbTriangulatedi;
-        int nGood = CheckRT(vR[i], vt[i], mvKeys1, mvKeys2, mvMatches12, vbMatchesInliers, K, vP3Di, 4.0 * mSigma2, vbTriangulatedi, parallaxi);
+        int nGood = CheckRT(vR[i], vt[i], mvKeys1, mvKeys2, mvMatches12, vbMatchesInliers, K, vP3Di, 4.0 * mSigma2, vbTriangulatedi, parallaxi,
+                           mK2); // CUSTOM
 
         // 保留最优的和次优的
         if (nGood > bestGood)
@@ -1016,13 +1020,19 @@ void TwoViewReconstruction::Normalize(const vector<cv::KeyPoint> &vKeys, vector<
 int TwoViewReconstruction::CheckRT(
     const Eigen::Matrix3f &R, const Eigen::Vector3f &t, const vector<cv::KeyPoint> &vKeys1, const vector<cv::KeyPoint> &vKeys2,
     const vector<Match> &vMatches12, vector<bool> &vbMatchesInliers,
-    const Eigen::Matrix3f &K, vector<cv::Point3f> &vP3D, float th2, vector<bool> &vbGood, float &parallax)
+    const Eigen::Matrix3f &K, vector<cv::Point3f> &vP3D, float th2, vector<bool> &vbGood, float &parallax,
+    const Eigen::Matrix3f &mK2) // CUSTOM
 {
     // Calibration parameters
     const float fx = K(0, 0);
     const float fy = K(1, 1);
     const float cx = K(0, 2);
     const float cy = K(1, 2);
+
+    const float fx2 = mK2(0, 0);
+    const float fy2 = mK2(1, 1);
+    const float cx2 = mK2(0, 2);
+    const float cy2 = mK2(1, 2);
 
     vbGood = vector<bool>(vKeys1.size(), false);
     vP3D.resize(vKeys1.size());
@@ -1045,7 +1055,7 @@ int TwoViewReconstruction::CheckRT(
     Eigen::Matrix<float, 3, 4> P2;
     P2.block<3, 3>(0, 0) = R;
     P2.block<3, 1>(0, 3) = t;
-    P2 = K * P2;
+    P2 = mK2 * P2;
 
     // 第二个相机的光心在世界坐标系下的坐标
     Eigen::Vector3f O2 = -R.transpose() * t;
@@ -1116,8 +1126,8 @@ int TwoViewReconstruction::CheckRT(
         // 计算3D点在第二个图像上的投影误差
         float im2x, im2y;
         float invZ2 = 1.0 / p3dC2(2);
-        im2x = fx * p3dC2(0) * invZ2 + cx;
-        im2y = fy * p3dC2(1) * invZ2 + cy;
+        im2x = fx2 * p3dC2(0) * invZ2 + cx2;
+        im2y = fy2 * p3dC2(1) * invZ2 + cy2;
 
         float squareError2 = (im2x - kp2.pt.x) * (im2x - kp2.pt.x) + (im2y - kp2.pt.y) * (im2y - kp2.pt.y);
 
