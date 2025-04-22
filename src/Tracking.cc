@@ -1719,12 +1719,14 @@ Sophus::SE3f Tracking::GrabImageMonocular(
     } else {
         GeometricCamera* cam = new Pinhole(frameIntrinsics);
         cam = mpAtlas->AddCamera(cam);
+        /*
         cout << "Added pinhole cam for timestamp " << timestamp << ", intrinsics: ";
         for(size_t i = 0; i < frameIntrinsics.size(); i++) {
             cout << frameIntrinsics[i];
             if(i < frameIntrinsics.size() - 1) cout << ", ";
         }
         cout << endl;
+        */
 
         mFrameCameras[timestamp] = cam;
     }
