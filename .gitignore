@@ -80,5 +80,17 @@ Vocabulary/superpoint_voc.yml.gz
 .vscode/settings.json
 
 #CUSTOM
+/outputs/
 /opencv/
-/Examples/
+/Examples/Monocular-Inertial/mono_inertial_dmt
+venv/
+voc_binary_tartan_8u_6.zip
+/lib
+/libncurses5_6.3-2ubuntu0.1_amd64.deb
+/libncursesw5_6.3-2ubuntu0.1_amd64.deb
+/libtinfo5_6.3-2ubuntu0.1_amd64.deb
+/onnxruntime-linux-x64-gpu-1.16.3/
+/onnxruntime-linux-x64-gpu-1.16.3.tgz
+/nvhpc_2022_2211_Linux_x86_64_cuda_multi.tar.gz
+/cuda_10.2.89_440.33.01_linux.run
+/cuda-keyring_1.1-1_all.deb
