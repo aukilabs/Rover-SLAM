@@ -74,6 +74,7 @@ int main(int argc, char *argv[])
     nImu.resize(num_seq);
 
     bool bUseIntrinsicsFile = true;
+    bool bUseIMU = false;
 
     string output_folder = argv[argc - 1];
     cout << "Output folder: " << output_folder << endl;
@@ -145,8 +146,10 @@ int main(int argc, char *argv[])
 
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
     bool bUseViewer = true;
-    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::IMU_MONOCULAR, bUseViewer,
-                          0, "", output_folder);
+    ORB_SLAM3::System SLAM(
+        argv[1],argv[2],
+        bUseIMU ? ORB_SLAM3::System::IMU_MONOCULAR : ORB_SLAM3::System::MONOCULAR,
+        bUseViewer, 0, "", output_folder);
 
     float imageScale = SLAM.GetImageScale();
 
@@ -225,12 +228,18 @@ int main(int argc, char *argv[])
             if (bUseIntrinsicsFile) {
                 long long frametimeNs = static_cast<long long>(tframe * 1e9);
                 auto frameIntrinsics = vMapCamIntrinsics[seq][frametimeNs];
-                SLAM.TrackMonocular(im, tframe, vImuMeas, "", frameIntrinsics);
-                //SLAM.TrackMonocular(im, tframe, vector<ORB_SLAM3::IMU::Point>(), "", frameIntrinsics);
+                SLAM.TrackMonocular(
+                    im, tframe,
+                    bUseIMU ? vImuMeas : vector<ORB_SLAM3::IMU::Point>(),
+                    "", frameIntrinsics
+                );
             }
             else {
-                SLAM.TrackMonocular(im, tframe, vImuMeas);
-                //SLAM.TrackMonocular(im, tframe, vector<ORB_SLAM3::IMU::Point>(), "", {});
+                SLAM.TrackMonocular(
+                    im, tframe,
+                    bUseIMU ? vImuMeas : vector<ORB_SLAM3::IMU::Point>(),
+                    "", {}
+                );
             }
 
     #ifdef COMPILEDWITHC11
