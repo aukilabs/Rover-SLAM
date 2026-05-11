@@ -4,6 +4,10 @@
 
 This is the Phase 1 implementation of the real-time SLAM server that converts the ORB-SLAM3 monocular tracking system into a REST API service. The server receives images over HTTP and returns pose estimates in real-time.
 
+**Full HTTP API reference (request headers, raw vs JSON, errors, CORS):** [slam_server_api.md](slam_server_api.md).
+
+**Phone camera UI:** with the server running, open `http://<PC-LAN-IP>:<port>/index.html` on your phone (same Wi‑Fi). Source file: [index.html](index.html) (served by the binary from that path next to `slam_server`).
+
 ## Features Implemented (Phase 1)
 
 ### ✅ Core Server Infrastructure

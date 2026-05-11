@@ -17,6 +17,8 @@
 #include <memory>
 #include <unordered_map>
 #include <csignal>
+#include <iterator>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -48,6 +50,8 @@ struct ServerConfig {
     bool use_viewer = false;
     int max_queue_size = 10;
     double processing_timeout = 5.0; // seconds
+    /** UTF-8 HTML for GET /index.html (phone camera UI); empty => 404 with hint */
+    string index_html_body;
 };
 
 // Image request structure
@@ -95,9 +99,10 @@ private:
     atomic<uint64_t> successful_tracks_{0};
     atomic<uint64_t> failed_tracks_{0};
     atomic<double> avg_processing_time_{0.0};
+    string index_html_body_;
     
 public:
-    SLAMServer(const ServerConfig& config) : config_(config) {
+    SLAMServer(const ServerConfig& config) : config_(config), index_html_body_(config.index_html_body) {
         // Initialize SLAM system
         slam_system_ = make_unique<ORB_SLAM3::System>(
             config_.vocabulary_path, 
@@ -120,6 +125,8 @@ public:
         cout << "Vocabulary: " << config_.vocabulary_path << endl;
         cout << "Settings: " << config_.settings_path << endl;
         cout << "Output directory: " << config_.output_dir << endl;
+        if (!index_html_body_.empty())
+            cout << "Phone stream UI: http://<this-host>:" << config_.port << "/index.html" << endl;
     }
     
     ~SLAMServer() {
@@ -163,7 +170,7 @@ private:
         http_server_->set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
             res.set_header("Access-Control-Allow-Origin", "*");
             res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            res.set_header("Access-Control-Allow-Headers", "Content-Type");
+            res.set_header("Access-Control-Allow-Headers", "Content-Type, X-Intrinsics, X-Client-ID");
             return httplib::Server::HandlerResponse::Unhandled;
         });
         
@@ -172,6 +179,20 @@ private:
             return;
         });
         
+        // Static phone stream UI (same origin as API)
+        http_server_->Get("/index.html", [this](const httplib::Request&, httplib::Response& res) {
+            if (index_html_body_.empty()) {
+                res.status = 404;
+                res.set_content(
+                    "index.html not found. Place index.html next to the slam_server executable "
+                    "(same folder as Examples/Monocular/slam_server when using default CMake output).",
+                    "text/plain; charset=utf-8");
+                return;
+            }
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(index_html_body_, "text/html; charset=utf-8");
+        });
+
         // Main tracking endpoint
         http_server_->Post("/api/v1/track", [this](const httplib::Request& req, httplib::Response& res) {
             handleTrackRequest(req, res);
@@ -317,6 +338,7 @@ private:
         response["message"] = "ORB-SLAM3 Real-Time Server";
         response["version"] = "1.0.0";
         response["endpoints"] = {
+            {"GET /index.html", "Phone camera stream UI (static page)"},
             {"POST /api/v1/track", "Submit image for tracking"},
             {"GET /api/v1/status", "Get server status"},
             {"GET /api/v1/trajectory", "Get trajectory data"},
@@ -515,6 +537,33 @@ private:
     chrono::steady_clock::time_point server_start_time_ = chrono::steady_clock::now();
 };
 
+static string exe_parent_dir(const char* argv0) {
+    if (!argv0)
+        return ".";
+    string p(argv0);
+    size_t pos = p.find_last_of("/\\");
+    if (pos == string::npos)
+        return ".";
+    return p.substr(0, pos);
+}
+
+static string load_index_html_body(const char* argv0) {
+    const string d = exe_parent_dir(argv0);
+    vector<string> paths = {d + "/index.html", d + "\\index.html", string("Examples/Monocular/index.html")};
+    for (const auto& path : paths) {
+        ifstream f(path, ios::binary);
+        if (f.good()) {
+            string s((istreambuf_iterator<char>(f)), istreambuf_iterator<char>());
+            if (!s.empty()) {
+                cout << "Loaded stream UI from " << path << " (" << s.size() << " bytes)" << endl;
+                return s;
+            }
+        }
+    }
+    cerr << "Warning: index.html not found; GET /index.html returns 404 (checked next to slam_server and Examples/Monocular/index.html)." << endl;
+    return {};
+}
+
 void printUsage() {
     cout << endl << "Usage: ./slam_server path_to_vocabulary path_to_settings [options]" << endl;
     cout << "Options:" << endl;
@@ -557,6 +606,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+    
+    config.index_html_body = load_index_html_body(argv[0]);
     
     try {
         cout << "Initializing SLAM Server..." << endl;

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Rover-SLAM phone stream</title>
+  <style>
+    :root { --bg: #0f1115; --fg: #e8eaed; --muted: #9aa0a6; --accent: #3b82f6; --err: #f87171; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--fg); padding: 12px; max-width: 520px; margin-inline: auto; }
+    h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 8px; }
+    p.hint { font-size: 0.8rem; color: var(--muted); margin: 0 0 12px; line-height: 1.4; }
+    video { display: none; }
+    canvas { width: 100%; border-radius: 8px; background: #000; display: block; margin-bottom: 12px; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+    label { font-size: 0.85rem; color: var(--muted); }
+    button, select { font-size: 1rem; padding: 10px 14px; border-radius: 8px; border: none; cursor: pointer; }
+    button.primary { background: var(--accent); color: #fff; flex: 1; min-width: 120px; }
+    button.danger { background: #374151; color: #fff; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    select { background: #1f2937; color: var(--fg); flex: 1; }
+    input[type="range"] { flex: 1; min-width: 100px; }
+    .status { font-size: 0.8rem; color: var(--muted); white-space: pre-wrap; word-break: break-word; min-height: 3.5em; }
+    .status.err { color: var(--err); }
+    fieldset { border: 1px solid #2d3340; border-radius: 8px; margin: 12px 0; padding: 10px; }
+    legend { font-size: 0.8rem; color: var(--muted); padding: 0 6px; }
+    .intrinsics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .intrinsics input { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid #2d3340; background: #1a1d24; color: var(--fg); }
+  </style>
+</head>
+<body>
+  <h1>Rover-SLAM stream</h1>
+  <p class="hint">Same Wi‑Fi as this PC. Start camera, then frames POST to this server’s <code>/api/v1/track</code>. Use <strong>--viewer</strong> on the PC to see the map. iOS may require HTTPS for camera; try Android or <code>localhost</code> tunnel first.</p>
+
+  <video id="vid" playsinline muted></video>
+  <canvas id="cv"></canvas>
+
+  <div class="row">
+    <button type="button" class="primary" id="btnStart">Start camera</button>
+    <button type="button" class="danger" id="btnStop" disabled>Stop</button>
+  </div>
+  <div class="row">
+    <label for="facing">Camera</label>
+    <select id="facing">
+      <option value="environment">Back (environment)</option>
+      <option value="user">Front (user)</option>
+    </select>
+  </div>
+  <div class="row">
+    <label for="fps">Target FPS</label>
+    <input type="range" id="fps" min="1" max="30" value="10" />
+    <span id="fpsVal">10</span>
+  </div>
+  <div class="row">
+    <label for="qual">JPEG quality</label>
+    <input type="range" id="qual" min="0.3" max="0.95" step="0.05" value="0.75" />
+    <span id="qualVal">0.75</span>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="sendK" /> Send intrinsics (fx fy cx cy) for <strong>canvas</strong> size</label>
+  </div>
+  <fieldset>
+    <legend>Optional intrinsics (only if checked above)</legend>
+    <div class="intrinsics">
+      <input type="number" id="fx" placeholder="fx" step="any" />
+      <input type="number" id="fy" placeholder="fy" step="any" />
+      <input type="number" id="cx" placeholder="cx" step="any" />
+      <input type="number" id="cy" placeholder="cy" step="any" />
+    </div>
+  </fieldset>
+  <div class="status" id="status">Idle.</div>
+
+  <script>
+(function () {
+  const vid = document.getElementById('vid');
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  const btnStart = document.getElementById('btnStart');
+  const btnStop = document.getElementById('btnStop');
+  const facing = document.getElementById('facing');
+  const fpsEl = document.getElementById('fps');
+  const fpsVal = document.getElementById('fpsVal');
+  const qualEl = document.getElementById('qual');
+  const qualVal = document.getElementById('qualVal');
+  const sendK = document.getElementById('sendK');
+  const status = document.getElementById('status');
+  const fx = document.getElementById('fx');
+  const fy = document.getElementById('fy');
+  const cx = document.getElementById('cx');
+  const cy = document.getElementById('cy');
+
+  let stream = null;
+  let timer = null;
+  let frameId = 1;
+  let inFlight = 0;
+  const maxW = 960;
+
+  function setStatus(msg, isErr) {
+    status.textContent = msg;
+    status.classList.toggle('err', !!isErr);
+  }
+
+  fpsEl.addEventListener('input', function () { fpsVal.textContent = fpsEl.value; });
+  qualEl.addEventListener('input', function () { qualVal.textContent = qualEl.value; });
+
+  function layoutCanvas() {
+    if (!vid.videoWidth) return;
+    let w = vid.videoWidth;
+    let h = vid.videoHeight;
+    if (w > maxW) {
+      h = Math.round(h * (maxW / w));
+      w = maxW;
+    }
+    cv.width = w;
+    cv.height = h;
+  }
+
+  async function start() {
+    setStatus('Requesting camera…');
+    btnStart.disabled = true;
+    try {
+      if (stream) {
+        stream.getTracks().forEach(function (t) { t.stop(); });
+        stream = null;
+      }
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: facing.value }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+      vid.srcObject = stream;
+      await vid.play();
+      layoutCanvas();
+      const fps = Math.max(1, Math.min(30, parseInt(fpsEl.value, 10) || 10));
+      const period = Math.round(1000 / fps);
+      timer = setInterval(tick, period);
+      btnStop.disabled = false;
+      setStatus('Streaming at ~' + fps + ' FPS (JPEG ' + qualEl.value + ').');
+    } catch (e) {
+      setStatus('Camera error: ' + (e && e.message ? e.message : String(e)), true);
+      btnStart.disabled = false;
+    }
+  }
+
+  function tick() {
+    if (!stream || !vid.videoWidth) return;
+    layoutCanvas();
+    ctx.drawImage(vid, 0, 0, cv.width, cv.height);
+    const q = parseFloat(qualEl.value) || 0.75;
+    const dataUrl = cv.toDataURL('image/jpeg', q);
+    const comma = dataUrl.indexOf(',');
+    const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+    const fid = frameId++;
+    const body = {
+      image_base64: b64,
+      timestamp: Date.now() / 1000,
+      frame_id: fid
+    };
+    if (sendK.checked) {
+      const k = [parseFloat(fx.value), parseFloat(fy.value), parseFloat(cx.value), parseFloat(cy.value)];
+      if (k.every(function (x) { return !isNaN(x); })) body.intrinsics = k;
+    }
+    inFlight++;
+    fetch('/api/v1/track', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (_ref) {
+        inFlight--;
+        if (!_ref.ok) setStatus('HTTP ' + (_ref.j && _ref.j.error ? _ref.j.error : 'error'), true);
+        else if (fid % 30 === 0) setStatus('Queued frame ' + fid + ' (in-flight ~' + inFlight + ').');
+      })
+      .catch(function (e) {
+        inFlight--;
+        setStatus('Network: ' + (e && e.message ? e.message : String(e)), true);
+      });
+  }
+
+  function stop() {
+    if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+    if (stream) {
+      stream.getTracks().forEach(function (t) { t.stop(); });
+      stream = null;
+    }
+    vid.srcObject = null;
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    setStatus('Stopped.');
+  }
+
+  btnStart.addEventListener('click', start);
+  btnStop.addEventListener('click', stop);
+})();
+  </script>
+</body>
+</html>
