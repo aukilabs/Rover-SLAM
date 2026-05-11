@@ -54,13 +54,22 @@ find_package(Gflags REQUIRED)
 find_package(Glog REQUIRED)
 # find_package(realsense2)
 
+# ONNX Runtime GPU 1.16.3: extract tarball next to the repo or pass -DONNXRUNTIME_ROOT=...
+set(ONNXRUNTIME_ROOT "${PROJECT_SOURCE_DIR}/onnxruntime-linux-x64-gpu-1.16.3" CACHE PATH "Root of extracted onnxruntime-linux-x64-gpu-1.16.3 (must contain include/ and lib/)")
+if(NOT EXISTS "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so")
+  message(FATAL_ERROR "ONNX Runtime not found at ONNXRUNTIME_ROOT=${ONNXRUNTIME_ROOT}\n"
+    "  Expected file: ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so\n"
+    "  Extract onnxruntime-linux-x64-gpu-1.16.3 into the repo root, or run cmake with:\n"
+    "  cmake -DONNXRUNTIME_ROOT=/path/to/onnxruntime-linux-x64-gpu-1.16.3 ..")
+endif()
+
 include_directories(
 ${PROJECT_SOURCE_DIR}
 ${PROJECT_SOURCE_DIR}/include
 ${PROJECT_SOURCE_DIR}/include/CameraModels
 ${PROJECT_SOURCE_DIR}/Thirdparty/Sophus
 ${EIGEN3_INCLUDE_DIR}
-/mnt/c/Repositories/Rover-SLAM/onnxruntime-linux-x64-gpu-1.16.3/include
+${ONNXRUNTIME_ROOT}/include
 ${CUDA_INCLUDE_DIRS}
 ${Boost_INCLUDE_DIRS}
 ${YAML_CPP_INCLUDE_DIR}
@@ -158,7 +167,7 @@ ${PROJECT_SOURCE_DIR}/Thirdparty/DBoW3/lib/libDBoW3.so
 ${PROJECT_SOURCE_DIR}/Thirdparty/g2o/lib/libg2o.so
 -lboost_serialization
 -lcrypto
-/mnt/c/Repositories/Rover-SLAM/onnxruntime-linux-x64-gpu-1.16.3/lib/libonnxruntime.so
+${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so
 )
 
 
