@@ -163,6 +163,9 @@ void LocalMapping::Run()
             vdMPCreation_ms.push_back(timeMPCreation);
 #endif
 
+            // Lightweight focal refinement for current KF before LBA (mono only)
+            RefineCurrentKFFocalLength();
+
             bool b_doneLBA = false;
             int num_FixedKF_BA = 0;
             int num_OptKF_BA = 0;
@@ -951,6 +954,167 @@ void LocalMapping::CreateNewMapPoints()
     mpTracker->mpExtractorLeft->lastmatchnum = matchmean;
     mpTracker->mpIniExtractor->lastmatchnum = matchmean;
     
+}
+
+void LocalMapping::RefineCurrentKFFocalLength()
+{
+    if(!mbMonocular) return;
+    if(!mpCurrentKeyFrame) return;
+    if(!mpCurrentKeyFrame->mpCamera) return;
+    if(mpCurrentKeyFrame->mpCamera->GetType() != GeometricCamera::CAM_PINHOLE) return;
+
+    // Collect last up-to-5 temporal neighbors including previous KFs along the spanning chain
+    std::vector<KeyFrame*> neighbors;
+    neighbors.push_back(mpCurrentKeyFrame);
+    KeyFrame* prev = mpCurrentKeyFrame->mPrevKF;
+    while(prev && neighbors.size() < 5)
+    {
+        if(!prev->isBad()) neighbors.push_back(prev);
+        prev = prev->mPrevKF;
+    }
+
+    // Prepare variables
+    float fx0 = mpCurrentKeyFrame->fx;
+    float fy0 = mpCurrentKeyFrame->fy;
+    float cx0 = mpCurrentKeyFrame->cx;
+    float cy0 = mpCurrentKeyFrame->cy;
+
+    float fx = fx0;
+    float fy = fy0;
+
+    // Soft bounds around initial config (use KeyFrame's current as proxy for config)
+    const float fx_min = fx0 * 0.8f;
+    const float fx_max = fx0 * 1.2f;
+    const float fy_min = fy0 * 0.8f;
+    const float fy_max = fy0 * 1.2f;
+
+    // Prior center: average of recent neighbors' camera focals if available
+    float fx_prev = 0.0f;
+    float fy_prev = 0.0f;
+    int count_prev = 0;
+    for(size_t i=1; i<neighbors.size(); ++i)
+    {
+        KeyFrame* kf = neighbors[i];
+        if(!kf || !kf->mpCamera) continue;
+        fx_prev += kf->mpCamera->getParameter(0);
+        fy_prev += kf->mpCamera->getParameter(1);
+        count_prev++;
+    }
+    if(count_prev == 0){ fx_prev = fx0; fy_prev = fy0; }
+    else { fx_prev /= count_prev; fy_prev /= count_prev; }
+
+    const float prior_sigma_frac = 0.2f; // Lower means stronger prior
+    const float w_fx_prior = 1.0f / (prior_sigma_frac * fx_prev * prior_sigma_frac * fx_prev);
+    const float w_fy_prior = 1.0f / (prior_sigma_frac * fy_prev * prior_sigma_frac * fy_prev);
+
+    // One or two Gauss-Newton iterations are enough
+    for(int iter=0; iter<2; ++iter)
+    {
+        double H11=0.0, H12=0.0, H22=0.0; // Hessian (fx, fy)
+        double b1=0.0, b2=0.0;           // gradient
+
+        // Accumulate residuals over observations in the selected neighbors
+        for(KeyFrame* pKF : neighbors)
+        {
+            if(!pKF || pKF->isBad()) continue;
+            const Sophus::SE3f Tcw = mpCurrentKeyFrame->GetPose();
+            const Sophus::SE3f Tiw = pKF->GetPose();
+            Sophus::SE3f Tij = Tcw * pKF->GetPoseInverse();
+
+            const vector<MapPoint*> vMPs = pKF->GetMapPointMatches();
+            for(size_t i=0;i<vMPs.size();++i)
+            {
+                MapPoint* pMP = vMPs[i];
+                if(!pMP || pMP->isBad()) continue;
+
+                const int idx = i;
+                if(idx<0 || idx>= (int)pKF->mvKeysUn.size()) continue;
+                const cv::KeyPoint &kp = pKF->mvKeysUn[idx];
+
+                // Project MP into current KF using current pose and 3D
+                Eigen::Vector3f Pw = pMP->GetWorldPos();
+                Eigen::Vector3f Pc = Tcw * Pw;
+                const float Z = Pc.z();
+                if(Z <= 0.0f) continue;
+                const float X = Pc.x();
+                const float Y = Pc.y();
+
+                // Use measurement from pKF but align indices; we minimize reprojection in current KF's image plane
+                // For temporal neighbors, we do not have 2D of current KF; instead use current KF own observations
+                // Simplify: only use observations from current KF itself
+                if(pKF != mpCurrentKeyFrame) continue;
+
+                // observation in current KF
+                const cv::KeyPoint &z = mpCurrentKeyFrame->mvKeysUn[idx];
+                const float u_obs = z.pt.x;
+                const float v_obs = z.pt.y;
+
+                const float invZ = 1.0f / Z;
+                const float x_over_z = X * invZ;
+                const float y_over_z = Y * invZ;
+
+                const float u_pred = fx * x_over_z + cx0;
+                const float v_pred = fy * y_over_z + cy0;
+
+                const float rx = u_obs - u_pred;
+                const float ry = v_obs - v_pred;
+
+                // Jacobians wrt fx, fy
+                const float Jfx = -x_over_z;
+                const float Jfy = -y_over_z;
+
+                // Use level-based weighting as in BA
+                const float invSigma2 = mpCurrentKeyFrame->mvInvLevelSigma2[z.octave];
+
+                const double w = invSigma2;
+                H11 += w * (Jfx*Jfx);
+                H22 += w * (Jfy*Jfy);
+                // No cross term; model separates u and v w.r.t fx, fy
+                b1  += w * (Jfx*rx);
+                b2  += w * (Jfy*ry);
+            }
+        }
+
+        // Add priors
+        H11 += w_fx_prior;
+        b1 += w_fx_prior * (fx_prev - fx);
+        H22 += w_fy_prior;
+        b2 += w_fy_prior * (fy_prev - fy);
+
+        // Levenberg-Marquardt damping
+        //const double lambda = 0.01;
+        //H11 *= (1.0 + lambda);
+        //H22 *= (1.0 + lambda);
+
+        // Solve 2x2 diagonal system
+        double dfx = (H11>0.0) ? (b1 / H11) : 0.0;
+        double dfy = (H22>0.0) ? (b2 / H22) : 0.0;
+
+        // Limit per-iteration step to 2% of original
+        const double step_lim_fx = 0.02 * fx0;
+        const double step_lim_fy = 0.02 * fy0;
+        if(dfx > step_lim_fx) dfx = step_lim_fx; else if(dfx < -step_lim_fx) dfx = -step_lim_fx;
+        if(dfy > step_lim_fy) dfy = step_lim_fy; else if(dfy < -step_lim_fy) dfy = -step_lim_fy;
+
+        fx += static_cast<float>(dfx);
+        fy += static_cast<float>(dfy);
+
+        // Clamp to soft bounds
+        if(fx < fx_min) fx = fx_min; else if(fx > fx_max) fx = fx_max;
+        if(fy < fy_min) fy = fy_min; else if(fy > fy_max) fy = fy_max;
+    }
+
+    // Exponential smoothing towards previous focal to avoid oscillation
+    const float alpha = 0.3f; // blend factor
+    fx = alpha * fx + (1.0f - alpha) * fx_prev;
+    fy = alpha * fy + (1.0f - alpha) * fy_prev;
+
+    // Debug print
+    std::cout << "Refine fx,fy: (" << fx_prev << ", " << fy_prev << ") -> (" << fx << ", " << fy << ")" << std::endl;
+
+    // Apply to camera and keyframe cached intrinsics
+    mpCurrentKeyFrame->mpCamera->setParameter(fx, 0);
+    mpCurrentKeyFrame->mpCamera->setParameter(fy, 1);
 }
 
 // Eigen::Matrix<double, 6, 6> LocalMapping::Initinformation(const vector<Eigen::Vector3d>& pointSet,double fx, double fy){

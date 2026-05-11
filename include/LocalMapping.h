@@ -139,6 +139,9 @@ protected:
     void SearchInNeighbors();
     void KeyFrameCulling();
 
+    // Lightweight per-keyframe intrinsics refinement (fx, fy) before LBA
+    void RefineCurrentKFFocalLength();
+
     System *mpSystem;
 
     bool mbMonocular;

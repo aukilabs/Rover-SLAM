@@ -14,25 +14,25 @@ loopClosing: 1
 # 707.15, 717.47, 640, 360, 0.00423664, -0.0953159, -0.00359639, -0.00170014 (colmap)
 # 706.51, 716.387, 640, 360, 0.00418667, -0.0936161, -0.00239247, -0.000998352 (colmap 2)
 # 704.07, 714.39, 640, 360, -0.000620502, -0.0884254, -0.0018504, -0.000636303 (after bundle adjustment)
-# 704.311, 714.474, 640.218, 59.737, -0.000505042, -0.0885923, -0.00182754, -0.000646933 (Second BA, also including principal point)
+# 704.311, 714.474, 640.218, 359.737, -0.000505042, -0.0885923, -0.00182754, -0.000646933 (Second BA, also including principal point)
 # Colmap new:
 # 702.472, 712.58, 640, 360, -0.00556547, -0.0820532, -0.00103476, -2.73297e-05
 # 696.994, 707.906, 640, 360, -0.0114368, -0.0785617, -0.00222728, 0.000880309
-Camera1.fx: 696.994
-Camera1.fy: 707.906
-Camera1.cx: 640.0
-Camera1.cy: 360.0
+Camera1.fx: 704.311
+Camera1.fy: 714.474
+Camera1.cx: 640.218
+Camera1.cy: 359.737
 
-Camera1.k1: -0.0114368
-Camera1.k2: -0.0785617
-Camera1.p1: -0.00222728
-Camera1.p2: 0.000880309
+Camera1.k1: -0.000505042
+Camera1.k2: -0.0885923
+Camera1.p1: -0.00182754
+Camera1.p2: -0.000646933
 
 # Camera resolution
 Camera.width: 1280
 Camera.height: 720
 
-Camera.newWidth: 640
+Camera.newWidth: 480
 Camera.newHeight: 360
 
 # Camera frames per second 
