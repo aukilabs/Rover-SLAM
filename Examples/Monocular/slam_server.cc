@@ -19,6 +19,7 @@
 #include <csignal>
 #include <iterator>
 #include <vector>
+#include <atomic>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -100,10 +101,13 @@ private:
     atomic<uint64_t> failed_tracks_{0};
     atomic<double> avg_processing_time_{0.0};
     string index_html_body_;
-    
+    atomic<bool> shutdown_done_{false};
+
 public:
     SLAMServer(const ServerConfig& config) : config_(config), index_html_body_(config.index_html_body) {
         // Initialize SLAM system
+        // Empty save folder: do not auto-enable System.SaveAtlasToFile default "Atlas"
+        // (server exits often; atlas I/O is slow and usually not needed here).
         slam_system_ = make_unique<ORB_SLAM3::System>(
             config_.vocabulary_path, 
             config_.settings_path,
@@ -111,7 +115,7 @@ public:
             config_.use_viewer,
             0, 
             "",
-            config_.output_dir
+            ""
         );
         
         // Initialize HTTP server
@@ -124,7 +128,8 @@ public:
         cout << "SLAM Server initialized successfully" << endl;
         cout << "Vocabulary: " << config_.vocabulary_path << endl;
         cout << "Settings: " << config_.settings_path << endl;
-        cout << "Output directory: " << config_.output_dir << endl;
+        if (!config_.output_dir.empty())
+            cout << "Output directory (reserved / not used for ORB atlas save): " << config_.output_dir << endl;
         if (!index_html_body_.empty())
             cout << "Phone stream UI: http://<this-host>:" << config_.port << "/index.html" << endl;
     }
@@ -139,8 +144,18 @@ public:
             throw runtime_error("Failed to start HTTP server on port " + to_string(config_.port));
         }
     }
+
+    /** Async-signal-safe enough for SIGINT: only closes the listen socket (unblocks listen). */
+    void requestStop() {
+        if (http_server_)
+            http_server_->stop();
+    }
     
     void shutdown() {
+        bool expected = false;
+        if (!shutdown_done_.compare_exchange_strong(expected, true))
+            return;
+
         cout << "Shutting down SLAM server..." << endl;
         
         // Stop HTTP server
@@ -481,6 +496,9 @@ private:
         TrackingResponse response;
         response.timestamp = request->timestamp;
         response.frame_id = request->frame_id;
+
+        cout << "Frame " << request->frame_id << " image resolution: "
+             << request->image.cols << " x " << request->image.rows << endl;
         
         try {
             lock_guard<mutex> slam_lock(slam_mutex_);
@@ -564,6 +582,14 @@ static string load_index_html_body(const char* argv0) {
     return {};
 }
 
+// Plain function for signal(); must not capture (signal() needs a C function pointer).
+static SLAMServer* g_active_server = nullptr;
+
+static void signalStopListen(int /*sig*/) {
+    if (g_active_server)
+        g_active_server->requestStop();
+}
+
 void printUsage() {
     cout << endl << "Usage: ./slam_server path_to_vocabulary path_to_settings [options]" << endl;
     cout << "Options:" << endl;
@@ -613,17 +639,21 @@ int main(int argc, char* argv[]) {
         cout << "Initializing SLAM Server..." << endl;
         SLAMServer server(config);
         
-        // Set up signal handlers for graceful shutdown
-        static SLAMServer* server_ptr = &server;
-        signal(SIGINT, [](int) {
-            cout << "\nShutdown signal received..." << endl;
-            if (server_ptr) {
-                server_ptr->shutdown();
-            }
-            exit(0);
-        });
-        
+        // Unblock listen() from a signal handler — do not run full shutdown() in the handler
+        // (locks, joins, iostream are not async-signal-safe on POSIX).
+        g_active_server = &server;
+        signal(SIGINT, signalStopListen);
+#ifndef _WIN32
+#ifdef SIGTERM
+        signal(SIGTERM, signalStopListen);
+#endif
+#endif
+
         server.start();
+
+        cerr << "\nHTTP server stopped, shutting down SLAM..." << endl;
+        server.shutdown();
+        g_active_server = nullptr;
         
     } catch (const exception& e) {
         cerr << "Error: " << e.what() << endl;
