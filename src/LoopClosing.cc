@@ -1174,9 +1174,15 @@ bool LoopClosing::DetectCommonRegionsFromBoW_sp(
     int nProjOptMatches = 80; // 通过更小的半径,更严的距离搜索到的匹配点数量
 
     // CUSTOM
-    nBoWMatches *= 5;
-    nBoWInliers *= 5;
-    nSim3Inliers = 20;
+    nBoWMatches = 30;
+    nBoWInliers = 20;
+    nSim3Inliers = 15;
+    nProjMatches = 70; //100
+    nProjOptMatches = 30;
+
+    //nBoWMatches *= 3; // 5;
+    //nBoWInliers *= 3; // 5;
+    //nSim3Inliers = 20;
 
     // 1. 获取当前帧的共视帧(在共同区域检测中应该避免当前关键帧的共视关键帧中)
     set<KeyFrame*> spConnectedKeyFrames = mpCurrentKF->GetConnectedKeyFrames();
