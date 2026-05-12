@@ -1174,9 +1174,9 @@ bool LoopClosing::DetectCommonRegionsFromBoW_sp(
     int nProjOptMatches = 80; // 通过更小的半径,更严的距离搜索到的匹配点数量
 
     // CUSTOM
-    nBoWMatches = 30;
-    nBoWInliers = 20;
-    nSim3Inliers = 15;
+    //nBoWMatches = 30;
+    //nBoWInliers = 20;
+    //nSim3Inliers = 15;
     nProjMatches = 70; //100
     nProjOptMatches = 30;
 
@@ -1485,10 +1485,10 @@ bool LoopClosing::DetectCommonRegionsFromBoW_sp(
 
                 // 3.3.1 重新利用之前计算的mScw信息, 通过投影寻找更多的匹配点
                 //int numProjMatches = matcher.SearchByProjection(mpCurrentKF, mScw, vpMapPoints, vpKeyFrames, vpMatchedMP, vpMatchedKF, 8, 1.5);
-                //int numProjMatches = mspmatcher.SearchByProjection(mpCurrentKF, mScw, vpMapPoints, vpKeyFrames, vpMatchedMP, vpMatchedKF, 10, 1.5);
+                int numProjMatches = mspmatcher.SearchByProjection(mpCurrentKF, mScw, vpMapPoints, vpKeyFrames, vpMatchedMP, vpMatchedKF, 10, 1.5);
                 
                 //CUSTOM
-                int numProjMatches = mspmatcher.SearchByProjection(mpCurrentKF, mScw, vpMapPoints, vpKeyFrames, vpMatchedMP, vpMatchedKF, 8, 1.5);
+                //int numProjMatches = mspmatcher.SearchByProjection(mpCurrentKF, mScw, vpMapPoints, vpKeyFrames, vpMatchedMP, vpMatchedKF, 8, 1.5);
 
                
 
