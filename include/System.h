@@ -177,6 +177,8 @@ public:
     // Information from most recent processed frame
     // You can call this right after TrackMonocular (or stereo or RGBD)
     int GetTrackingState();
+    /** Atlas active map id (0 if none). Useful for filtering per-map trajectory after merges / new maps. */
+    unsigned long int GetCurrentMapId();
     std::vector<MapPoint*> GetTrackedMapPoints();
     std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
 

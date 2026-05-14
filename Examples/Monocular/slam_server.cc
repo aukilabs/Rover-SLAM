@@ -70,6 +70,8 @@ struct TrackingResponse {
     Sophus::SE3f pose;
     double timestamp = 0.0;
     uint64_t frame_id = 0;
+    /** Atlas Map::GetId() at track time; merge keeps unified map id for merged trajectory. */
+    unsigned long map_id = 0;
     string error_message;
     double processing_time = 0.0;
 };
@@ -309,31 +311,66 @@ private:
     void handleTrajectoryRequest(const httplib::Request& req, httplib::Response& res) {
         json response;
         json trajectory_json = json::array();
-        
+
+        unsigned long current_map_id = 0;
+        if (slam_system_) {
+            lock_guard<mutex> slam_lock(slam_mutex_);
+            current_map_id = slam_system_->GetCurrentMapId();
+        }
+
         {
             lock_guard<mutex> lock(trajectory_mutex_);
             for (const auto& pose : trajectory_) {
-                if (pose.success) {
-                    json pose_json;
-                    pose_json["timestamp"] = pose.timestamp;
-                    pose_json["frame_id"] = pose.frame_id;
-                    
-                    // Convert SE3 pose to translation and quaternion
-                    auto translation = pose.pose.translation();
-                    auto quaternion = pose.pose.unit_quaternion();
-                    
-                    pose_json["position"] = {translation.x(), translation.y(), translation.z()};
-                    pose_json["orientation"] = {quaternion.w(), quaternion.x(), quaternion.y(), quaternion.z()};
-                    pose_json["processing_time_ms"] = pose.processing_time * 1000.0;
-                    
-                    trajectory_json.push_back(pose_json);
-                }
+                if (!pose.success || pose.map_id != current_map_id)
+                    continue;
+                json pose_json;
+                pose_json["timestamp"] = pose.timestamp;
+                pose_json["frame_id"] = pose.frame_id;
+
+                // ORB-SLAM Tcw: world -> camera
+                Sophus::SE3f Tcw = pose.pose;
+
+                // Invert to get Twc: camera -> world
+                Sophus::SE3f Twc = Tcw.inverse();
+
+                // Convert ORB/CV camera basis to Three.js camera basis:
+                // ORB camera:   +X right, +Y down, +Z forward
+                // Three.js:     +X right, +Y up,   -Z forward
+                Eigen::Matrix3f cv_to_three;
+                cv_to_three << 1,  0,  0,
+                            0, -1,  0,
+                            0,  0, -1;
+
+                // Apply basis conversion to the camera orientation
+                Eigen::Matrix3f R_three = Twc.so3().matrix() * cv_to_three;
+                Eigen::Vector3f t_three = Twc.translation();
+
+                Eigen::Quaternionf q_three(R_three);
+                q_three.normalize();
+
+                pose_json["position"] = {
+                    t_three.x(),
+                    t_three.y(),
+                    t_three.z()
+                };
+
+                pose_json["orientation"] = {
+                    q_three.w(),
+                    q_three.x(),
+                    q_three.y(),
+                    q_three.z()
+                };
+
+                pose_json["processing_time_ms"] = pose.processing_time * 1000.0;
+
+                trajectory_json.push_back(pose_json);
             }
         }
-        
+
         response["trajectory"] = trajectory_json;
         response["count"] = trajectory_json.size();
-        
+        response["map_id"] = current_map_id;
+
         res.set_content(response.dump(), "application/json");
     }
     
@@ -514,14 +551,15 @@ private:
             
             response.success = !pose.matrix().isZero();
             response.pose = pose;
-            
+            response.map_id = slam_system_->GetCurrentMapId();
+
             if (response.success) {
                 successful_tracks_++;
             } else {
                 failed_tracks_++;
                 response.error_message = "Tracking failed";
             }
-            
+
         } catch (const exception& e) {
             response.success = false;
             response.error_message = string("SLAM processing error: ") + e.what();
