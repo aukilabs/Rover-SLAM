@@ -164,7 +164,7 @@ void LocalMapping::Run()
 #endif
 
             // Lightweight focal refinement for current KF before LBA (mono only)
-            RefineCurrentKFFocalLength();
+            //RefineCurrentKFFocalLength();
 
             bool b_doneLBA = false;
             int num_FixedKF_BA = 0;
@@ -1110,7 +1110,10 @@ void LocalMapping::RefineCurrentKFFocalLength()
     fy = alpha * fy + (1.0f - alpha) * fy_prev;
 
     // Debug print
-    std::cout << "Refine fx,fy: (" << fx_prev << ", " << fy_prev << ") -> (" << fx << ", " << fy << ")" << std::endl;
+    std::cout << "Refine fx,fy: (" 
+        << fx0 << ", " << fy0 << ") -> (" 
+        << fx_prev << ", " << fy_prev << ") -> ("
+        << fx << ", " << fy << ")" << std::endl;
 
     // Apply to camera and keyframe cached intrinsics
     mpCurrentKeyFrame->mpCamera->setParameter(fx, 0);

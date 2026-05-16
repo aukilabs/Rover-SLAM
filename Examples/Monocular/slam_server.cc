@@ -44,13 +44,37 @@ using json = nlohmann::json;
 
 namespace {
 
-/** Match Map::ApplyScaledRotation: bring Tcw from pre-step world into post-step world. */
-Sophus::SE3f ApplyWorldSimilarityToTcw(const Sophus::SE3f &Tcw, const Sophus::SE3f &Tyw, float s)
+/** ORB camera Twc -> Three.js position + quaternion (w,x,y,z). */
+json TwcToClientJson(const Sophus::SE3f &Twc, double timestamp, uint64_t frame_id, bool is_keyframe,
+                     double processing_time_ms = 0.0)
 {
-    Sophus::SE3f Twc = Tcw.inverse();
-    Twc.translation() *= s;
-    Sophus::SE3f Tyc = Tyw * Twc;
-    return Tyc.inverse();
+    Eigen::Matrix3f cv_to_three;
+    cv_to_three << 1,  0,  0,
+                   0, -1,  0,
+                   0,  0, -1;
+
+    Eigen::Matrix3f R_three = Twc.so3().matrix() * cv_to_three;
+    Eigen::Vector3f t_three = Twc.translation();
+    Eigen::Quaternionf q_three(R_three);
+    q_three.normalize();
+
+    json pose_json;
+    pose_json["timestamp"] = timestamp;
+    pose_json["frame_id"] = frame_id;
+    pose_json["is_keyframe"] = is_keyframe;
+    pose_json["position"] = {t_three.x(), t_three.y(), t_three.z()};
+    pose_json["orientation"] = {q_three.w(), q_three.x(), q_three.y(), q_three.z()};
+    pose_json["processing_time_ms"] = processing_time_ms;
+    return pose_json;
+}
+
+/** Default per-frame on the active atlas map only; ?dense=0 for keyframe-only. */
+bool trajectoryUseDense(const httplib::Request& req)
+{
+    if (!req.has_param("dense"))
+        return true;
+    const string v = req.get_param_value("dense");
+    return v != "0" && v != "false";
 }
 
 } // namespace
@@ -79,20 +103,6 @@ struct ImageRequest {
     vector<float> intrinsics; // Optional frame-specific intrinsics
 };
 
-// Tracking response structure
-struct TrackingResponse {
-    bool success = false;
-    Sophus::SE3f pose;
-    double timestamp = 0.0;
-    uint64_t frame_id = 0;
-    /** Atlas Map::GetId() at track time; merge keeps unified map id for merged trajectory. */
-    unsigned long map_id = 0;
-    /** Count of Atlas-wide ApplyScaledRotation steps already reflected in `pose` (see GetCurrentMapSimilarityCount). */
-    int similarity_stage = 0;
-    string error_message;
-    double processing_time = 0.0;
-};
-
 class SLAMServer {
 private:
     ServerConfig config_;
@@ -102,17 +112,12 @@ private:
     // Thread safety
     mutex slam_mutex_;
     mutex queue_mutex_;
-    mutex trajectory_mutex_;
     
     // Incoming frames (potentially unordered arrival); worker picks smallest timestamp when buffer policy allows.
     deque<shared_ptr<ImageRequest>> image_queue_;
     condition_variable queue_cv_;
     atomic<bool> processing_active_{true};
     thread processing_thread_;
-    
-    // Trajectory storage
-    vector<TrackingResponse> trajectory_;
-    size_t max_trajectory_size_ = 1000;
     
     // Statistics
     atomic<uint64_t> total_requests_{0};
@@ -341,73 +346,29 @@ private:
         json response;
         json trajectory_json = json::array();
 
+        const bool dense = trajectoryUseDense(req);
+
         unsigned long current_map_id = 0;
-        vector<pair<Sophus::SE3f, float>> similarity_log;
+        vector<ORB_SLAM3::System::TrajectorySample> samples;
         if (slam_system_) {
             lock_guard<mutex> slam_lock(slam_mutex_);
             current_map_id = slam_system_->GetCurrentMapId();
-            slam_system_->GetCurrentMapSimilarityLog(similarity_log);
+            if (dense)
+                slam_system_->GetActiveMapDenseTrajectory(samples);
+            else
+                slam_system_->GetActiveMapTrajectory(samples, true);
         }
-        const int cur_sim_n = static_cast<int>(similarity_log.size());
 
-        {
-            lock_guard<mutex> lock(trajectory_mutex_);
-            for (const auto& pose : trajectory_) {
-                if (!pose.success || pose.map_id != current_map_id)
-                    continue;
-                json pose_json;
-                pose_json["timestamp"] = pose.timestamp;
-                pose_json["frame_id"] = pose.frame_id;
-
-                Sophus::SE3f Tcw = pose.pose;
-                int st = pose.similarity_stage;
-                if (st < 0)
-                    st = 0;
-                if (st > cur_sim_n)
-                    st = cur_sim_n;
-                for (int si = st; si < cur_sim_n; ++si) {
-                    Tcw = ApplyWorldSimilarityToTcw(Tcw, similarity_log[static_cast<size_t>(si)].first,
-                                                    similarity_log[static_cast<size_t>(si)].second);
-                }
-
-                // ORB-SLAM Tcw: world -> camera
-                Sophus::SE3f Twc = Tcw.inverse();
-
-                // ORB camera -> Three.js camera basis
-                Eigen::Matrix3f cv_to_three;
-                cv_to_three << 1,  0,  0,
-                            0, -1,  0,
-                            0,  0, -1;
-
-                Eigen::Matrix3f R_three = Twc.so3().matrix() * cv_to_three;
-                Eigen::Vector3f t_three = Twc.translation();
-
-                Eigen::Quaternionf q_three(R_three);
-                q_three.normalize();
-
-                pose_json["position"] = {
-                    t_three.x(),
-                    t_three.y(),
-                    t_three.z()
-                };
-
-                pose_json["orientation"] = {
-                    q_three.w(),
-                    q_three.x(),
-                    q_three.y(),
-                    q_three.z()
-                };
-
-                pose_json["processing_time_ms"] = pose.processing_time * 1000.0;
-
-                trajectory_json.push_back(pose_json);
-            }
+        for (const auto& sample : samples) {
+            trajectory_json.push_back(
+                TwcToClientJson(sample.Twc, sample.timestamp, sample.id, sample.is_keyframe));
         }
 
         response["trajectory"] = trajectory_json;
         response["count"] = trajectory_json.size();
         response["map_id"] = current_map_id;
-        response["similarity_count"] = cur_sim_n;
+        response["dense"] = dense;
+        response["source"] = dense ? "active_map_dense_frames" : "active_map_keyframes";
 
         res.set_content(response.dump(), "application/json");
     }
@@ -431,7 +392,7 @@ private:
             {"GET /index.html", "Phone camera stream UI (static page)"},
             {"POST /api/v1/track", "Submit image for tracking"},
             {"GET /api/v1/status", "Get server status"},
-            {"GET /api/v1/trajectory", "Get trajectory data"},
+            {"GET /api/v1/trajectory", "Active-map trajectory (dense default; ?dense=0 keyframes only)"},
             {"GET /api/v1/health", "Health check"}
         };
         
@@ -602,65 +563,44 @@ private:
     
     void processImageRequest(shared_ptr<ImageRequest> request) {
         auto start_time = chrono::high_resolution_clock::now();
-        TrackingResponse response;
-        response.timestamp = request->timestamp;
-        response.frame_id = request->frame_id;
 
         cout << "Frame " << request->frame_id << " image resolution: "
              << request->image.cols << " x " << request->image.rows << endl;
         
+        bool success = false;
         try {
             lock_guard<mutex> slam_lock(slam_mutex_);
             
-            // Process image through SLAM
             Sophus::SE3f pose = slam_system_->TrackMonocular(
                 request->image, 
                 request->timestamp,
-                vector<ORB_SLAM3::IMU::Point>(), // No IMU data for monocular
+                vector<ORB_SLAM3::IMU::Point>(),
                 "",
                 request->intrinsics
             );
             
-            response.success = !pose.matrix().isZero();
-            response.pose = pose;
-            response.map_id = slam_system_->GetCurrentMapId();
-            response.similarity_stage = slam_system_->GetCurrentMapSimilarityCount();
-
-            if (response.success) {
+            success = !pose.matrix().isZero();
+            if (success) {
                 successful_tracks_++;
             } else {
                 failed_tracks_++;
-                response.error_message = "Tracking failed";
             }
 
         } catch (const exception& e) {
-            response.success = false;
-            response.error_message = string("SLAM processing error: ") + e.what();
+            cerr << "SLAM processing error: " << e.what() << endl;
             failed_tracks_++;
         }
         
         auto end_time = chrono::high_resolution_clock::now();
-        response.processing_time = chrono::duration<double>(end_time - start_time).count();
+        const double processing_time =
+            chrono::duration<double>(end_time - start_time).count();
         
-        // Update statistics
         double current_avg = avg_processing_time_.load();
-        double new_avg = current_avg + (response.processing_time - current_avg) / total_requests_.load();
-        avg_processing_time_.store(new_avg);
-        
-        // Store in trajectory
-        {
-            lock_guard<mutex> traj_lock(trajectory_mutex_);
-            trajectory_.push_back(response);
-            
-            // Limit trajectory size
-            if (trajectory_.size() > max_trajectory_size_) {
-                trajectory_.erase(trajectory_.begin());
-            }
+        const auto n = total_requests_.load();
+        if (n > 0) {
+            double new_avg = current_avg + (processing_time - current_avg) / n;
+            avg_processing_time_.store(new_avg);
         }
-        
-        //cout << "Processed frame " << response.frame_id 
-        //     << " (success: " << response.success 
-        //     << ", time: " << response.processing_time * 1000.0 << "ms)" << endl;
     }
     
     chrono::steady_clock::time_point server_start_time_ = chrono::steady_clock::now();

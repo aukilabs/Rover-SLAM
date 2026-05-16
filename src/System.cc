@@ -21,6 +21,7 @@
 #include "System.h"
 #include "Converter.h"
 #include <thread>
+#include <unordered_set>
 #include <pangolin/pangolin.h>
 #include <iomanip>
 #include <openssl/md5.h>
@@ -1419,19 +1420,129 @@ unsigned long int System::GetCurrentMapId()
     return pMap->GetId();
 }
 
-int System::GetCurrentMapSimilarityCount()
-{
-    if (!mpAtlas)
-        return 0;
-    return mpAtlas->GetSimilarityLogSize();
-}
-
-void System::GetCurrentMapSimilarityLog(std::vector<std::pair<Sophus::SE3f, float>> &out)
+void System::GetActiveMapTrajectory(std::vector<TrajectorySample> &out, bool include_live_frame)
 {
     out.clear();
     if (!mpAtlas)
         return;
-    mpAtlas->GetSimilarityLogCopy(out);
+
+    Map *pMap = mpAtlas->GetCurrentMap();
+    if (!pMap)
+        return;
+
+    vector<KeyFrame *> vpKFs = pMap->GetAllKeyFrames();
+    sort(vpKFs.begin(), vpKFs.end(), KeyFrame::lId);
+
+    for (KeyFrame *pKF : vpKFs)
+    {
+        if (!pKF || pKF->isBad())
+            continue;
+        Map *pKFMap = pKF->GetMap();
+        if (!pKFMap || pKFMap != pMap)
+            continue;
+
+        TrajectorySample sample;
+        sample.id = pKF->mnId;
+        sample.timestamp = pKF->mTimeStamp;
+        sample.Twc = pKF->GetPoseInverse();
+        sample.is_keyframe = true;
+        out.push_back(sample);
+    }
+
+    if (!include_live_frame)
+        return;
+
+    unique_lock<mutex> lock(mMutexState);
+    const int state = mTrackingState;
+    if (state != Tracking::OK && state != Tracking::OK_KLT && state != Tracking::RECENTLY_LOST)
+        return;
+
+    KeyFrame *pRefKF = mpTracker->mCurrentFrame.mpReferenceKF;
+    if (!pRefKF || pRefKF->GetMap() != pMap)
+        return;
+
+    const Sophus::SE3f Tcw = mpTracker->mCurrentFrame.GetPose();
+    if (Tcw.matrix().isZero())
+        return;
+
+    const unsigned long cur_id = mpTracker->mCurrentFrame.mnId;
+    if (!out.empty() && out.back().is_keyframe && out.back().id == cur_id)
+        return;
+
+    TrajectorySample live;
+    live.id = cur_id;
+    live.timestamp = mpTracker->mCurrentFrame.mTimeStamp;
+    live.Twc = Tcw.inverse();
+    live.is_keyframe = false;
+    out.push_back(live);
+}
+
+void System::GetActiveMapDenseTrajectory(std::vector<TrajectorySample> &out)
+{
+    out.clear();
+    if (!mpAtlas || !mpTracker)
+        return;
+
+    Map *pMap = mpAtlas->GetCurrentMap();
+    if (!pMap)
+        return;
+
+    std::unordered_set<unsigned long> active_kf_ids;
+    for (KeyFrame *pkf : pMap->GetAllKeyFrames())
+    {
+        if (pkf && !pkf->isBad())
+            active_kf_ids.insert(pkf->mnId);
+    }
+
+    unique_lock<mutex> lock(mMutexState);
+
+    auto lit = mpTracker->mlRelativeFramePoses.begin();
+    auto lend = mpTracker->mlRelativeFramePoses.end();
+    auto lRit = mpTracker->mlpReferences.begin();
+    auto lT = mpTracker->mlFrameTimes.begin();
+    auto lid = mpTracker->mlFrameIds.begin();
+    auto lbL = mpTracker->mlbLost.begin();
+
+    unsigned long frame_idx = 0;
+    for (; lit != lend; ++lit, ++lRit, ++lT, ++lbL, ++frame_idx)
+    {
+        const unsigned long frame_id =
+            (lid != mpTracker->mlFrameIds.end()) ? *lid : frame_idx;
+        if (lid != mpTracker->mlFrameIds.end())
+            ++lid;
+
+        if (*lbL)
+            continue;
+
+        KeyFrame *pKF = *lRit;
+        if (!pKF)
+            continue;
+
+        Sophus::SE3f Trw;
+        while (pKF->isBad())
+        {
+            Trw = Trw * pKF->mTcp;
+            pKF = pKF->GetParent();
+        }
+
+        if (!pKF || active_kf_ids.find(pKF->mnId) == active_kf_ids.end())
+            continue;
+
+        Trw = Trw * pKF->GetPose();
+
+        Sophus::SE3f Twc;
+        if (mSensor == IMU_MONOCULAR || mSensor == IMU_STEREO || mSensor == IMU_RGBD)
+            Twc = (pKF->mImuCalib.mTbc * (*lit) * Trw).inverse();
+        else
+            Twc = ((*lit) * Trw).inverse();
+
+        TrajectorySample sample;
+        sample.id = frame_id;
+        sample.timestamp = *lT;
+        sample.Twc = Twc;
+        sample.is_keyframe = false;
+        out.push_back(sample);
+    }
 }
 
 vector<MapPoint*> System::GetTrackedMapPoints()

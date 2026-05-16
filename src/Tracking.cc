@@ -2730,6 +2730,7 @@ void Tracking::Track()
             mlRelativeFramePoses.push_back(Tcr_);
             mlpReferences.push_back(mCurrentFrame.mpReferenceKF);
             mlFrameTimes.push_back(mCurrentFrame.mTimeStamp);
+            mlFrameIds.push_back(mCurrentFrame.mnId);
             mlbLost.push_back(mState==LOST);
         }
         else
@@ -2739,6 +2740,7 @@ void Tracking::Track()
             mlRelativeFramePoses.push_back(mlRelativeFramePoses.back());
             mlpReferences.push_back(mlpReferences.back());
             mlFrameTimes.push_back(mlFrameTimes.back());
+            mlFrameIds.push_back(mlFrameIds.back());
             mlbLost.push_back(mState==LOST);
         }
 
@@ -3189,10 +3191,21 @@ void Tracking::CreateInitialMapMonocular()
  * 3. 上一帧为最近丢失且重定位失败时
  * 4. 重定位成功，局部地图跟踪失败
  */
+void Tracking::ClearFrameTrajectory()
+{
+    mlRelativeFramePoses.clear();
+    mlpReferences.clear();
+    mlFrameTimes.clear();
+    mlFrameIds.clear();
+    mlbLost.clear();
+}
+
 void Tracking::CreateMapInAtlas()
 {
     mnLastInitFrameId = mCurrentFrame.mnId;
     mpAtlas->CreateNewMap();
+    // Keep mlRelativeFramePoses: after map merge, pre-merge frames become valid again when
+    // their reference KFs move onto the active map (filter by active-map KF set in System).
     if (mSensor==System::IMU_STEREO || mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_RGBD)
         mpAtlas->SetInertialSensor();  // mpAtlas中map的mbIsInertial=true
     mbSetInit=false;  // 好像没什么用
@@ -4743,6 +4756,7 @@ void Tracking::Reset(bool bLocMap)
     mlRelativeFramePoses.clear();
     mlpReferences.clear();
     mlFrameTimes.clear();
+    mlFrameIds.clear();
     mlbLost.clear();
     mCurrentFrame = Frame();
     mnLastRelocFrameId = 0;

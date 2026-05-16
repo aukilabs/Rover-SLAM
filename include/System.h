@@ -179,11 +179,21 @@ public:
     // Information from most recent processed frame
     // You can call this right after TrackMonocular (or stereo or RGBD)
     int GetTrackingState();
-    /** Atlas active map id (0 if none). Useful for filtering per-map trajectory after merges / new maps. */
+    /** Atlas active map id (0 if none). */
     unsigned long int GetCurrentMapId();
-    /** All ApplyScaledRotation (T,s) on the active map in this atlas, in time order — one index space for trajectory replay after map fusion. */
-    int GetCurrentMapSimilarityCount();
-    void GetCurrentMapSimilarityLog(std::vector<std::pair<Sophus::SE3f, float>>& out);
+
+    /** One pose sample for GET /api/v1/trajectory (same frames as MapDrawer / SaveKeyFrameTrajectoryTUM). */
+    struct TrajectorySample {
+        unsigned long id = 0;
+        double timestamp = 0.0;
+        Sophus::SE3f Twc;
+        bool is_keyframe = true;
+    };
+    /** Active-map keyframe path (post–loop/merge BA), optionally plus the live tracked frame. */
+    void GetActiveMapTrajectory(std::vector<TrajectorySample>& out, bool include_live_frame = true);
+    /** Per-frame path from tracker lists (Tcr × ref KF pose); stays aligned after loop/merge like EuRoC export. */
+    void GetActiveMapDenseTrajectory(std::vector<TrajectorySample>& out);
+
     std::vector<MapPoint*> GetTrackedMapPoints();
     std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
 

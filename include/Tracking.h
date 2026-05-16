@@ -152,6 +152,7 @@ public:
     list<Sophus::SE3f> mlRelativeFramePoses;
     list<KeyFrame*> mlpReferences;
     list<double> mlFrameTimes;
+    list<long unsigned int> mlFrameIds;
     list<bool> mlbLost;
 
     // frames with estimated pose
@@ -163,6 +164,8 @@ public:
 
     void Reset(bool bLocMap = false);
     void ResetActiveMap(bool bLocMap = false);
+    /** Drop per-frame trajectory lists (e.g. when atlas starts a new map). */
+    void ClearFrameTrajectory();
     cv::Mat plotImages(Frame f1,Frame f2,std::vector<int> vmathcers12);
     
     void plotMatches(const cv::Mat& figure , const std::vector<cv::KeyPoint>& kpts0, 
