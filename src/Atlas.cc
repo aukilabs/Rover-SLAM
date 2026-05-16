@@ -82,7 +82,13 @@ void Atlas::CreateNewMap()
 
     mpCurrentMap = new Map(mnLastInitKFidMap);  //新建地图
     mpCurrentMap->SetCurrentMap();              //设置为活跃地图
+    mpCurrentMap->SetAtlas(this);
     mspMaps.insert(mpCurrentMap);               //插入地图集
+
+    {
+        unique_lock<mutex> simLock(mMutexSimilarityLog);
+        mvSimilarityLog.clear();
+    }
 }
 
 void Atlas::ChangeMap(Map *pMap)
@@ -96,6 +102,7 @@ void Atlas::ChangeMap(Map *pMap)
 
     mpCurrentMap = pMap;
     mpCurrentMap->SetCurrentMap();
+    mpCurrentMap->SetAtlas(this);
 }
 
 unsigned long int Atlas::GetLastInitKFid()
@@ -262,6 +269,9 @@ void Atlas::clearAtlas()
     mspMaps.clear();
     mpCurrentMap = static_cast<Map *>(NULL);
     mnLastInitKFidMap = 0;
+
+    unique_lock<mutex> simLock(mMutexSimilarityLog);
+    mvSimilarityLog.clear();
 }
 
 Map *Atlas::GetCurrentMap()
@@ -454,6 +464,24 @@ map<long unsigned int, KeyFrame *> Atlas::GetAtlasKeyframes()
     }
 
     return mpIdKFs;
+}
+
+void Atlas::RecordSimilarityTransform(const Sophus::SE3f &T, float s)
+{
+    unique_lock<mutex> lock(mMutexSimilarityLog);
+    mvSimilarityLog.push_back(std::make_pair(T, s));
+}
+
+int Atlas::GetSimilarityLogSize()
+{
+    unique_lock<mutex> lock(mMutexSimilarityLog);
+    return static_cast<int>(mvSimilarityLog.size());
+}
+
+void Atlas::GetSimilarityLogCopy(std::vector<std::pair<Sophus::SE3f, float>> &out)
+{
+    unique_lock<mutex> lock(mMutexSimilarityLog);
+    out = mvSimilarityLog;
 }
 
 } // namespace ORB_SLAM3

@@ -1419,6 +1419,21 @@ unsigned long int System::GetCurrentMapId()
     return pMap->GetId();
 }
 
+int System::GetCurrentMapSimilarityCount()
+{
+    if (!mpAtlas)
+        return 0;
+    return mpAtlas->GetSimilarityLogSize();
+}
+
+void System::GetCurrentMapSimilarityLog(std::vector<std::pair<Sophus::SE3f, float>> &out)
+{
+    out.clear();
+    if (!mpAtlas)
+        return;
+    mpAtlas->GetSimilarityLogCopy(out);
+}
+
 vector<MapPoint*> System::GetTrackedMapPoints()
 {
     unique_lock<mutex> lock(mMutexState);

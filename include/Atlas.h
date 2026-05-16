@@ -27,6 +27,8 @@
 #include "KannalaBrandt8.h"
 
 #include <set>
+#include <vector>
+#include <utility>
 #include <mutex>
 #include <boost/serialization/vector.hpp>
 #include <boost/serialization/export.hpp>
@@ -144,6 +146,11 @@ public:
 
     long unsigned int GetNumLivedMP();
 
+    /** All ApplyScaledRotation (T,s) on any map in this atlas, in time order — one index space for trajectory replay. */
+    void RecordSimilarityTransform(const Sophus::SE3f &T, float s);
+    int GetSimilarityLogSize();
+    void GetSimilarityLogCopy(std::vector<std::pair<Sophus::SE3f, float>> &out);
+
 protected:
 
     std::set<Map*> mspMaps;
@@ -168,6 +175,8 @@ protected:
     // Mutex
     std::mutex mMutexAtlas;
 
+    std::vector<std::pair<Sophus::SE3f, float>> mvSimilarityLog;
+    std::mutex mMutexSimilarityLog;
 
 }; // class Atlas
 

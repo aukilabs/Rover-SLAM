@@ -24,6 +24,8 @@
 #include "KeyFrame.h"
 
 #include <set>
+#include <vector>
+#include <utility>
 #include <pangolin/pangolin.h>
 #include <mutex>
 
@@ -117,6 +119,8 @@ public:
 
     void ApplyScaledRotation(const Sophus::SE3f &T, const float s, const bool bScaledVel=false);
 
+    void SetAtlas(Atlas* pAtlas);
+
     void SetInertialSensor();
     bool IsInertial();
     void SetIniertialBA1();
@@ -178,6 +182,8 @@ protected:
 
     int mnMapChange;
     int mnMapChangeNotified;
+
+    Atlas* mpAtlas;
 
     long unsigned int mnInitKFid;
     long unsigned int mnMaxKFid;

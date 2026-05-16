@@ -13,7 +13,7 @@
 #include <sstream>
 #include <thread>
 #include <mutex>
-#include <queue>
+#include <deque>
 #include <memory>
 #include <unordered_map>
 #include <csignal>
@@ -42,6 +42,19 @@
 using namespace std;
 using json = nlohmann::json;
 
+namespace {
+
+/** Match Map::ApplyScaledRotation: bring Tcw from pre-step world into post-step world. */
+Sophus::SE3f ApplyWorldSimilarityToTcw(const Sophus::SE3f &Tcw, const Sophus::SE3f &Tyw, float s)
+{
+    Sophus::SE3f Twc = Tcw.inverse();
+    Twc.translation() *= s;
+    Sophus::SE3f Tyc = Tyw * Twc;
+    return Tyc.inverse();
+}
+
+} // namespace
+
 // Server configuration structure
 struct ServerConfig {
     int port = 8080;
@@ -50,6 +63,8 @@ struct ServerConfig {
     string output_dir = "./output";
     bool use_viewer = false;
     int max_queue_size = 10;
+    /** Wait until this many frames are buffered (unless shutting down); then process oldest by `timestamp`. */
+    size_t min_buffer_frames = 3;
     double processing_timeout = 5.0; // seconds
     /** UTF-8 HTML for GET /index.html (phone camera UI); empty => 404 with hint */
     string index_html_body;
@@ -72,6 +87,8 @@ struct TrackingResponse {
     uint64_t frame_id = 0;
     /** Atlas Map::GetId() at track time; merge keeps unified map id for merged trajectory. */
     unsigned long map_id = 0;
+    /** Count of Atlas-wide ApplyScaledRotation steps already reflected in `pose` (see GetCurrentMapSimilarityCount). */
+    int similarity_stage = 0;
     string error_message;
     double processing_time = 0.0;
 };
@@ -87,8 +104,8 @@ private:
     mutex queue_mutex_;
     mutex trajectory_mutex_;
     
-    // Image processing queue
-    queue<shared_ptr<ImageRequest>> image_queue_;
+    // Incoming frames (potentially unordered arrival); worker picks smallest timestamp when buffer policy allows.
+    deque<shared_ptr<ImageRequest>> image_queue_;
     condition_variable queue_cv_;
     atomic<bool> processing_active_{true};
     thread processing_thread_;
@@ -119,6 +136,17 @@ public:
             "",
             ""
         );
+
+        if (config_.min_buffer_frames < 1) {
+            cerr << "Warning: min_buffer_frames must be >= 1; using 1." << endl;
+            config_.min_buffer_frames = 1;
+        }
+        if (config_.max_queue_size < static_cast<int>(config_.min_buffer_frames)) {
+            cerr << "Warning: max_queue_size (" << config_.max_queue_size
+                 << ") < min_buffer_frames (" << config_.min_buffer_frames
+                 << "); raising max_queue_size." << endl;
+            config_.max_queue_size = static_cast<int>(config_.min_buffer_frames);
+        }
         
         // Initialize HTTP server
         http_server_ = make_unique<httplib::Server>();
@@ -187,7 +215,8 @@ private:
         http_server_->set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
             res.set_header("Access-Control-Allow-Origin", "*");
             res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            res.set_header("Access-Control-Allow-Headers", "Content-Type, X-Intrinsics, X-Client-ID");
+            res.set_header("Access-Control-Allow-Headers",
+                "Content-Type, X-Intrinsics, X-Client-ID, X-Capture-Timestamp, X-Frame-Id");
             return httplib::Server::HandlerResponse::Unhandled;
         });
         
@@ -263,7 +292,7 @@ private:
                 }
                 
                 // Add to processing queue
-                image_queue_.push(image_req);
+                image_queue_.push_back(image_req);
                 queue_cv_.notify_one();
             }
             
@@ -313,10 +342,13 @@ private:
         json trajectory_json = json::array();
 
         unsigned long current_map_id = 0;
+        vector<pair<Sophus::SE3f, float>> similarity_log;
         if (slam_system_) {
             lock_guard<mutex> slam_lock(slam_mutex_);
             current_map_id = slam_system_->GetCurrentMapId();
+            slam_system_->GetCurrentMapSimilarityLog(similarity_log);
         }
+        const int cur_sim_n = static_cast<int>(similarity_log.size());
 
         {
             lock_guard<mutex> lock(trajectory_mutex_);
@@ -327,21 +359,26 @@ private:
                 pose_json["timestamp"] = pose.timestamp;
                 pose_json["frame_id"] = pose.frame_id;
 
-                // ORB-SLAM Tcw: world -> camera
                 Sophus::SE3f Tcw = pose.pose;
+                int st = pose.similarity_stage;
+                if (st < 0)
+                    st = 0;
+                if (st > cur_sim_n)
+                    st = cur_sim_n;
+                for (int si = st; si < cur_sim_n; ++si) {
+                    Tcw = ApplyWorldSimilarityToTcw(Tcw, similarity_log[static_cast<size_t>(si)].first,
+                                                    similarity_log[static_cast<size_t>(si)].second);
+                }
 
-                // Invert to get Twc: camera -> world
+                // ORB-SLAM Tcw: world -> camera
                 Sophus::SE3f Twc = Tcw.inverse();
 
-                // Convert ORB/CV camera basis to Three.js camera basis:
-                // ORB camera:   +X right, +Y down, +Z forward
-                // Three.js:     +X right, +Y up,   -Z forward
+                // ORB camera -> Three.js camera basis
                 Eigen::Matrix3f cv_to_three;
                 cv_to_three << 1,  0,  0,
                             0, -1,  0,
                             0,  0, -1;
 
-                // Apply basis conversion to the camera orientation
                 Eigen::Matrix3f R_three = Twc.so3().matrix() * cv_to_three;
                 Eigen::Vector3f t_three = Twc.translation();
 
@@ -370,6 +407,7 @@ private:
         response["trajectory"] = trajectory_json;
         response["count"] = trajectory_json.size();
         response["map_id"] = current_map_id;
+        response["similarity_count"] = cur_sim_n;
 
         res.set_content(response.dump(), "application/json");
     }
@@ -445,6 +483,23 @@ private:
             vector<uchar> image_data(req.body.begin(), req.body.end());
             image_req->image = cv::imdecode(image_data, cv::IMREAD_UNCHANGED);
 
+            const auto ts_hdr = req.get_header_value("X-Capture-Timestamp");
+            if (!ts_hdr.empty()) {
+                try {
+                    image_req->timestamp = stod(ts_hdr);
+                } catch (const exception& e) {
+                    cerr << "Warning: invalid X-Capture-Timestamp '" << ts_hdr << "': " << e.what() << endl;
+                }
+            }
+            const auto fid_hdr = req.get_header_value("X-Frame-Id");
+            if (!fid_hdr.empty()) {
+                try {
+                    image_req->frame_id = stoull(fid_hdr);
+                } catch (const exception& e) {
+                    cerr << "Warning: invalid X-Frame-Id '" << fid_hdr << "': " << e.what() << endl;
+                }
+            }
+
             // Optional intrinsics via header for raw uploads
             // Expect header format: X-Intrinsics: "fx,fy,cx,cy" or space separated
             const auto intr_hdr = req.get_header_value("X-Intrinsics");
@@ -503,28 +558,45 @@ private:
     }
     
     void processImages() {
-        cout << "Started image processing thread" << endl;
-        
-        while (processing_active_) {
+        const size_t min_buf = config_.min_buffer_frames;
+        cout << "Started image processing thread (min_buffer=" << min_buf
+             << ", dequeue oldest timestamp)" << endl;
+
+        while (true) {
             shared_ptr<ImageRequest> request;
-            
+
             {
                 unique_lock<mutex> lock(queue_mutex_);
-                queue_cv_.wait(lock, [this] { return !image_queue_.empty() || !processing_active_; });
-                
-                if (!processing_active_) break;
-                
-                if (!image_queue_.empty()) {
-                    request = image_queue_.front();
-                    image_queue_.pop();
+                queue_cv_.wait(lock, [this, min_buf] {
+                    if (!processing_active_.load())
+                        return true;
+                    return image_queue_.size() >= min_buf;
+                });
+
+                if (image_queue_.empty()) {
+                    if (!processing_active_.load())
+                        break;
+                    continue;
                 }
+
+                const bool shutting_down = !processing_active_.load();
+                if (!shutting_down && image_queue_.size() < min_buf)
+                    continue;
+
+                auto oldest = min_element(
+                    image_queue_.begin(),
+                    image_queue_.end(),
+                    [](const shared_ptr<ImageRequest>& a, const shared_ptr<ImageRequest>& b) {
+                        return a->timestamp < b->timestamp;
+                    });
+                request = *oldest;
+                image_queue_.erase(oldest);
             }
-            
-            if (request) {
+
+            if (request)
                 processImageRequest(request);
-            }
         }
-        
+
         cout << "Image processing thread stopped" << endl;
     }
     
@@ -552,6 +624,7 @@ private:
             response.success = !pose.matrix().isZero();
             response.pose = pose;
             response.map_id = slam_system_->GetCurrentMapId();
+            response.similarity_stage = slam_system_->GetCurrentMapSimilarityCount();
 
             if (response.success) {
                 successful_tracks_++;
@@ -634,6 +707,7 @@ void printUsage() {
     cout << "  --port <number>        Server port (default: 8080)" << endl;
     cout << "  --output-dir <path>    Output directory (default: ./output)" << endl;
     cout << "  --max-queue <number>   Maximum queue size (default: 10)" << endl;
+    cout << "  --min-buffer <number>  Min frames in queue before tracking; oldest timestamp first (default: 3)" << endl;
     cout << "  --viewer               Enable SLAM viewer (default: disabled)" << endl;
     cout << "  --help                 Show this help message" << endl;
     cout << endl;
@@ -662,6 +736,8 @@ int main(int argc, char* argv[]) {
             config.output_dir = argv[++i];
         } else if (arg == "--max-queue" && i + 1 < argc) {
             config.max_queue_size = stoi(argv[++i]);
+        } else if (arg == "--min-buffer" && i + 1 < argc) {
+            config.min_buffer_frames = static_cast<size_t>(stoul(argv[++i]));
         } else if (arg == "--viewer") {
             config.use_viewer = true;
         } else {

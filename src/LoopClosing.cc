@@ -1177,7 +1177,7 @@ bool LoopClosing::DetectCommonRegionsFromBoW_sp(
     //nBoWMatches = 30;
     //nBoWInliers = 20;
     //nSim3Inliers = 15;
-    nProjMatches = 70; //100
+    nProjMatches = 50; //100
     nProjOptMatches = 30;
 
     //nBoWMatches *= 3; // 5;

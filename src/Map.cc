@@ -17,6 +17,7 @@
  */
 
 #include "Map.h"
+#include "Atlas.h"
 
 #include <mutex>
 
@@ -27,7 +28,8 @@ long unsigned int Map::nNextId = 0;
 
 Map::Map()
     : mnMaxKFid(0), mnBigChangeIdx(0), mbImuInitialized(false), mnMapChange(0), mpFirstRegionKF(static_cast<KeyFrame *>(NULL)),
-    mbFail(false), mIsInUse(false), mHasTumbnail(false), mbBad(false), mnMapChangeNotified(0), mbIsInertial(false), mbIMU_BA1(false), mbIMU_BA2(false)
+    mbFail(false), mIsInUse(false), mHasTumbnail(false), mbBad(false), mnMapChangeNotified(0), mbIsInertial(false), mbIMU_BA1(false), mbIMU_BA2(false),
+    mpAtlas(nullptr)
 {
     mnId = nNextId++;
     mThumbnail = static_cast<GLubyte *>(NULL);
@@ -36,7 +38,8 @@ Map::Map()
 Map::Map(int initKFid)
     : mnInitKFid(initKFid), mnMaxKFid(initKFid), /*mnLastLoopKFid(initKFid),*/ mnBigChangeIdx(0), mIsInUse(false),
     mHasTumbnail(false), mbBad(false), mbImuInitialized(false), mpFirstRegionKF(static_cast<KeyFrame *>(NULL)),
-    mnMapChange(0), mbFail(false), mnMapChangeNotified(0), mbIsInertial(false), mbIMU_BA1(false), mbIMU_BA2(false)
+    mnMapChange(0), mbFail(false), mnMapChangeNotified(0), mbIsInertial(false), mbIMU_BA1(false), mbIMU_BA2(false),
+    mpAtlas(nullptr)
 {
     mnId = nNextId++;
     mThumbnail = static_cast<GLubyte *>(NULL);
@@ -316,7 +319,14 @@ void Map::ApplyScaledRotation(const Sophus::SE3f &T, const float s, const bool b
         pMP->SetWorldPos(s * Ryw * pMP->GetWorldPos() + tyw);
         pMP->UpdateNormalAndDepth();
     }
+    if (mpAtlas)
+        mpAtlas->RecordSimilarityTransform(T, s);
     mnMapChange++;
+}
+
+void Map::SetAtlas(Atlas *pAtlas)
+{
+    mpAtlas = pAtlas;
 }
 
 void Map::SetInertialSensor()

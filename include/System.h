@@ -25,6 +25,8 @@
 #include<stdio.h>
 #include<stdlib.h>
 #include<string>
+#include<vector>
+#include<utility>
 #include<thread>
 #include<opencv2/core/core.hpp>
 
@@ -179,6 +181,9 @@ public:
     int GetTrackingState();
     /** Atlas active map id (0 if none). Useful for filtering per-map trajectory after merges / new maps. */
     unsigned long int GetCurrentMapId();
+    /** All ApplyScaledRotation (T,s) on the active map in this atlas, in time order — one index space for trajectory replay after map fusion. */
+    int GetCurrentMapSimilarityCount();
+    void GetCurrentMapSimilarityLog(std::vector<std::pair<Sophus::SE3f, float>>& out);
     std::vector<MapPoint*> GetTrackedMapPoints();
     std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
 
