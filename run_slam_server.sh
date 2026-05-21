@@ -1,2 +1,3 @@
 #!/bin/bash
-./Examples/Monocular/slam_server Vocabulary/voc_binary_tartan_8u_6.yml.gz Examples/Monocular/iphoneSLAM.yaml --max-queue 20 --viewer
+#./Examples/Monocular/slam_server Vocabulary/voc_binary_tartan_8u_6.yml.gz Examples/Monocular/iphoneSLAM.yaml --max-queue 10 --slam-interval-nth 1 --viewer --portal-manifest datasets/robin_office_slam/refined_manifest_2026-05-21_07-23-57.json --output-dir ./outputs/slam_server --debug-output ./outputs/slam_server/debug
+./Examples/Monocular/slam_server Vocabulary/voc_binary_tartan_8u_6.yml.gz Examples/Monocular/iphoneSLAM.yaml --max-queue 10 --slam-interval-nth 1 --viewer --portal-manifest datasets/robin_office_slam/one_portal.json --output-dir ./outputs/slam_server --debug-output ./outputs/slam_server/debug

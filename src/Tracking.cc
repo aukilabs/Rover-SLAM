@@ -3924,8 +3924,8 @@ bool Tracking::NeedNewKeyFrame()
         c4=false;
     //std::cout << "NeedNewKF: c1a=" << c1a << "; c1b=" << c1b << "; c1c=" << c1c << "; c2=" << c2 <<"; c3="<<c3<<";c4 ="<<c4<<std::endl;   500
     // 相比ORB-SLAM2多了c3,c4
-    //if(((c1a||c1b||c1c) && c2)||c3 ||c4)
-    if(true)
+    if(((c1a||c1b||c1c) && c2)||c3 ||c4)
+    //if(true)
     {
         // If the mapping accepts keyframes, insert keyframe.
         // Otherwise send a signal to interrupt BA

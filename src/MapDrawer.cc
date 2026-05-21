@@ -20,6 +20,7 @@
 #include "MapPoint.h"
 #include "KeyFrame.h"
 #include <pangolin/pangolin.h>
+#include <algorithm>
 #include <mutex>
 
 namespace ORB_SLAM3
@@ -132,6 +133,68 @@ bool MapDrawer::ParseViewerParamFile(cv::FileStorage &fSettings)
     return !b_miss_params;
 }
 
+void MapDrawer::SetViewerAlignment(const Eigen::Matrix3f &R_domain_slam, const Eigen::Vector3f &t_domain_slam, const float scale)
+{
+    unique_lock<mutex> lock(mMutexViewerAlignment);
+    mViewerAlignment.enabled = true;
+    mViewerAlignment.scale = scale;
+    mViewerAlignment.R_domain_slam = R_domain_slam;
+    mViewerAlignment.t_domain_slam = t_domain_slam;
+}
+
+void MapDrawer::ClearViewerAlignment()
+{
+    unique_lock<mutex> lock(mMutexViewerAlignment);
+    mViewerAlignment = ViewerAlignment();
+}
+
+MapDrawer::ViewerAlignment MapDrawer::GetViewerAlignment()
+{
+    unique_lock<mutex> lock(mMutexViewerAlignment);
+    return mViewerAlignment;
+}
+
+void MapDrawer::SetViewerPortalSquares(const std::vector<PortalSquare> &squares)
+{
+    unique_lock<mutex> lock(mMutexViewerPortalSquares);
+    mViewerPortalSquares = squares;
+}
+
+void MapDrawer::ClearViewerPortalSquares()
+{
+    unique_lock<mutex> lock(mMutexViewerPortalSquares);
+    mViewerPortalSquares.clear();
+}
+
+void MapDrawer::SetViewerTruthPortalSquares(const std::vector<PortalSquare> &squares)
+{
+    unique_lock<mutex> lock(mMutexViewerPortalSquares);
+    mViewerTruthPortalSquares = squares;
+}
+
+void MapDrawer::ClearViewerTruthPortalSquares()
+{
+    unique_lock<mutex> lock(mMutexViewerPortalSquares);
+    mViewerTruthPortalSquares.clear();
+}
+
+Eigen::Vector3f MapDrawer::ApplyViewerAlignment(const Eigen::Vector3f &p_slam, const ViewerAlignment &alignment)
+{
+    if(!alignment.enabled)
+        return p_slam;
+    return alignment.scale * (alignment.R_domain_slam * p_slam) + alignment.t_domain_slam;
+}
+
+Sophus::SE3f MapDrawer::ApplyViewerAlignment(const Sophus::SE3f &Twc_slam, const ViewerAlignment &alignment)
+{
+    if(!alignment.enabled)
+        return Twc_slam;
+
+    const Eigen::Matrix3f R = alignment.R_domain_slam * Twc_slam.so3().matrix();
+    const Eigen::Vector3f t = ApplyViewerAlignment(Twc_slam.translation(), alignment);
+    return Sophus::SE3f(R, t);
+}
+
 void MapDrawer::DrawMapPoints()
 {
     Map* pActiveMap = mpAtlas->GetCurrentMap();
@@ -146,6 +209,8 @@ void MapDrawer::DrawMapPoints()
     if(vpMPs.empty())
         return;
 
+    ViewerAlignment alignment = GetViewerAlignment();
+
     glPointSize(mPointSize);
     glBegin(GL_POINTS);
     glColor3f(0.0,0.0,0.0);//设置全部地图点为黑色
@@ -154,7 +219,7 @@ void MapDrawer::DrawMapPoints()
     {
         if(vpMPs[i]->isBad() || spRefMPs.count(vpMPs[i]))
             continue;
-        Eigen::Matrix<float,3,1> pos = vpMPs[i]->GetWorldPos();
+        Eigen::Vector3f pos = ApplyViewerAlignment(vpMPs[i]->GetWorldPos(), alignment);
         glVertex3f(pos(0),pos(1),pos(2));
     }
     glEnd();
@@ -167,12 +232,73 @@ void MapDrawer::DrawMapPoints()
     {
         if((*sit)->isBad())
             continue;
-        Eigen::Matrix<float,3,1> pos = (*sit)->GetWorldPos();
+        Eigen::Vector3f pos = ApplyViewerAlignment((*sit)->GetWorldPos(), alignment);
         glVertex3f(pos(0),pos(1),pos(2));
 
     }
 
     glEnd();
+}
+
+void MapDrawer::DrawPortalSquares()
+{
+    std::vector<PortalSquare> squares;
+    std::vector<PortalSquare> truthSquares;
+    {
+        unique_lock<mutex> lock(mMutexViewerPortalSquares);
+        squares = mViewerPortalSquares;
+        truthSquares = mViewerTruthPortalSquares;
+    }
+    if(squares.empty() && truthSquares.empty())
+        return;
+
+    auto drawSquares = [this](const std::vector<PortalSquare> &items,
+                              float lineR, float lineG, float lineB,
+                              float pointR, float pointG, float pointB)
+    {
+        if(items.empty())
+            return;
+
+        glDisable(GL_LIGHTING);
+        glLineWidth(std::max(3.0f, mGraphLineWidth * 2.0f));
+        glColor3f(lineR, lineG, lineB);
+        glBegin(GL_LINES);
+        for(const PortalSquare &square : items)
+        {
+            Eigen::Vector3f pts[4];
+            for(int i = 0; i < 4; ++i)
+            {
+                const auto &p = square.corners[i];
+                pts[i] = Eigen::Vector3f(p[0], p[1], p[2]);
+            }
+
+            for(int i = 0; i < 4; ++i)
+            {
+                const Eigen::Vector3f &a = pts[i];
+                const Eigen::Vector3f &b = pts[(i + 1) % 4];
+                glVertex3f(a(0), a(1), a(2));
+                glVertex3f(b(0), b(1), b(2));
+            }
+        }
+        glEnd();
+
+        glPointSize(std::max(8.0f, mPointSize * 2.5f));
+        glColor3f(pointR, pointG, pointB);
+        glBegin(GL_POINTS);
+        for(const PortalSquare &square : items)
+        {
+            for(int i = 0; i < 4; ++i)
+            {
+                const auto &p = square.corners[i];
+                const Eigen::Vector3f q(p[0], p[1], p[2]);
+                glVertex3f(q(0), q(1), q(2));
+            }
+        }
+        glEnd();
+    };
+
+    drawSquares(truthSquares, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f);
+    drawSquares(squares, 0.0f, 0.35f, 1.0f, 1.0f, 0.15f, 0.0f);
 }
 
 void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const bool bDrawInertialGraph, const bool bDrawOptLba)
@@ -182,12 +308,14 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
     const float z = w*0.6;
 
     Map* pActiveMap = mpAtlas->GetCurrentMap();
+    if(!pActiveMap)
+        return;
+
+    ViewerAlignment alignment = GetViewerAlignment();
+
     // DEBUG LBA
     std::set<long unsigned int> sOptKFs = pActiveMap->msOptKFs;
     std::set<long unsigned int> sFixedKFs = pActiveMap->msFixedKFs;
-
-    if(!pActiveMap)
-        return;
 
     const vector<KeyFrame*> vpKFs = pActiveMap->GetAllKeyFrames();
 
@@ -196,7 +324,7 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
         for(size_t i=0; i<vpKFs.size(); i++)
         {
             KeyFrame* pKF = vpKFs[i];
-            Eigen::Matrix4f Twc = pKF->GetPoseInverse().matrix();
+            Eigen::Matrix4f Twc = ApplyViewerAlignment(pKF->GetPoseInverse(), alignment).matrix();
             unsigned int index_color = pKF->mnOriginMapId;
 
             glPushMatrix();
@@ -273,14 +401,14 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
         {
             // Covisibility Graph
             const vector<KeyFrame*> vCovKFs = vpKFs[i]->GetCovisiblesByWeight(100);
-            Eigen::Vector3f Ow = vpKFs[i]->GetCameraCenter();
+            Eigen::Vector3f Ow = ApplyViewerAlignment(vpKFs[i]->GetCameraCenter(), alignment);
             if(!vCovKFs.empty())
             {
                 for(vector<KeyFrame*>::const_iterator vit=vCovKFs.begin(), vend=vCovKFs.end(); vit!=vend; vit++)
                 {
                     if((*vit)->mnId<vpKFs[i]->mnId)
                         continue;
-                    Eigen::Vector3f Ow2 = (*vit)->GetCameraCenter();
+                    Eigen::Vector3f Ow2 = ApplyViewerAlignment((*vit)->GetCameraCenter(), alignment);
                     glVertex3f(Ow(0),Ow(1),Ow(2));
                     glVertex3f(Ow2(0),Ow2(1),Ow2(2));
                 }
@@ -290,7 +418,7 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
             KeyFrame* pParent = vpKFs[i]->GetParent();
             if(pParent)
             {
-                Eigen::Vector3f Owp = pParent->GetCameraCenter();
+                Eigen::Vector3f Owp = ApplyViewerAlignment(pParent->GetCameraCenter(), alignment);
                 glVertex3f(Ow(0),Ow(1),Ow(2));
                 glVertex3f(Owp(0),Owp(1),Owp(2));
             }
@@ -301,7 +429,7 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
             {
                 if((*sit)->mnId<vpKFs[i]->mnId)
                     continue;
-                Eigen::Vector3f Owl = (*sit)->GetCameraCenter();
+                Eigen::Vector3f Owl = ApplyViewerAlignment((*sit)->GetCameraCenter(), alignment);
                 glVertex3f(Ow(0),Ow(1),Ow(2));
                 glVertex3f(Owl(0),Owl(1),Owl(2));
             }
@@ -320,11 +448,11 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
         for(size_t i=0; i<vpKFs.size(); i++)
         {
             KeyFrame* pKFi = vpKFs[i];
-            Eigen::Vector3f Ow = pKFi->GetCameraCenter();
+            Eigen::Vector3f Ow = ApplyViewerAlignment(pKFi->GetCameraCenter(), alignment);
             KeyFrame* pNext = pKFi->mNextKF;
             if(pNext)
             {
-                Eigen::Vector3f Owp = pNext->GetCameraCenter();
+                Eigen::Vector3f Owp = ApplyViewerAlignment(pNext->GetCameraCenter(), alignment);
                 glVertex3f(Ow(0),Ow(1),Ow(2));
                 glVertex3f(Owp(0),Owp(1),Owp(2));
             }
@@ -446,11 +574,13 @@ void MapDrawer::SetCurrentCameraPose(const Sophus::SE3f &Tcw)
 
 void MapDrawer::GetCurrentOpenGLCameraMatrix(pangolin::OpenGlMatrix &M, pangolin::OpenGlMatrix &MOw)
 {
-    Eigen::Matrix4f Twc;
+    Sophus::SE3f Twc_slam;
     {
         unique_lock<mutex> lock(mMutexCamera);
-        Twc = mCameraPose.matrix();
+        Twc_slam = mCameraPose;
     }
+    ViewerAlignment alignment = GetViewerAlignment();
+    Eigen::Matrix4f Twc = ApplyViewerAlignment(Twc_slam, alignment).matrix();
 
     for (int i = 0; i<4; i++) {
         M.m[4*i] = Twc(0,i);

@@ -1223,7 +1223,9 @@ void LocalMapping::SearchInNeighbors()
     // 单目情况要30个邻接关键帧,0.4版本是20个，又加了许多
     int nn = 10;
     if(mbMonocular)
-        nn=30;
+        // CUSTOM Robin
+        nn = 20;
+        // nn=30;
     
     // 和当前关键帧相邻的关键帧，也就是一级相邻关键帧
     const vector<KeyFrame*> vpNeighKFs = mpCurrentKeyFrame->GetBestCovisibilityKeyFrames(nn);

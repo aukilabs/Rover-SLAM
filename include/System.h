@@ -193,6 +193,13 @@ public:
     void GetActiveMapTrajectory(std::vector<TrajectorySample>& out, bool include_live_frame = true);
     /** Per-frame path from tracker lists (Tcr × ref KF pose); stays aligned after loop/merge like EuRoC export. */
     void GetActiveMapDenseTrajectory(std::vector<TrajectorySample>& out);
+    /** Viewer-only domain-from-SLAM Sim3; does not mutate the active SLAM map. */
+    void SetViewerAlignment(const Eigen::Matrix3f& R_domain_slam, const Eigen::Vector3f& t_domain_slam, float scale);
+    void ClearViewerAlignment();
+    void SetViewerPortalSquares(const std::vector<MapDrawer::PortalSquare>& squares);
+    void ClearViewerPortalSquares();
+    void SetViewerTruthPortalSquares(const std::vector<MapDrawer::PortalSquare>& squares);
+    void ClearViewerTruthPortalSquares();
 
     std::vector<MapPoint*> GetTrackedMapPoints();
     std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();

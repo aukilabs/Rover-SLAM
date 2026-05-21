@@ -31,6 +31,7 @@ if [ $? -eq 0 ]; then
     echo "Options:"
     echo "  --port 8080              Set server port"
     echo "  --output-dir ./output    Set output directory"
+    echo "  --debug-output ./debug   Write latest trajectory JSON for debugging"
     echo "  --max-queue 10           Set maximum queue size"
     echo "  --viewer                 Enable SLAM viewer"
     echo "  --help                   Show help"

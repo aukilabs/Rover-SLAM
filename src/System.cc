@@ -1545,6 +1545,42 @@ void System::GetActiveMapDenseTrajectory(std::vector<TrajectorySample> &out)
     }
 }
 
+void System::SetViewerAlignment(const Eigen::Matrix3f& R_domain_slam, const Eigen::Vector3f& t_domain_slam, float scale)
+{
+    if(mpMapDrawer)
+        mpMapDrawer->SetViewerAlignment(R_domain_slam, t_domain_slam, scale);
+}
+
+void System::ClearViewerAlignment()
+{
+    if(mpMapDrawer)
+        mpMapDrawer->ClearViewerAlignment();
+}
+
+void System::SetViewerPortalSquares(const std::vector<MapDrawer::PortalSquare>& squares)
+{
+    if(mpMapDrawer)
+        mpMapDrawer->SetViewerPortalSquares(squares);
+}
+
+void System::ClearViewerPortalSquares()
+{
+    if(mpMapDrawer)
+        mpMapDrawer->ClearViewerPortalSquares();
+}
+
+void System::SetViewerTruthPortalSquares(const std::vector<MapDrawer::PortalSquare>& squares)
+{
+    if(mpMapDrawer)
+        mpMapDrawer->SetViewerTruthPortalSquares(squares);
+}
+
+void System::ClearViewerTruthPortalSquares()
+{
+    if(mpMapDrawer)
+        mpMapDrawer->ClearViewerTruthPortalSquares();
+}
+
 vector<MapPoint*> System::GetTrackedMapPoints()
 {
     unique_lock<mutex> lock(mMutexState);

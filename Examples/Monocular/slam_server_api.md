@@ -52,7 +52,7 @@ Submit **one** image for tracking. The handler **queues** the frame and returns 
 | `503` | Image queue is full (`success: false`, `error` explains retry). |
 | `500` | Internal exception (`success: false`, `error`). |
 
-Queue depth is limited by `--max-queue` (default `10`).
+Queue depth is limited by `--max-queue` (default `10`). If `--slam-interval-nth N` is greater than `1`, accepted frames outside the interval return success but are not queued for SLAM.
 
 ---
 
@@ -135,7 +135,16 @@ X-Intrinsics: 500,500,320,240
 
 ## `GET /api/v1/trajectory`
 
-Returns recent **successful** poses held in memory (ring buffer; oldest entries dropped when over cap, default **1000** poses in code).
+Returns poses from the **active atlas map** (not a global multi-map export). By default every tracked frame is included; use `?dense=0` for keyframes only. If portal alignment is enabled and at least one portal has been accepted, poses are returned in the domain/COLMAP frame; use `?aligned=0` for raw SLAM coordinates.
+
+If the server was started with `--debug-output <dir>`, every trajectory response is also written as pretty JSON to `<dir>/trajectory_latest.json`, overwriting the previous file.
+
+**Query parameters**
+
+| Param | Default | Meaning |
+|--------|---------|---------|
+| `dense` | `1` (on) | `dense=0` or `dense=false` → keyframes only; otherwise all frames on the active map. |
+| `aligned` | `1` (on) | `aligned=0` or `aligned=false` → raw ORB-SLAM coordinates, even when portal alignment is available. |
 
 **Response:** JSON
 
@@ -145,17 +154,67 @@ Returns recent **successful** poses held in memory (ring buffer; oldest entries 
     {
       "timestamp": 1735689600.123,
       "frame_id": 42,
+      "is_keyframe": false,
       "position": [x, y, z],
       "orientation": [w, x, y, z],
       "processing_time_ms": 45.2
     }
   ],
-  "count": 1
+  "count": 1,
+  "map_id": 0,
+  "dense": true,
+  "source": "active_map_dense_frames",
+  "coordinate_frame": "domain_colmap",
+  "alignment": {
+    "enabled": true,
+    "aligned": true,
+    "status": "aligned",
+    "scale": 1.23,
+    "scale_source": "single_portal_local_points",
+    "portal_observations": 1,
+    "last_portal_short_id": "ABCD1234",
+    "last_reprojection_error_px": 1.2,
+    "last_local_points_used": 12
+  }
 }
 ```
 
-- **`position`:** Translation in meters (same frame as SLAM output).
-- **`orientation`:** Unit quaternion **`[w, x, y, z]`** (scalar-first).
+### Coordinate convention (trajectory poses)
+
+Each trajectory entry is produced by `TwcToClientJson` in `slam_server.cc` from a **world-from-camera** pose **`Twc`** (OpenCV / ORB camera convention: **+Z forward**, **+Y down**, **+X right** in camera space; translation is the **camera optical center in world**). With portal alignment active, `Twc` is first transformed by the current domain-from-SLAM `Sim(3)`.
+
+| Field | Meaning |
+|--------|---------|
+| **`position`** | `Twc.translation()` in **meters** — camera center in the reported `coordinate_frame`. **No axis flip** is applied to translation. |
+| **`orientation`** | Unit quaternion **`[w, x, y, z]`** (Hamilton, scalar-first) for the **3×3 rotation** `R_three = R_wc × cv_to_three`, where `R_wc` is the rotation part of `Twc` and `cv_to_three = diag(1, −1, −1)`. This right-multiplies the camera frame so **+Y and +Z are negated** relative to OpenCV — the usual fix for plotting ORB/OpenCV camera poses in **Three.js** (Y-up, −Z forward). |
+| **`is_keyframe`** | Whether this sample came from a map keyframe (`dense=0`) or is a per-frame track sample (`dense=1`). |
+
+**Not included:** `Tcw` / `cam_from_world`, OpenGL (ARKit) poses, or uncorrected `R_wc` quaternions. Clients that need raw SLAM `Twc` should request `GET /api/v1/trajectory?aligned=0`.
+
+### Portal alignment
+
+Start the server with `--portal-manifest <refined_manifest.json>` to enable portal alignment. The manifest must contain `portals[].shortId`, `portals[].pose.position`, `portals[].pose.rotation`, and metric `portals[].physicalSize`. Portal poses are loaded with the same OpenGL/domain-to-COLMAP conversion used by the reconstruction server: position `[x,y,z] -> [y,x,-z]`, quaternion `[x,y,z,w] -> [y,x,-z,w]`.
+
+For each accepted frame, the server can detect QR payloads matching `https://r8.hr/<SHORT_ID>`, solve a metric portal pose with OpenCV `solvePnP` from the QR corners and `physicalSize`, then align ORB-SLAM's monocular trajectory to the domain frame. A single portal can provide an approximate scale by comparing the metric portal-plane geometry to SLAM map points projected near the QR in the same frame. Repeated detections of the same QR, or detections of multiple portals, refine scale from camera-center baselines.
+
+When `--viewer` is enabled, the Pangolin map viewer applies the same domain-from-SLAM transform at render time after the first accepted portal alignment. This affects the displayed active-map points, keyframes, graph lines, and current camera only; the underlying ORB-SLAM map remains in raw SLAM coordinates for tracking, bundle adjustment, and loop closure.
+
+`alignment.scale_source` indicates the active scale estimate:
+
+| Value | Meaning |
+|--------|---------|
+| `single_portal_local_points` | Scale from multiple SLAM points projected near one detected portal. |
+| `single_portal_local_depth` | Scale from one nearby SLAM point, less stable than point-pair scale. |
+| `portal_camera_baseline` | Scale refined from repeated same-QR or multi-portal camera baselines. |
+| `unit_fallback` | Portal pose anchored rotation/translation, but no reliable metric scale estimate was available. |
+
+**Implementing the same convention elsewhere** (e.g. image localization servers): given world-from-camera `Twc` in an OpenCV-style camera frame,
+
+```
+R_three = R_wc @ [[1,0,0],[0,-1,0],[0,0,-1]]
+position  = t_wc
+orientation = quaternion(R_three) as [w, x, y, z]
+```
 
 ---
 
@@ -183,7 +242,7 @@ Returns a short JSON description and the list of endpoints (same information as 
 ## Command-line (server)
 
 ```text
-./slam_server <vocabulary> <settings.yaml> [--port N] [--output-dir DIR] [--max-queue N] [--viewer]
+./slam_server <vocabulary> <settings.yaml> [--port N] [--output-dir DIR] [--debug-output DIR] [--max-queue N] [--slam-interval-nth N] [--viewer] [--portal-manifest refined_manifest.json]
 ```
 
 See `README_slam_server.md` for build notes and examples.
