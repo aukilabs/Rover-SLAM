@@ -164,7 +164,7 @@ void Viewer::Run()
     mbFinished = false;
     mbStopped = false;
 
-    pangolin::CreateWindowAndBind("ORB-SLAM3: Map Viewer",1024,768);
+    pangolin::CreateWindowAndBind("AUKI-SLAM",1024,768);
 
     // 3D Mouse handler requires depth testing to be enabled
     glEnable(GL_DEPTH_TEST);
@@ -180,6 +180,7 @@ void Viewer::Run()
     // pangolin::Var<bool> menuSideView("menu.Side View",false,false);
     pangolin::Var<bool> menuShowPoints("menu.Show Points",true,true);
     pangolin::Var<bool> menuShowPortals("menu.Show Portals",true,true);
+    pangolin::Var<bool> menuShowTopography("menu.Show Topography",true,true);
     pangolin::Var<bool> menuShowKeyFrames("menu.Show KeyFrames",true,true);
     pangolin::Var<bool> menuShowGraph("menu.Show Graph",false,true);
     pangolin::Var<bool> menuShowInertialGraph("menu.Show Inertial Graph",true,true);
@@ -193,13 +194,13 @@ void Viewer::Run()
     // Define Camera Render Object (for view / scene browsing)
     pangolin::OpenGlRenderState s_cam(
                 pangolin::ProjectionMatrix(1024,768,mViewpointF,mViewpointF,512,389,0.1,1000),
-                pangolin::ModelViewLookAt(mViewpointX,mViewpointY,mViewpointZ, 0,0,0,0.0,-1.0, 0.0)
+                pangolin::ModelViewLookAt(mViewpointX,mViewpointY,mViewpointZ, 0,0,0,1.0,0.0, 0.0)
                 );
 
     // Add named OpenGL viewport to window and provide 3D Handler
     pangolin::View& d_cam = pangolin::CreateDisplay()
             .SetBounds(0.0, 1.0, pangolin::Attach::Pix(175), 1.0, -1024.0f/768.0f)
-            .SetHandler(new pangolin::Handler3D(s_cam));
+            .SetHandler(new pangolin::Handler3D(s_cam, pangolin::AxisX));
 
     pangolin::OpenGlMatrix Twc, Twr;
     Twc.SetIdentity();
@@ -244,13 +245,13 @@ void Viewer::Run()
             if(bCameraView)
             {
                 s_cam.SetProjectionMatrix(pangolin::ProjectionMatrix(1024,768,mViewpointF,mViewpointF,512,389,0.1,1000));
-                s_cam.SetModelViewMatrix(pangolin::ModelViewLookAt(mViewpointX,mViewpointY,mViewpointZ, 0,0,0,0.0,-1.0, 0.0));
+                s_cam.SetModelViewMatrix(pangolin::ModelViewLookAt(mViewpointX,mViewpointY,mViewpointZ, 0,0,0,1.0,0.0, 0.0));
                 s_cam.Follow(Twc);
             }
             else
             {
                 s_cam.SetProjectionMatrix(pangolin::ProjectionMatrix(1024,768,3000,3000,512,389,0.1,1000));
-                s_cam.SetModelViewMatrix(pangolin::ModelViewLookAt(0,0.01,10, 0,0,0,0.0,0.0, 1.0));
+                s_cam.SetModelViewMatrix(pangolin::ModelViewLookAt(0,0.01,10, 0,0,0,1.0,0.0, 0.0));
                 s_cam.Follow(Ow);
             }
             bFollow = true;
@@ -265,7 +266,7 @@ void Viewer::Run()
             menuCamView = false;
             bCameraView = true;
             s_cam.SetProjectionMatrix(pangolin::ProjectionMatrix(1024,768,mViewpointF,mViewpointF,512,389,0.1,10000));
-            s_cam.SetModelViewMatrix(pangolin::ModelViewLookAt(mViewpointX,mViewpointY,mViewpointZ, 0,0,0,0.0,-1.0, 0.0));
+            s_cam.SetModelViewMatrix(pangolin::ModelViewLookAt(mViewpointX,mViewpointY,mViewpointZ, 0,0,0,1.0,0.0, 0.0));
             s_cam.Follow(Twc);
         }
 
@@ -274,7 +275,7 @@ void Viewer::Run()
             menuTopView = false;
             bCameraView = false;
             s_cam.SetProjectionMatrix(pangolin::ProjectionMatrix(1024,768,3000,3000,512,389,0.1,10000));
-            s_cam.SetModelViewMatrix(pangolin::ModelViewLookAt(0,0.01,50, 0,0,0,0.0,0.0, 1.0));
+            s_cam.SetModelViewMatrix(pangolin::ModelViewLookAt(0,0.01,50, 0,0,0,1.0,0.0, 0.0));
             s_cam.Follow(Ow);
         }
 
@@ -315,8 +316,12 @@ void Viewer::Run()
             mpMapDrawer->DrawKeyFrames(menuShowKeyFrames,menuShowGraph, menuShowInertialGraph, menuShowOptLba);
         if(menuShowPoints)
             mpMapDrawer->DrawMapPoints();
-        if(menuShowPortals)
+        if(menuShowTopography)
+            mpMapDrawer->DrawTopographyMesh();
+        if(menuShowPortals) {
             mpMapDrawer->DrawPortalSquares();
+            mpMapDrawer->DrawCustomPoints();
+        }
 
         pangolin::FinishFrame();
 
@@ -348,6 +353,7 @@ void Viewer::Run()
             menuShowKeyFrames = true;
             menuShowPoints = true;
             menuShowPortals = true;
+            menuShowTopography = true;
             menuLocalizationMode = false;
             if(bLocalizationMode)
                 mpSystem->DeactivateLocalizationMode();

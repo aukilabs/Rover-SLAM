@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.11)
 project(ORB_SLAM3)
 
 IF(NOT CMAKE_BUILD_TYPE)
@@ -171,6 +171,48 @@ ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so
 )
 
 
+find_package(ZXing QUIET CONFIG)
+set(SLAM_SERVER_ZXING_SYSTEM_HEADERS OFF)
+if(ZXing_FOUND)
+  set(SLAM_SERVER_ZXING_SYSTEM_HEADERS ON)
+else()
+  include(FetchContent)
+  set(BUILD_WRITERS OFF CACHE BOOL "Build ZXing writers" FORCE)
+  set(BUILD_EXAMPLES OFF CACHE BOOL "Build ZXing examples" FORCE)
+  set(BUILD_BLACKBOX_TESTS OFF CACHE BOOL "Build ZXing blackbox tests" FORCE)
+  set(BUILD_UNIT_TESTS OFF CACHE BOOL "Build ZXing unit tests" FORCE)
+  set(BUILD_PYTHON_MODULE OFF CACHE BOOL "Build ZXing Python module" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build ZXing as a static library" FORCE)
+
+  FetchContent_Declare(
+    zxing_cpp
+    GIT_REPOSITORY https://github.com/zxing-cpp/zxing-cpp.git
+    GIT_TAG v1.1.0
+    GIT_SHALLOW TRUE
+  )
+  if(COMMAND FetchContent_MakeAvailable)
+    FetchContent_MakeAvailable(zxing_cpp)
+  else()
+    FetchContent_GetProperties(zxing_cpp)
+    if(NOT zxing_cpp_POPULATED)
+      FetchContent_Populate(zxing_cpp)
+      add_subdirectory(${zxing_cpp_SOURCE_DIR} ${zxing_cpp_BINARY_DIR} EXCLUDE_FROM_ALL)
+    endif()
+  endif()
+  if(TARGET ZXing AND NOT MSVC)
+    # ZXing-C++ v1.1.0 is C++14-compatible but misses <limits> in a few headers on newer GCC.
+    target_compile_options(ZXing PRIVATE -include limits)
+  endif()
+endif()
+if(NOT TARGET ZXing::ZXing)
+  message(FATAL_ERROR "ZXing::ZXing target not available")
+endif()
+
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(LIBHEIF QUIET libheif)
+endif()
+
 # Build examples
 
 
@@ -196,7 +238,19 @@ target_link_libraries(mono_tum_vi ${PROJECT_NAME})
 
 add_executable(slam_server
         Examples/Monocular/slam_server.cc)
-target_link_libraries(slam_server ${PROJECT_NAME})
+target_link_libraries(slam_server ${PROJECT_NAME} ZXing::ZXing)
+if(SLAM_SERVER_ZXING_SYSTEM_HEADERS)
+  target_compile_definitions(slam_server PRIVATE SLAM_SERVER_ZXING_SYSTEM_HEADERS)
+endif()
+if(LIBHEIF_FOUND)
+  target_compile_definitions(slam_server PRIVATE SLAM_SERVER_HAVE_LIBHEIF)
+  target_include_directories(slam_server PRIVATE ${LIBHEIF_INCLUDE_DIRS})
+  target_compile_options(slam_server PRIVATE ${LIBHEIF_CFLAGS_OTHER})
+  target_link_libraries(slam_server ${LIBHEIF_LDFLAGS})
+  message(STATUS "slam_server HEIC fallback enabled via libheif ${LIBHEIF_VERSION}")
+else()
+  message(STATUS "slam_server HEIC fallback disabled; install libheif-dev for HEIC uploads when OpenCV lacks HEIF support")
+endif()
 
 
 #Monocular inertial examples

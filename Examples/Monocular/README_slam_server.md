@@ -60,7 +60,7 @@ Get current server status and statistics.
 ```
 
 #### `GET /api/v1/trajectory`
-Get trajectory poses for the active map (`?dense=0` for keyframes only, `?aligned=0` for raw SLAM coordinates). See **[slam_server_api.md](slam_server_api.md)** for full response fields and **coordinate convention**: `position` = reported-frame `Twc` translation (camera center in SLAM or portal-aligned domain coordinates); `orientation` = `[w,x,y,z]` for `R_wc × diag(1,−1,−1)` (Three.js-friendly camera rotation).
+Get trajectory poses for the active map (`?dense=0` for keyframes only, `?aligned=0` for raw SLAM coordinates). The response also includes app-renderable `placed_data` rows (`barcode_ean13`, `portal_corner`) and 2D `frame_detections` rows for overlays/debugging. See **[slam_server_api.md](slam_server_api.md)** for the full response schema, detector-only high-res still behavior, and **coordinate convention**: `position`/`placed_data[].point` are world coordinates in the reported frame; `orientation` = `[w,x,y,z]` for `R_wc × diag(1,−1,−1)` (Three.js-friendly camera rotation).
 
 #### `GET /api/v1/health`
 Health check endpoint.
@@ -164,6 +164,7 @@ make slam_server
 - `--debug-output <path>`: Directory for `trajectory_latest.json`, overwritten on every `GET /api/v1/trajectory` response (default: disabled)
 - `--max-queue <number>`: Maximum image queue size (default: 10)
 - `--slam-interval-nth <N>`: Run SLAM on one out of every N accepted frames, starting with the first accepted frame (default: 1)
+- `--custom-detect-every <N>`: Run custom EAN-13 barcode detection every N accepted frames; use `X-Run-Detector` or JSON `run_detector` to force detection for a single upload (default: disabled)
 - `--min-buffer <number>`: Min frames queued before tracking; oldest timestamp first (default: 3)
 - `--portal-manifest <path>`: Enable portal QR alignment from a refined manifest containing `portals[].shortId`, `portals[].pose`, and metric `portals[].physicalSize`.
 - `--portal-detect-every <N>`: Run portal QR detection every N accepted frames (default: 1)

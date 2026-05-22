@@ -20,10 +20,10 @@ Camera1.cx: 716.9096
 Camera1.cy: 963.1064
 
 # Camera resolution
-Camera.width: 720
+Camera.width: 960
 Camera.height: 1280
 
-Camera.newWidth: 360
+Camera.newWidth: 480
 Camera.newHeight: 640
 # Camera frames per second 
 Camera.fps: 10

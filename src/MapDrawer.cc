@@ -21,6 +21,7 @@
 #include "KeyFrame.h"
 #include <pangolin/pangolin.h>
 #include <algorithm>
+#include <cmath>
 #include <mutex>
 
 namespace ORB_SLAM3
@@ -178,6 +179,30 @@ void MapDrawer::ClearViewerTruthPortalSquares()
     mViewerTruthPortalSquares.clear();
 }
 
+void MapDrawer::SetViewerCustomPoints(const std::vector<CustomPoint> &points)
+{
+    unique_lock<mutex> lock(mMutexViewerCustomPoints);
+    mViewerCustomPoints = points;
+}
+
+void MapDrawer::ClearViewerCustomPoints()
+{
+    unique_lock<mutex> lock(mMutexViewerCustomPoints);
+    mViewerCustomPoints.clear();
+}
+
+void MapDrawer::SetViewerTopographyMesh(const std::vector<MeshTriangle> &triangles)
+{
+    unique_lock<mutex> lock(mMutexViewerTopographyMesh);
+    mViewerTopographyMesh = triangles;
+}
+
+void MapDrawer::ClearViewerTopographyMesh()
+{
+    unique_lock<mutex> lock(mMutexViewerTopographyMesh);
+    mViewerTopographyMesh.clear();
+}
+
 Eigen::Vector3f MapDrawer::ApplyViewerAlignment(const Eigen::Vector3f &p_slam, const ViewerAlignment &alignment)
 {
     if(!alignment.enabled)
@@ -299,6 +324,90 @@ void MapDrawer::DrawPortalSquares()
 
     drawSquares(truthSquares, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f);
     drawSquares(squares, 0.0f, 0.35f, 1.0f, 1.0f, 0.15f, 0.0f);
+}
+
+void MapDrawer::DrawCustomPoints()
+{
+    std::vector<CustomPoint> points;
+    {
+        unique_lock<mutex> lock(mMutexViewerCustomPoints);
+        points = mViewerCustomPoints;
+    }
+    if(points.empty())
+        return;
+
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr int kSlices = 12;
+    constexpr int kStacks = 8;
+
+    glDisable(GL_LIGHTING);
+    glColor3f(0.0f, 0.0f, 1.0f);
+    for(const CustomPoint &point : points)
+    {
+        if(point.diameter_m <= 0.0f)
+            continue;
+        const float radius = 0.5f * point.diameter_m;
+        const float cx = point.point[0];
+        const float cy = point.point[1];
+        const float cz = point.point[2];
+
+        for(int stack = 0; stack < kStacks; ++stack)
+        {
+            const float phi0 = -0.5f * kPi + kPi * static_cast<float>(stack) / static_cast<float>(kStacks);
+            const float phi1 = -0.5f * kPi + kPi * static_cast<float>(stack + 1) / static_cast<float>(kStacks);
+            glBegin(GL_TRIANGLE_STRIP);
+            for(int slice = 0; slice <= kSlices; ++slice)
+            {
+                const float theta = 2.0f * kPi * static_cast<float>(slice) / static_cast<float>(kSlices);
+                const float cosTheta = std::cos(theta);
+                const float sinTheta = std::sin(theta);
+                const float cosPhi0 = std::cos(phi0);
+                const float cosPhi1 = std::cos(phi1);
+
+                glVertex3f(
+                    cx + radius * cosPhi0 * cosTheta,
+                    cy + radius * cosPhi0 * sinTheta,
+                    cz + radius * std::sin(phi0));
+                glVertex3f(
+                    cx + radius * cosPhi1 * cosTheta,
+                    cy + radius * cosPhi1 * sinTheta,
+                    cz + radius * std::sin(phi1));
+            }
+            glEnd();
+        }
+    }
+}
+
+void MapDrawer::DrawTopographyMesh()
+{
+    unique_lock<mutex> lock(mMutexViewerTopographyMesh);
+    if(mViewerTopographyMesh.empty())
+        return;
+
+    glDisable(GL_LIGHTING);
+    glColor4f(0.35f, 0.35f, 0.35f, 0.22f);
+    glBegin(GL_TRIANGLES);
+    for(const MeshTriangle &triangle : mViewerTopographyMesh)
+    {
+        for(const auto &p : triangle.vertices)
+            glVertex3f(p[0], p[1], p[2]);
+    }
+    glEnd();
+
+    glLineWidth(std::max(1.0f, mGraphLineWidth));
+    glColor4f(0.12f, 0.12f, 0.12f, 0.45f);
+    glBegin(GL_LINES);
+    for(const MeshTriangle &triangle : mViewerTopographyMesh)
+    {
+        for(int i = 0; i < 3; ++i)
+        {
+            const auto &a = triangle.vertices[i];
+            const auto &b = triangle.vertices[(i + 1) % 3];
+            glVertex3f(a[0], a[1], a[2]);
+            glVertex3f(b[0], b[1], b[2]);
+        }
+    }
+    glEnd();
 }
 
 void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const bool bDrawInertialGraph, const bool bDrawOptLba)

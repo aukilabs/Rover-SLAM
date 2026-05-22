@@ -1581,6 +1581,30 @@ void System::ClearViewerTruthPortalSquares()
         mpMapDrawer->ClearViewerTruthPortalSquares();
 }
 
+void System::SetViewerCustomPoints(const std::vector<MapDrawer::CustomPoint>& points)
+{
+    if(mpMapDrawer)
+        mpMapDrawer->SetViewerCustomPoints(points);
+}
+
+void System::ClearViewerCustomPoints()
+{
+    if(mpMapDrawer)
+        mpMapDrawer->ClearViewerCustomPoints();
+}
+
+void System::SetViewerTopographyMesh(const std::vector<MapDrawer::MeshTriangle>& triangles)
+{
+    if(mpMapDrawer)
+        mpMapDrawer->SetViewerTopographyMesh(triangles);
+}
+
+void System::ClearViewerTopographyMesh()
+{
+    if(mpMapDrawer)
+        mpMapDrawer->ClearViewerTopographyMesh();
+}
+
 vector<MapPoint*> System::GetTrackedMapPoints()
 {
     unique_lock<mutex> lock(mMutexState);

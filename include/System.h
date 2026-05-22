@@ -200,6 +200,10 @@ public:
     void ClearViewerPortalSquares();
     void SetViewerTruthPortalSquares(const std::vector<MapDrawer::PortalSquare>& squares);
     void ClearViewerTruthPortalSquares();
+    void SetViewerCustomPoints(const std::vector<MapDrawer::CustomPoint>& points);
+    void ClearViewerCustomPoints();
+    void SetViewerTopographyMesh(const std::vector<MapDrawer::MeshTriangle>& triangles);
+    void ClearViewerTopographyMesh();
 
     std::vector<MapPoint*> GetTrackedMapPoints();
     std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();

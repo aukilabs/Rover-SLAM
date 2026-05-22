@@ -48,12 +48,26 @@ public:
         std::array<std::array<float, 3>, 4> corners;
     };
 
+    struct CustomPoint
+    {
+        std::string type;
+        std::string id;
+        std::array<float, 3> point;
+        float diameter_m = 0.1f;
+    };
+
+    struct MeshTriangle
+    {
+        std::array<std::array<float, 3>, 3> vertices;
+    };
+
     void newParameterLoader(Settings* settings);
 
     Atlas* mpAtlas;
 
     void DrawMapPoints();
     void DrawPortalSquares();
+    void DrawCustomPoints();
     void DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const bool bDrawInertialGraph, const bool bDrawOptLba);
     void DrawCurrentCamera(pangolin::OpenGlMatrix &Twc);
     void SetCurrentCameraPose(const Sophus::SE3f &Tcw);
@@ -65,6 +79,11 @@ public:
     void ClearViewerPortalSquares();
     void SetViewerTruthPortalSquares(const std::vector<PortalSquare> &squares);
     void ClearViewerTruthPortalSquares();
+    void SetViewerCustomPoints(const std::vector<CustomPoint> &points);
+    void ClearViewerCustomPoints();
+    void SetViewerTopographyMesh(const std::vector<MeshTriangle> &triangles);
+    void ClearViewerTopographyMesh();
+    void DrawTopographyMesh();
 
 private:
 
@@ -94,9 +113,13 @@ private:
     std::mutex mMutexCamera;
     std::mutex mMutexViewerAlignment;
     std::mutex mMutexViewerPortalSquares;
+    std::mutex mMutexViewerCustomPoints;
+    std::mutex mMutexViewerTopographyMesh;
     ViewerAlignment mViewerAlignment;
     std::vector<PortalSquare> mViewerPortalSquares;
     std::vector<PortalSquare> mViewerTruthPortalSquares;
+    std::vector<CustomPoint> mViewerCustomPoints;
+    std::vector<MeshTriangle> mViewerTopographyMesh;
 
     float mfFrameColors[6][3] = {{0.0f, 0.0f, 1.0f},
                                 {0.8f, 0.4f, 1.0f},
