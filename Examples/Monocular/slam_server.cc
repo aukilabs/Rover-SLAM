@@ -1918,7 +1918,7 @@ private:
         const vector<BarcodeRoiCandidate> candidates =
             barcodeRoiCandidates(gray, numeric_limits<size_t>::max());
         roi_candidates_ms = elapsedMs(roi_candidates_start, chrono::high_resolution_clock::now());
-        const vector<float> scales = {1.0f, 2.0f, 1.5f};
+        const vector<float> scales = {1.0f};//, 2.0f, 1.5f};
         const auto roi_scans_start = chrono::high_resolution_clock::now();
         for (size_t i = 0; i < candidates.size(); ++i) {
             const BarcodeRoiCandidate& candidate = candidates[i];
@@ -1931,6 +1931,7 @@ private:
                 static_cast<float>(candidate.rect.x),
                 static_cast<float>(candidate.rect.y));
 
+            
             for (float scale : scales) {
                 cv::Mat scaled_crop;
                 cv::Mat scaled_clahe;
@@ -1951,6 +1952,10 @@ private:
                 scan(*clahe_to_scan, ZXing::Binarizer::LocalAverage, "clahe/local" + suffix,
                      offset, scale);
             }
+            
+            // string suffix =
+            //        " roi#" + to_string(i) + " score=" + to_string(candidate.score);
+            //scan(crop, ZXing::Binarizer::LocalAverage, "gray/local" + suffix, offset, 1.0f);
         }
         roi_scans_ms = elapsedMs(roi_scans_start, chrono::high_resolution_clock::now());
 
@@ -1963,8 +1968,8 @@ private:
              << " barcode timing_ms total=" << total_ms
              << " luminance=" << luminance_ms
              << " full_gray=" << full_gray_ms
-             << " clahe_prepare=" << clahe_prepare_ms
-             << " full_clahe=" << full_clahe_ms
+             //<< " clahe_prepare=" << clahe_prepare_ms
+             //<< " full_clahe=" << full_clahe_ms
              << " roi_candidates=" << roi_candidates_ms
              << " roi_scans=" << roi_scans_ms
              << " candidates=" << candidates.size()

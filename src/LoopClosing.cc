@@ -1174,11 +1174,11 @@ bool LoopClosing::DetectCommonRegionsFromBoW_sp(
     int nProjOptMatches = 80; // 通过更小的半径,更严的距离搜索到的匹配点数量
 
     // CUSTOM
-    //nBoWMatches = 30;
-    //nBoWInliers = 20;
-    //nSim3Inliers = 15;
-    nProjMatches = 50; //100
-    nProjOptMatches = 30;
+    nBoWMatches = 30;
+    nBoWInliers = 20;
+    nSim3Inliers = 20;
+    nProjMatches = 60; //100
+    nProjOptMatches = 40;
 
     //nBoWMatches *= 3; // 5;
     //nBoWInliers *= 3; // 5;
