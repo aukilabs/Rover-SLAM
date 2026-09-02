@@ -9,7 +9,8 @@ File.version: "1.0"
 
 Camera.type: "Rectified"
 
-#loopClosing: 0
+# ALIKED v1: loop closure and relocalization deferred (see README_slam_server.md).
+loopClosing: 0
 
 # Camera calibration and distortion parameters (OpenCV) 
 # Picked one frame for now, TODO use recorded frame intrinsics instead.

@@ -86,7 +86,9 @@ SPextractor::SPextractor(int _nfeatures, float _scaleFactor, int _nlevels,
     nfeatures(_nfeatures), scaleFactor(_scaleFactor), nlevels(_nlevels),
     iniThFAST(_iniThFAST), minThFAST(_minThFAST)
 {
-   
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+    featureExtractor = new AlikedExtractor();
+#else
     if(mModelstr == "onnx")
     {   Configuration cfg;
         cfg.device = "cuda";
@@ -96,6 +98,7 @@ SPextractor::SPextractor(int _nfeatures, float _scaleFactor, int _nlevels,
         featureExtractor->InitOrtEnv(cfg);
 
     }
+#endif
     // else{
     //     mModel = _superpoint;
     //     if(!(mModel)->build()){
@@ -143,6 +146,13 @@ SPextractor::SPextractor(int _nfeatures, float _scaleFactor, int _nlevels,
     }
     mnFeaturesPerLevel[nlevels-1] = std::max(nfeatures - sumFeatures, 0);
 
+}
+
+
+SPextractor::~SPextractor()
+{
+    delete featureExtractor;
+    featureExtractor = nullptr;
 }
 
 
@@ -591,6 +601,10 @@ int SPextractor::operator()( InputArray _image,  vector<KeyPoint>& _keypoints,
 
 int SPextractor::ExtractSingleLayer(const cv::Mat &image, std::vector<cv::KeyPoint>& vKeyPoints, cv::Mat &Descriptors)
 {
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+    featureExtractor->lastmatch = lastmatchnum;
+    return featureExtractor->Extract(image, vKeyPoints, Descriptors);
+#else
     if(mModelstr == "onnx"){
         Configuration cfg;
         cv::Mat image_copy = image.clone();
@@ -614,6 +628,7 @@ int SPextractor::ExtractSingleLayer(const cv::Mat &image, std::vector<cv::KeyPoi
 
 
     return vKeyPoints.size();
+#endif
 }
 
 int SPextractor::ExtractMultiLayers(const cv::Mat &image, std::vector<cv::KeyPoint>& vKeyPoints, cv::Mat &Descriptors)

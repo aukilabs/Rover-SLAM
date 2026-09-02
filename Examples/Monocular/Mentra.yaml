@@ -8,7 +8,8 @@ File.version: "1.0"
 # System.SaveAtlasToFile: "Session_MH01_MH02_MH03_Stereo60_Pseudo"
 
 Camera.type: "PinHole"
-loopClosing: 1
+# ALIKED v1: loop closure and relocalization deferred (see README_slam_server.md).
+loopClosing: 0
 
 # Camera calibration and distortion parameters (OpenCV) 
 # 707.15, 717.47, 640, 360, 0.00423664, -0.0953159, -0.00359639, -0.00170014 (colmap)

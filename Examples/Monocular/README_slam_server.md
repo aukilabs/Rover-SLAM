@@ -133,19 +133,53 @@ python3 Examples/Monocular/send_frame.py datasets/dmt_euroc/85a134bb-ecbd-40c0-b
 ```
 
 
+## ALIKED + LightGlue (default stack)
+
+When built with LibTorch (`LIBTORCH_ROOT` set at configure time), `slam_server` uses the MrNeRF ALIKED extractor (`aliked-n16`, top_k≈1024) and LightGlue matcher from `third_party/Light_Glue_CPP`. Weights are read from `third_party/Light_Glue_CPP/models/` (`aliked-n16.pt`, `aliked_lightglue.pt`).
+
+### Build requirements
+
+| Dependency | Notes |
+|------------|--------|
+| `LIBTORCH_ROOT` | CUDA LibTorch prefix (env var or `-DLIBTORCH_ROOT=...`). Required for the ALIKED+LightGlue path. |
+| CUDA | **12.1+** (enforced by `cmake/modules/light_glue_cpp.cmake`). |
+| Model weights | `third_party/Light_Glue_CPP/models/aliked-n16.pt`, `aliked_lightglue.pt` (and siblings if you switch models). |
+
+```bash
+export LIBTORCH_ROOT=/opt/libtorch
+mkdir build && cd build
+cmake .. -DLIBTORCH_ROOT=$LIBTORCH_ROOT
+make slam_server
+```
+
+Without `LIBTORCH_ROOT`, CMake skips `auki_lightglue_lib` and the legacy ONNX SuperPoint/LightGlue path is used instead.
+
+### Loop closure and relocalization (deferred in v1)
+
+**Set `loopClosing: 0` in your settings YAML.** If the key is omitted, `System.cc` defaults loop closing **on**, which is not supported for the ALIKED v1 stack.
+
+Loop closure and relocalization are **not available** in v1 (no ALIKED DBoW vocabulary; EigenPlaces global retrieval is a planned follow-on). Tracking and mapping continue to work with loop closing disabled.
+
+Example configs (`iphoneSLAM.yaml`, `DMT.yaml`, `Mentra.yaml`) ship with `loopClosing: 0`.
+
+### Vocabulary CLI argument (still required)
+
+You must still pass a vocabulary file at startup, e.g. `Vocabulary/voc_binary_tartan_8u_6.yml.gz`. The binary loads the SuperPoint DBoW vocabulary during `System` construction even when `loopClosing: 0`. Making the argument optional is deferred until EigenPlaces/place-recognition follow-on work.
+
 ## Usage
 
 ### Building
 ```bash
+export LIBTORCH_ROOT=/opt/libtorch   # adjust to your LibTorch install
 mkdir build && cd build
-cmake ..
+cmake .. -DLIBTORCH_ROOT=$LIBTORCH_ROOT
 make slam_server
 ```
 
 ### Running the Server
 ```bash
-# Basic usage
-./slam_server vocabulary.txt settings.yaml
+# Basic usage (vocabulary path still required; use a yaml with loopClosing: 0)
+./slam_server Vocabulary/voc_binary_tartan_8u_6.yml.gz settings.yaml
 
 # With options
 ./slam_server vocabulary.txt settings.yaml \
@@ -211,10 +245,12 @@ include/third_party/
 
 ## Configuration
 
-The server uses the same ORB-SLAM3 configuration files as the original examples:
+The server uses the same ORB-SLAM3 configuration files as the original examples. For ALIKED v1, include **`loopClosing: 0`** (see above). Default example YAMLs: `iphoneSLAM.yaml`, `Examples/Monocular-Inertial/DMT.yaml`, `Mentra.yaml`.
 
 ```yaml
 # Example settings.yaml
+loopClosing: 0   # required for ALIKED v1 (loop/reloc deferred)
+
 Camera.fx: 500.0
 Camera.fy: 500.0
 Camera.cx: 320.0

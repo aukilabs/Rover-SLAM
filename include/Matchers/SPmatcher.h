@@ -27,7 +27,11 @@
 #include"MapPoint.h"
 #include"KeyFrame.h"
 #include"Frame.h"
-#include"Matchers/lightglue_onnx.h"
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+#include "Matchers/LightGlueMrNerfMatcher.h"
+#else
+#include "Matchers/lightglue_onnx.h"
+#endif
 
 namespace ORB_SLAM3
 {
@@ -126,7 +130,11 @@ namespace ORB_SLAM3
         static const int HISTO_LENGTH;
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+        LightGlueMrNerfMatcher* featureMatcher;
+#else
         LightGlueDecoupleOnnxRunner* featureMatcher;
+#endif
     protected:
         float RadiusByViewingCos(const float &viewCos);
 

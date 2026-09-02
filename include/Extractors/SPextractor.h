@@ -29,7 +29,11 @@
 #include <memory>
 #include <Eigen/Core>
 #include <opencv2/opencv.hpp>
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+#include "Extractors/AlikedExtractor.h"
+#else
 #include "Extractors/superpoint_onnx.h"
+#endif
 //#include "Extractors/super_point.h"
 #ifdef EIGEN_MPL2_ONLY
 #undef EIGEN_MPL2_ONLY
@@ -63,7 +67,7 @@ public:
 
     // SPextractor(const SuperPointConfig &super_point_config);
 
-    ~SPextractor(){}
+    ~SPextractor();
 
 
     // Compute the SP features and descriptors on an image.
@@ -97,8 +101,13 @@ public:
 
     std::vector<cv::Mat> mvImagePyramid;
 
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+    AlikedExtractor* featureExtractor;
+    std::string mModelstr = "aliked";
+#else
     SuperPointOnnxRunner* featureExtractor;
     std::string mModelstr = "onnx";//表明创建onnx模型还是tensorrt
+#endif
 
     float lastmatchnum = 0;
 protected:

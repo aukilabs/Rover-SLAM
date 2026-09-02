@@ -1,5 +1,20 @@
 cmake_minimum_required(VERSION 3.11)
-project(ORB_SLAM3)
+
+if(NOT CMAKE_CUDA_COMPILER)
+  if(DEFINED ENV{CUDA_HOME})
+    set(CMAKE_CUDA_COMPILER "$ENV{CUDA_HOME}/bin/nvcc" CACHE FILEPATH "CUDA compiler")
+  elseif(EXISTS "/usr/local/cuda-12.9/bin/nvcc")
+    set(CMAKE_CUDA_COMPILER "/usr/local/cuda-12.9/bin/nvcc" CACHE FILEPATH "CUDA compiler")
+  elseif(EXISTS "/usr/local/cuda/bin/nvcc")
+    set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc" CACHE FILEPATH "CUDA compiler")
+  endif()
+endif()
+
+if(DEFINED LIBTORCH_ROOT OR DEFINED ENV{LIBTORCH_ROOT} OR CMAKE_CUDA_COMPILER)
+  project(ORB_SLAM3 LANGUAGES CXX C CUDA)
+else()
+  project(ORB_SLAM3 LANGUAGES CXX C)
+endif()
 
 IF(NOT CMAKE_BUILD_TYPE)
   SET(CMAKE_BUILD_TYPE Release)
@@ -31,11 +46,15 @@ set(CMAKE_CXX_FLAGS_DEBUG  "${CMAKE_CXX_FLAGS} -g")
 # endif()
 
 LIST(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake_modules)
+LIST(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/modules)
+
+include(${PROJECT_SOURCE_DIR}/cmake/modules/libtorch.cmake)
 
 # 要保证整个工程的opencv版本一致，包括dbow，源码以及ros相关的
 # 3 4 都可以正常运行//必须要opencv3.4.13,要不然会在加载词袋处卡住
 
 find_package(OpenCV 3.4.13 REQUIRED)
+include(${PROJECT_SOURCE_DIR}/cmake/modules/light_glue_cpp.cmake)
    if(NOT OpenCV_FOUND)
       message(FATAL_ERROR "OpenCV > 3.2 not found.")
    endif()
@@ -113,8 +132,10 @@ src/TwoViewReconstruction.cc
 src/Config.cc
 src/Settings.cc
 src/Extractors/SPextractor.cc
+src/Extractors/AlikedExtractor.cc
 src/Extractors/superpoint_onnx.cc
 src/Matchers/SPmatcher.cc
+src/Matchers/LightGlueMrNerfMatcher.cc
 src/Matchers/lightglue_onnx.cpp
 src/Matchers/transform.cpp
 include/Timestamp.h
@@ -149,8 +170,10 @@ include/TwoViewReconstruction.h
 include/SerializationUtils.h
 include/Config.h
 include/Extractors/SPextractor.h
+include/Extractors/AlikedExtractor.h
 include/Extractors/superpoint_onnx.h
 include/Matchers/SPmatcher.h
+include/Matchers/LightGlueMrNerfMatcher.h
 include/Matchers/lightglue_onnx.h
 include/Matchers/Configuration.h
 include/Matchers/transform.h
@@ -167,8 +190,28 @@ ${PROJECT_SOURCE_DIR}/Thirdparty/DBoW3/lib/libDBoW3.so
 ${PROJECT_SOURCE_DIR}/Thirdparty/g2o/lib/libg2o.so
 -lboost_serialization
 -lcrypto
+-Wl,--no-as-needed
 ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so
+-Wl,--as-needed
 )
+
+if(AUKI_LIGHTGLUE_AVAILABLE)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE AUKI_LIGHTGLUE_AVAILABLE)
+  target_include_directories(${PROJECT_NAME} PRIVATE "${LIGHT_GLUE_CPP_DIR}/include")
+  target_link_libraries(${PROJECT_NAME}
+    auki_lightglue_lib
+    ${TORCH_LIBRARIES})
+  set(_auki_wrapper_sources
+    src/Extractors/AlikedExtractor.cc
+    src/Matchers/LightGlueMrNerfMatcher.cc)
+  # Global CMAKE_CXX_FLAGS uses -std=c++14; override on wrapper TUs for LibTorch.
+  set_source_files_properties(${_auki_wrapper_sources} PROPERTIES
+    COMPILE_OPTIONS "-std=gnu++20"
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS ON)
+  target_compile_options(${PROJECT_NAME} PRIVATE ${TORCH_CXX_FLAGS})
+endif()
 
 
 find_package(ZXing QUIET CONFIG)
@@ -252,6 +295,21 @@ else()
   message(STATUS "slam_server HEIC fallback disabled; install libheif-dev for HEIC uploads when OpenCV lacks HEIF support")
 endif()
 
+if(AUKI_LIGHTGLUE_AVAILABLE)
+  add_executable(smoke_aliked_lightglue Examples/Monocular/smoke_aliked_lightglue.cc)
+  target_compile_definitions(smoke_aliked_lightglue PRIVATE AUKI_LIGHTGLUE_AVAILABLE)
+  target_include_directories(smoke_aliked_lightglue PRIVATE "${LIGHT_GLUE_CPP_DIR}/include")
+  target_link_libraries(smoke_aliked_lightglue PRIVATE
+    "-Wl,--no-as-needed"
+    ${PROJECT_NAME}
+    ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so
+    "-Wl,--as-needed")
+  target_compile_options(smoke_aliked_lightglue PRIVATE ${TORCH_CXX_FLAGS} "-std=c++20")
+  set_target_properties(smoke_aliked_lightglue PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS ON)
+endif()
 
 #Monocular inertial examples
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/Examples/Monocular-Inertial)

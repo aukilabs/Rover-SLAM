@@ -34,6 +34,46 @@ Download ["Examples" ](https://pan.baidu.com/s/1dd6k_Gf8mEjbiyli31_Yeg?pwd=p5y8)
 ## Download Dbow File
 Download ["voc_binary_tartan_8u_6.zip"](https://pan.baidu.com/s/1dd6k_Gf8mEjbiyli31_Yeg?pwd=p5y8), and unzip in ROVER-SLAM/Vocabulary/ .
 
+## ALIKED + LightGlue (MrNeRF stack, default when LibTorch is enabled)
+
+Tracking uses the vendored MrNeRF LibTorch stack (`third_party/Light_Glue_CPP`: ALIKED `aliked-n16`, top_k≈1024, + LightGlue matcher) when CMake finds LibTorch. SuperPoint/LightGlue ONNX are not used on that path.
+
+**Build requirements (GPU host):**
+
+- **LibTorch:** set `LIBTORCH_ROOT` to a CUDA LibTorch install (CMake env var or `-DLIBTORCH_ROOT=...`). If unset, configure skips `auki_lightglue_lib` and falls back to the legacy ONNX SuperPoint/LightGlue path.
+- **CUDA:** **12.1 or newer** (required by `cmake/modules/light_glue_cpp.cmake`).
+- **Model weights:** place MrNeRF checkpoints under `third_party/Light_Glue_CPP/models/` — at minimum `aliked-n16.pt` and `aliked_lightglue.pt` (shipped with the vendor tree).
+
+Example configure:
+
+```bash
+export LIBTORCH_ROOT=/opt/libtorch   # directory containing share/cmake/Torch/TorchConfig.cmake
+mkdir build && cd build
+cmake .. -DLIBTORCH_ROOT=$LIBTORCH_ROOT
+make -j$(nproc)
+```
+
+**Smoke test (GPU host):**
+
+After a LibTorch-enabled build, run the ALIKED+LightGlue harness from `Examples/Monocular` (default images: `frame_100_original.png` and `frame_101_original.png` in the repo root):
+
+```bash
+cd build
+make smoke_aliked_lightglue
+cd ../Examples/Monocular
+./smoke_aliked_lightglue
+# optional: ./smoke_aliked_lightglue /path/to/a.png /path/to/b.png [cuda|cpu]
+```
+
+Expect non-zero keypoint counts on both images and a positive match count. The target is omitted when `LIBTORCH_ROOT` is unset at configure time.
+
+**Runtime (v1):**
+
+- Set **`loopClosing: 0`** in your settings YAML. Loop closure and relocalization are **deferred** until a follow-on EigenPlaces retrieval initiative; tracking-only operation is supported.
+- The **vocabulary file is still required** on the command line (`voc_binary_tartan_8u_6.yml.gz` or equivalent SuperPoint DBoW vocab). Startup loads this file even with loop closing off; removing the CLI argument is out of scope for v1.
+
+See `Examples/Monocular/README_slam_server.md` for `slam_server`-specific settings and examples.
+
 # Building Rover-SLAM library and examples
 
 Clone the repository:

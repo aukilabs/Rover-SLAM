@@ -16,14 +16,17 @@ namespace ORB_SLAM3
 
 SPmatcher::SPmatcher(float thre)
 {
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+    featureMatcher = new LightGlueMrNerfMatcher("cuda");
+#else
     Configuration cfg;
     cfg.device = "cuda";
     cfg.extractorPath = "";
     cfg.extractorType = "";
     featureMatcher = new LightGlueDecoupleOnnxRunner();
     featureMatcher->InitOrtEnv(cfg);
+#endif
     featureMatcher->SetMatchThresh(thre);
-    std::string mode = "LightGlueDecoupleOnnxRunner";
 }
 
 void SPmatcher::plotspmatch(cv::Mat frame1,cv::Mat frame2, std::vector<cv::KeyPoint> kpts1, std::vector<cv::KeyPoint> kpts2,  std::vector<int> vmatches12){
@@ -357,25 +360,28 @@ int SPmatcher::Fuse(KeyFrame *pKF, Sophus::Sim3f &Scw, const vector<MapPoint *> 
  }
 
 int SPmatcher::MatchingPoints_onnx(std::vector<cv::Point2f> kpts0, std::vector<cv::Point2f> kpts1, float* desc0,float* desc1){
-    int rows = 300;
-    int cols = 400;
+    const int rows = 300;
+    const int cols = 400;
+    std::vector<int> vnMatches12(kpts0.size(), -1);
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+    constexpr int kDescCols = 128;
+    return featureMatcher->Match(kpts0, kpts1, desc0, desc1, kDescCols, cols, rows, cols, rows,
+                                 vnMatches12);
+#else
     auto normal_kpts0 = featureMatcher->Matcher_PreProcess(kpts0 , rows , cols);
     auto normal_kpts1 = featureMatcher->Matcher_PreProcess(kpts1 , rows , cols);
-    Configuration cfg;
     std::vector<Ort::Value> output = featureMatcher->Matcher_Inference(normal_kpts0, normal_kpts1, desc0, desc1);
-    int size;
-    //std::pair<std::vector<cv::Point2f>, std::vector<cv::Point2f>> output_end;
-    std::vector<int> vnMatches12;
-    vnMatches12 = std::vector<int>(normal_kpts0.size(), -1);
-    size = featureMatcher->Matcher_PostProcess_fused(output, kpts0 , kpts1, vnMatches12);
-    return size;
+    return featureMatcher->Matcher_PostProcess_fused(output, kpts0 , kpts1, vnMatches12);
+#endif
 }
 
 int SPmatcher::MatchingPoints_onnx(std::vector<cv::Point2f> kpts0, std::vector<cv::Point2f> kpts1, cv::Mat desc0,cv::Mat desc1, std::vector<int>& vnMatches12){
     vnMatches12.resize(kpts0.size(),-1);
-    int rows = 300;//需要修改！
-    int cols = 400;
-
+    const int rows = 300;
+    const int cols = 400;
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+    return featureMatcher->Match(kpts0, kpts1, desc0, desc1, cols, rows, cols, rows, vnMatches12);
+#else
     auto normal_kpts0 = featureMatcher->Matcher_PreProcess(kpts0 , rows , cols);
     auto normal_kpts1 = featureMatcher->Matcher_PreProcess(kpts1 , rows , cols);
 
@@ -399,24 +405,23 @@ int SPmatcher::MatchingPoints_onnx(std::vector<cv::Point2f> kpts0, std::vector<c
         }
     }
 
-    Configuration cfg;
     std::vector<Ort::Value> output = featureMatcher->Matcher_Inference(normal_kpts0, normal_kpts1, descriptors_data0, descriptors_data1);
-    //std::pair<std::vector<cv::Point2f>, std::vector<cv::Point2f>> output_end;
-    int size;
-    // std::vector<int> vnMatches12;
-    // vnMatches12 = std::vector<int>(normal_kpts0.size(), -1);
-    size = featureMatcher->Matcher_PostProcess_fused(output, kpts0 , kpts1, vnMatches12);
-    
+    const int size = featureMatcher->Matcher_PostProcess_fused(output, kpts0 , kpts1, vnMatches12);
+
     delete[] descriptors_data0;
     delete[] descriptors_data1;
-    
+
     return size;
+#endif
 }
 
 int SPmatcher::MatchingPoints_onnx(std::vector<cv::KeyPoint> kpts0, const std::vector<cv::KeyPoint> kpts1, cv::Mat desc0, const cv::Mat desc1, std::vector<int>& vnMatches12){
     vnMatches12.resize(kpts0.size(),-1);
-    int rows = 300;//需要修改！
-    int cols = 400;
+    const int rows = 300;
+    const int cols = 400;
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+    return featureMatcher->Match(kpts0, kpts1, desc0, desc1, cols, rows, cols, rows, vnMatches12);
+#else
     std::vector<cv::Point2f> kpts_pf0, kpts_pf1;
     for(const cv::KeyPoint& keypoint : kpts0){
         kpts_pf0.emplace_back(keypoint.pt);
@@ -448,30 +453,27 @@ int SPmatcher::MatchingPoints_onnx(std::vector<cv::KeyPoint> kpts0, const std::v
         }
     }
 
-    Configuration cfg;
     std::vector<Ort::Value> output = featureMatcher->Matcher_Inference(normal_kpts0, normal_kpts1, descriptors_data0, descriptors_data1);
-    //std::pair<std::vector<cv::Point2f>, std::vector<cv::Point2f>> output_end;
-    // std::vector<int> vnMatches12;
-    // vnMatches12 = std::vector<int>(normal_kpts0.size(), -1);
-    int size  = featureMatcher->Matcher_PostProcess_fused(output, kpts_pf0 , kpts_pf1, vnMatches12);
+    const int size  = featureMatcher->Matcher_PostProcess_fused(output, kpts_pf0 , kpts_pf1, vnMatches12);
 
     delete[] descriptors_data0;
     delete[] descriptors_data1;
 
     return size;
+#endif
 }
 
 
 int SPmatcher::MatchingPoints_onnx(Frame &f1, Frame &f2, vector<int> &vnMatches12)//在C++中，默认参数值只能在函数的声明或定义中的一处给定，而不能同时在两者中都给定。通常，我们在函数的声明中给定默认参数，然后在函数定义中省略默认参数值。
 {   
-    bool outlier_rejection=false;
     vnMatches12.resize(f1.mvKeys.size(),-1);
-    // int rows = 240;//改
-    // int cols = 320;//改
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+    return featureMatcher->Match(f1.mvKeys, f2.mvKeys, f1.mDescriptors, f2.mDescriptors,
+                                 f1.imgLeft.cols, f1.imgLeft.rows, f2.imgLeft.cols,
+                                 f2.imgLeft.rows, vnMatches12);
+#else
     int rows = f2.imgLeft.rows;
     int cols = f2.imgLeft.cols;
-    // Frame f3; Frame f4;
-    // MatchingPoints_onnx(f3,f4,vnMatches12);
     std::vector<cv::Point2f> kpts1, kpts2;
 
     for(const cv::KeyPoint& keypoint : f1.mvKeys){
@@ -482,27 +484,9 @@ int SPmatcher::MatchingPoints_onnx(Frame &f1, Frame &f2, vector<int> &vnMatches1
         kpts2.emplace_back(keypoint.pt);
     }
 
-    // for (const cv::KeyPoint& point : f1.mvKeys) {
-    //     cv::circle(f1.imgLeft, point.pt, 2,cv::Scalar(0, 0, 255), 0.5);
-    // }
-    // for(const cv::KeyPoint& point : f2.mvKeys) {
-    //     cv::circle(f2.imgLeft, point.pt, 2, cv::Scalar(0, 0, 255), 0.5);
-    // }
-    // int total_width = f1.imgLeft.cols + f2.imgLeft.cols;
-    // int max_height = std::max(f1.imgLeft.rows, f2.imgLeft.rows);
-    // cv::Mat combined_image(max_height, total_width, f2.imgLeft.type());
-    // f1.imgLeft.copyTo(combined_image(cv::Rect(0, 0, f1.imgLeft.cols, f1.imgLeft.rows)));
-    // f2.imgLeft.copyTo(combined_image(cv::Rect(f2.imgLeft.cols, 0, f2.imgLeft.cols, f2.imgLeft.rows)));
-    // cv::imshow("Feature Points", combined_image);
-    // cv::waitKey(0);
-
-
     auto normal_kpts1 = featureMatcher->Matcher_PreProcess(kpts1 , rows , cols);
     auto normal_kpts2 = featureMatcher->Matcher_PreProcess(kpts2 , rows , cols);
 
-    // std::vector<cv::DMatch>  matches;
-    // matches.clear();
-    
     int rows1 = f1.mDescriptors.rows;
     int cols1 = f1.mDescriptors.cols;
     float* descriptors_data1 = new float[rows1 * cols1];
@@ -512,17 +496,6 @@ int SPmatcher::MatchingPoints_onnx(Frame &f1, Frame &f2, vector<int> &vnMatches1
             descriptors_data1[i*cols1 + j] = row_data[j];
         }
     }
-
-    // int length = sizeof(descriptors_data1)/sizeof(float);
-    // for(int i = 0 ; i < length+100; i++)
-    // {
-    //     cout<<descriptors_data1[i]<<std::endl;
-    // }
-    // for(int i = 0 ; i < 256 ; i++)
-    // {
-    //     cout<<f1.mDescriptors.at<float>(0,i)<<" ";
-    // }
-    // std::cout<<endl;
 
     int rows2 = f2.mDescriptors.rows;
     int cols2 = f2.mDescriptors.cols;
@@ -534,23 +507,13 @@ int SPmatcher::MatchingPoints_onnx(Frame &f1, Frame &f2, vector<int> &vnMatches1
         }
     }
     std::vector<Ort::Value> output = featureMatcher->Matcher_Inference(normal_kpts1, normal_kpts2, descriptors_data1, descriptors_data2);
-    std::pair<std::vector<cv::Point2f>, std::vector<cv::Point2f>> output_end;
-    int size  = featureMatcher->Matcher_PostProcess_fused(output, kpts1 , kpts2, vnMatches12);
+    const int size  = featureMatcher->Matcher_PostProcess_fused(output, kpts1 , kpts2, vnMatches12);
 
     delete[] descriptors_data1;
     delete[] descriptors_data2;
-    
-    // if(outlier_rejection){
-    //     std::vector<uchar> inliers;
-    //     cv::findFundamentalMat(output_end.first, output_end.second, cv::FM_RANSAC, 3, 0.99, inliers);
-    //     int j = 0;
-    //     for(int i = 0; i < output_end.first.size(); i++){
-    //         if(inliers[i]){
 
-    //         }
-    //     }
-    // }
     return size;
+#endif
 }
 
 // int SPmatcher::MatchingPoints(const Eigen::Matrix<double, 259, Eigen::Dynamic>& features0, 
