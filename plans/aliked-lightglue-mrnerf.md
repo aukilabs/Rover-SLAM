@@ -1,8 +1,8 @@
 # Initiative: ALIKED + LightGlue (mrnerf)
 
-Status: integrating (S6–S7 tracking smoke PASS)  
+Status: done  
 Tier: feature  
-Stage: 10-integrate  
+Stage: 11-gate  
 Skips: _(none)_  
 Last updated: 2026-09-02
 
@@ -139,5 +139,5 @@ Ordered slices — one implementer subagent per slice; review + verify between s
 
 ## Gate (stage 11)
 
-- **Decision:** accept (v1 tracking smoke) — pending human latency sign-off on a preferred real sequence if desired
-- **Notes:** §5 extract+match GPU smoke OK; DMT offline tracking smoke OK after S6+S7 (no g2o double-free; no LoopClosing BoW SIGSEGV; ~196 KFs, clean shutdown). Integrate still needs: commit WIP stack + resolve nested `.git` in `third_party/Light_Glue_CPP` before merge to `prototyping`. Loop/reloc remain deferred (`loopClosing: 0`).
+- **Decision:** accept  
+- **Notes:** Human sign-off 2026-09-02 (phone/iOS stream with ALIKED+LightGlue “seems good”). Commits on `wip/aliked-libtorch-mrnerf`: `88608c7` (S6/S7 DMT stability), `2173a78` (stream UI/server backpressure). §5 GPU smoke + DMT offline tracking smoke OK. Optional follow-ons outside this gate: merge to `prototyping`, vendor hygiene for `third_party/Light_Glue_CPP`, latency polish. Loop/reloc deferred to follow-on **hybrid prior-map pose-graph** initiative (`loopClosing: 0` remains).
