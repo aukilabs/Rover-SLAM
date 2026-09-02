@@ -3174,6 +3174,20 @@ private:
         json response;
         
         try {
+            // Reject before JPEG decode when the tracking queue is already full.
+            // Unbounded phone clients + ngrok otherwise burn HTTP worker threads decoding
+            // frames that will only be dropped, which makes the stream UI appear frozen.
+            {
+                lock_guard<mutex> lock(queue_mutex_);
+                if (image_queue_.size() >= static_cast<size_t>(config_.max_queue_size)) {
+                    response["success"] = false;
+                    response["error"] = "Server queue full, try again later";
+                    res.set_content(response.dump(), "application/json");
+                    res.status = 503;
+                    return;
+                }
+            }
+
             // Parse request
             string parse_error;
             auto image_req = parseImageRequest(req, &parse_error);

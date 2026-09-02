@@ -93,6 +93,10 @@
   let timer = null;
   let frameId = 1;
   let inFlight = 0;
+  let dropped = 0;
+  let busy503 = 0;
+  // One in-flight POST max: phone browsers stall when many ~100KiB JSON bodies pile up via ngrok.
+  const maxInFlight = 1;
   const maxW = 960;
 
   function setStatus(msg, isErr) {
@@ -143,38 +147,82 @@
 
   function tick() {
     if (!stream || !vid.videoWidth) return;
+    if (inFlight >= maxInFlight) {
+      dropped++;
+      return;
+    }
     layoutCanvas();
     ctx.drawImage(vid, 0, 0, cv.width, cv.height);
     const q = parseFloat(qualEl.value) || 0.75;
-    const dataUrl = cv.toDataURL('image/jpeg', q);
-    const comma = dataUrl.indexOf(',');
-    const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
     const fid = frameId++;
-    const body = {
-      image_base64: b64,
-      timestamp: Date.now() / 1000,
-      frame_id: fid
-    };
-    if (sendK.checked) {
-      const k = [parseFloat(fx.value), parseFloat(fy.value), parseFloat(cx.value), parseFloat(cy.value)];
-      if (k.every(function (x) { return !isNaN(x); })) body.intrinsics = k;
-    }
     inFlight++;
-    fetch('/api/v1/track', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    })
-      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
-      .then(function (_ref) {
+    // Async encode keeps the preview canvas responsive while JPEG/ngrok work finishes.
+    if (!cv.toBlob) {
+      inFlight--;
+      setStatus('Canvas toBlob unsupported in this browser.', true);
+      return;
+    }
+    cv.toBlob(function (blob) {
+      if (!blob) {
         inFlight--;
-        if (!_ref.ok) setStatus('HTTP ' + (_ref.j && _ref.j.error ? _ref.j.error : 'error'), true);
-        else if (fid % 30 === 0) setStatus('Queued frame ' + fid + ' (in-flight ~' + inFlight + ').');
-      })
-      .catch(function (e) {
+        setStatus('JPEG encode failed.', true);
+        return;
+      }
+      const reader = new FileReader();
+      reader.onerror = function () {
         inFlight--;
-        setStatus('Network: ' + (e && e.message ? e.message : String(e)), true);
-      });
+        setStatus('Failed to read JPEG blob.', true);
+      };
+      reader.onloadend = function () {
+        const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+        const comma = dataUrl.indexOf(',');
+        const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+        const body = {
+          image_base64: b64,
+          timestamp: Date.now() / 1000,
+          frame_id: fid
+        };
+        if (sendK.checked) {
+          const k = [parseFloat(fx.value), parseFloat(fy.value), parseFloat(cx.value), parseFloat(cy.value)];
+          if (k.every(function (x) { return !isNaN(x); })) body.intrinsics = k;
+        }
+        fetch('/api/v1/track', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        })
+          .then(function (r) {
+            return r.json().then(function (j) { return { ok: r.ok, status: r.status, j: j }; });
+          })
+          .then(function (_ref) {
+            inFlight--;
+            if (_ref.status === 503) {
+              busy503++;
+              if (busy503 % 10 === 1) {
+                setStatus('Server busy (queue full). Dropped client=' + dropped + ' busy=' + busy503 + '.');
+              }
+              return;
+            }
+            if (!_ref.ok) {
+              setStatus('HTTP ' + (_ref.j && _ref.j.error ? _ref.j.error : 'error'), true);
+              return;
+            }
+            if (fid % 30 === 0) {
+              setStatus(
+                'Queued frame ' + fid +
+                ' (in-flight ' + inFlight +
+                ', dropped ' + dropped +
+                ', busy503 ' + busy503 + ').'
+              );
+            }
+          })
+          .catch(function (e) {
+            inFlight--;
+            setStatus('Network: ' + (e && e.message ? e.message : String(e)), true);
+          });
+      };
+      reader.readAsDataURL(blob);
+    }, 'image/jpeg', q);
   }
 
   function stop() {
