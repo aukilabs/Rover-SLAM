@@ -34,6 +34,10 @@
 #include <chrono>
 #include "ORBmatcher.h"
 
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+#include "Matchers/LightGlueMrNerfMatcher.h"
+#endif
+
 
 using namespace std;
 
@@ -3094,6 +3098,9 @@ void Tracking::CreateInitialMapMonocular()
     // Bundle Adjustment
     // Step 4 全局BA优化，同时优化所有位姿和三维点
     Verbose::PrintMess("New Map created with " + to_string(mpAtlas->MapPointsInMap()) + " points", Verbose::VERBOSITY_QUIET);
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+    MrNerfCudaDrainForHostAlloc();
+#endif
     Optimizer::GlobalBundleAdjustemnt(mpAtlas->GetCurrentMap(),20);
 
     // Step 5 取场景的中值深度，用于尺度归一化 

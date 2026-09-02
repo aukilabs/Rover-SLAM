@@ -1505,9 +1505,12 @@ int SPmatcher::SearchByBoWSP(KeyFrame* pKF1, KeyFrame *pKF2, vector<MapPoint *> 
     vector<int> vnMatches12 = vector<int>((*pKF1).mvKeys.size(), -1);
     nmatches = MatchingPoints_onnx(pKF1->mvKeys, pKF2->mvKeys, pKF1->mDescriptors, pKF2->mDescriptors,  vnMatches12);
     //cout<<"vnMatches12.size():  "<<vnMatches12.size();
+    const int nKpts2 = static_cast<int>(pKF2->mvKeys.size());
     for(size_t i = 0, iend = vnMatches12.size(); i<iend; i++)
     {
         if(vnMatches12[i]<0)
+            continue;
+        if(vnMatches12[i] >= nKpts2)
             continue;
         
         MapPoint* pMP1 = pKF1->GetMapPoint(i);

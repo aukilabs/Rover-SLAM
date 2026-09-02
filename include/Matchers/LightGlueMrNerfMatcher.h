@@ -54,4 +54,9 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+// Drain LibTorch CUDA work before host-side g2o graph alloc/free (init Global BA).
+void MrNerfCudaDrainForHostAlloc();
+#endif
+
 #endif

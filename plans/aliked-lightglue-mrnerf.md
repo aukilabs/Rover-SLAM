@@ -1,8 +1,8 @@
 # Initiative: ALIKED + LightGlue (mrnerf)
 
-Status: building (reopened — tracking smoke fails)  
+Status: integrating (S6–S7 tracking smoke PASS)  
 Tier: feature  
-Stage: 9-verify  
+Stage: 10-integrate  
 Skips: _(none)_  
 Last updated: 2026-09-02
 
@@ -95,13 +95,30 @@ Ordered slices — one implementer subagent per slice; review + verify between s
 - **Context:** `frame_*_original.png` in repo root or `Examples/` fixtures; recon smoke scripts for reference params.
 - **Human:** Run on GPU host; sign off §5 acceptance.
 
-**Dependencies:** 1 → 2 → 3 → 4 → 5 (4 can partially overlap 3 if matcher not needed for config-only changes).
+### Slice 6 — Fix DMT Global-BA abort (g2o double-free)
+- **Goal:** Offline `mono_inertial_dmt` on a short DMT sequence completes map init + Global BA without abort; §5 tracking smoke passes on LibTorch ALIKED+LightGlue path.
+- **Symptom:** Map init OK (~790 pts) then abort in `g2o::HyperGraph::clear` during `OptimizableGraph` dtor after `BundleAdjustment` / Global BA.
+- **Investigate first (before code churn):** heap corruption vs g2o ownership vs LibTorch allocator interaction; ASan/debug rebuild; compare SuperPoint ONNX path on same sequence if needed.
+- **Acceptance:** short DMT run exits cleanly (or reaches post-BA tracking) without double-free; document root cause in §8.
+- **Human:** GPU/WSL host for reproduce + verify.
+- **Status:** done (2026-09-02) — double-free fixed; LocalMapping SIGSEGV deferred to S7.
+
+### Slice 7 — Fix post-init LocalMapping SIGSEGV (tracking smoke)
+- **Goal:** Short DMT offline run progresses past map init + Global BA through LocalMapping without SIGSEGV; §5 tracking smoke meaningfully passes (pose/tracking advances for a short window).
+- **Symptom:** After S6, `verify_dmt_s6.sh` BA OK then `mono_inertial_dmt` SIGSEGV (~35s, exit 139) in/around LocalMapping.
+- **Investigate:** extend CUDA drain to matcher/extract call sites if still heap-corrupt; ASan/gdb backtrace; map-point / KF observation index bounds on ALIKED path; thread races.
+- **Acceptance:** short DMT sequence runs N frames (or until script timeout) without SIGSEGV/double-free; LocalMapping processes KFs; document cause in §8.
+- **Depends:** S6.
+- **Status:** done (2026-09-02) — LoopClosing BoW OOB when `loopClosing: 0` not fully idle; see §8.
+
+**Dependencies:** 1 → 2 → 3 → 4 → 5 → 6 (done). **S7** (done). Initiative ready for stage-11 / integrate review.
 
 **Follow-on initiative (not sliced here):** EigenPlaces ONNX global retrieval for loop/reloc.
 
 ## 7. Implementation notes
 
-- **Approvals:** Mass-approve all slices (S1–S5). Re-ask only when a slice needs human to run/try something locally (e.g. GPU smoke, LibTorch path on build host). Skip re-ask for pure code/review/verify cycles.
+- **Approvals:** Mass-approve S1–S5 (done). **Mass-approve all remaining** (2026-09-02) — S6+; no re-ask until blocked/done.
+- **Branch:** `wip/aliked-libtorch-mrnerf` (parked snapshot `fdc2e3c`); `prototyping` restored to SuperPoint/ONNX default.
 - Approach / sequence: S1 → S2 → S3 → S4 → S5 (see §6).
 - Key files: `CMakeLists.txt`, `cmake/modules/`, `third_party/Light_Glue_CPP/`, `SPextractor`, `SPmatcher`.
 - Bounce triggers → update §4 if LibTorch/CUDA wiring fails.
@@ -117,8 +134,10 @@ Ordered slices — one implementer subagent per slice; review + verify between s
 - **GPU verify PASS (2026-09-01 21:44 UTC):** Native WSL build at `~/build/rover-slam-s1-v2` from `~/rover-slam-work` + `~/libtorch-cu129` (LibTorch 2.7.0 cu128). RTX 5070 Ti, CUDA 12.9, `CMAKE_CUDA_ARCHITECTURES=120`. Targets built: `auki_lightglue_lib`, `libORB_SLAM3.so`, `smoke_aliked_lightglue`. Runtime smoke (`scripts/run_smoke_gpu.sh`): frame_100/101 → **1024 keypoints** each, **128-d** descriptors, **25 matches**, exit 0. Helpers: `scripts/sync_to_native_wsl.sh`, `scripts/verify_gpu_smoke.sh`, `scripts/run_smoke_gpu.sh`, `scripts/fetch_libtorch.sh`.
 - **Human gate:** Sign off §5 acceptance / stage 11 release when satisfied with latency on a real sequence.
 - **Runtime GPU smoke (2026-09-01 22:04):** Reconfirmed from `/mnt/d/agent-workspaces/Rover-SLAM` via `verify_gpu_smoke.sh` (`BUILD_DIR=~/build/rover-slam-s1-v3`, `LIBTORCH_ROOT=~/libtorch-native`) — 1024 kpts × 128-d each, 25 matches, exit 0.
+- **S6 DMT Global-BA fix (2026-09-02):** Root cause: LibTorch CUDA allocator left glibc heap inconsistent before init `BundleAdjustment`; teardown surfaced as `double free or corruption` in `g2o::HyperGraph::clear` (GDB malloc chunk size ~9.4e13). Fix: `MrNerfCudaDrainForHostAlloc()` before init Global BA; explicit `SparseOptimizer` teardown (`delete` algorithm + `clear()`); LightGlue match index bounds; BA keypoint/octave guards; link `g2o` via CMake target. Verify: `bash scripts/verify_dmt_s6.sh` — map init ~784 pts, `BA: End of the optimization`, LocalMapping continues (`mlNewKeyFrames` log); no double-free. Follow-on: intermittent SIGSEGV in LocalMapping after init (separate from g2o teardown; not S6 blocker).
+- **S7 post-init LocalMapping SIGSEGV fix (2026-09-02):** GDB backtrace (thread 14): `ORB_SLAM3::LoopClosing::Run()` → `NewDetectCommonRegions` (not Local BA / not Viewer). With `loopClosing: 0` in DMT.yaml the LoopClosing thread still received KFs from LocalMapping and entered BoW DB / place-recognition paths (`KeyFrameDatabase::add` / `DetectNBestCandidates_sp` use `mvInvertedFile[vit->first]` without bounds; ALIKED BoW vectors can index past vocabulary size → SIGSEGV). `DetectCommonRegionsFromBoW_sp` not reached in failing run (map &lt; 12 KFs path). Fix: idle `LoopClosing::Run` when `!mbActiveLC` (clear queue, no BoW); skip `InsertKeyFrame` in LocalMapping when LC inactive; bounds checks in `KeyFrameDatabase::add` / `DetectNBestCandidates_sp`; `SearchByBoWSP` match-index guard; `MrNerfCudaDrainForHostAlloc()` after ALIKED extract and LightGlue match; headless verify via `ROVER_SLAM_HEADLESS=1`. Verify: `POST_BA_SECONDS=45 bash scripts/verify_dmt_s7.sh` — BA OK, tracking continues (`trackReferenceKeyFrame success!`), shutdown clean, 207 KFs, exit 0 (no core dump).
 
 ## Gate (stage 11)
 
-- **Decision:** accept (v1)
-- **Notes:** §5 extract+match smoke passed on GPU. Tracking smoke on a real sequence and loop/reloc remain follow-on. Integrate: commit stack + resolve nested `.git` in `third_party/Light_Glue_CPP` before merge.
+- **Decision:** accept (v1 tracking smoke) — pending human latency sign-off on a preferred real sequence if desired
+- **Notes:** §5 extract+match GPU smoke OK; DMT offline tracking smoke OK after S6+S7 (no g2o double-free; no LoopClosing BoW SIGSEGV; ~196 KFs, clean shutdown). Integrate still needs: commit WIP stack + resolve nested `.git` in `third_party/Light_Glue_CPP` before merge to `prototyping`. Loop/reloc remain deferred (`loopClosing: 0`).

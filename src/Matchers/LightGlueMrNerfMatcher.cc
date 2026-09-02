@@ -1,10 +1,12 @@
 #include "Matchers/LightGlueMrNerfMatcher.h"
 
 #include <cstring>
+#include <algorithm>
 #include <stdexcept>
 
 #ifdef AUKI_LIGHTGLUE_AVAILABLE
 #include <torch/torch.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include "matcher/lightglue/matcher.hpp"
 #endif
 
@@ -62,20 +64,28 @@ std::vector<cv::Point2f> KeyPointsToPoint2f(const std::vector<cv::KeyPoint>& kpt
 
 int FillMatchesFromOutput(const torch::Dict<std::string, torch::Tensor>& match_out,
                           float match_thresh,
+                          int n_kpts1,
                           std::vector<int>& vnMatches12) {
     auto matches0 = match_out.at("matches0").to(torch::kCPU).contiguous();
     auto scores0 = match_out.at("matching_scores0").to(torch::kCPU).contiguous();
 
+    if (matches0.dim() != 2 || scores0.dim() != 2) {
+        throw std::runtime_error("[LightGlueMrNerfMatcher] expected batched matches0/matching_scores0");
+    }
+
     const int m = static_cast<int>(vnMatches12.size());
+    const int match_cols = static_cast<int>(matches0.size(1));
+    const int score_cols = static_cast<int>(scores0.size(1));
+    const int n = std::min({m, match_cols, score_cols});
     int count = 0;
 
     auto matches_acc = matches0.accessor<int64_t, 2>();
     auto scores_acc = scores0.accessor<float, 2>();
 
-    for (int i = 0; i < m; ++i) {
+    for (int i = 0; i < n; ++i) {
         const int64_t j = matches_acc[0][i];
         const float score = scores_acc[0][i];
-        if (j >= 0 && score > match_thresh) {
+        if (j >= 0 && j < n_kpts1 && score > match_thresh) {
             vnMatches12[i] = static_cast<int>(j);
             ++count;
         }
@@ -86,6 +96,17 @@ int FillMatchesFromOutput(const torch::Dict<std::string, torch::Tensor>& match_o
 #endif
 
 } // namespace
+
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+
+void MrNerfCudaDrainForHostAlloc() {
+    if (torch::cuda::is_available()) {
+        torch::cuda::synchronize();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+}
+
+#endif
 
 #ifdef AUKI_LIGHTGLUE_AVAILABLE
 
@@ -124,8 +145,10 @@ struct LightGlueMrNerfMatcher::Impl {
             torch::NoGradGuard no_grad;
             match_out = matcher_->forward(feats0, feats1);
         }
+        MrNerfCudaDrainForHostAlloc();
 
-        return FillMatchesFromOutput(match_out, match_thresh_, vnMatches12);
+        return FillMatchesFromOutput(match_out, match_thresh_,
+                                     static_cast<int>(kpts1.size()), vnMatches12);
     }
 };
 

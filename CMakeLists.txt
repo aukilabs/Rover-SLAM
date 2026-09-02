@@ -187,7 +187,7 @@ ${OpenCV_LIBS}
 ${EIGEN3_LIBS}
 ${Pangolin_LIBRARIES}
 ${PROJECT_SOURCE_DIR}/Thirdparty/DBoW3/lib/libDBoW3.so
-${PROJECT_SOURCE_DIR}/Thirdparty/g2o/lib/libg2o.so
+g2o
 -lboost_serialization
 -lcrypto
 -Wl,--no-as-needed

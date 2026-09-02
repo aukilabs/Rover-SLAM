@@ -66,6 +66,9 @@
 
 #include "Extractors/super_point.h"
 #include <utility>
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+#include "Matchers/LightGlueMrNerfMatcher.h"
+#endif
 #include <unordered_map>
 #include <opencv2/opencv.hpp>
 using namespace cv;
@@ -543,6 +546,9 @@ int SPextractor::operator()( InputArray _image,  vector<KeyPoint>& _keypoints,
         ComputePyramid(image);
         res = ExtractMultiLayers(image, _keypoints, descriptors);
     }
+#ifdef AUKI_LIGHTGLUE_AVAILABLE
+    MrNerfCudaDrainForHostAlloc();
+#endif
     // Pre-compute the scale pyramid
 
     // ComputePyramid(image);

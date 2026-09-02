@@ -19,6 +19,7 @@
 #include "Optimizer.h"
 
 #include <complex>
+#include <algorithm>
 
 #include <Eigen/StdVector>
 #include <Eigen/Dense>
@@ -2958,7 +2959,8 @@ void Optimizer::BundleAdjustment(
 
             const int leftIndex = get<0>(mit->second);
 
-            if (leftIndex != -1 && pKF->mvuRight[get<0>(mit->second)] < 0)
+            if (leftIndex != -1 && leftIndex < static_cast<int>(pKF->mvKeysUn.size()) &&
+                pKF->mvuRight[leftIndex] < 0)
             {
                 // 如果是单目相机按照下面操作
                 const cv::KeyPoint &kpUn = pKF->mvKeysUn[leftIndex];
@@ -2975,7 +2977,10 @@ void Optimizer::BundleAdjustment(
                 // 信息矩阵，也是协方差，表明了这个约束的观测在各个维度（x,y）上的可信程度，在我们这里对于具体的一个点，两个坐标的可信程度都是相同的，
                 // 其可信程度受到特征点在图像金字塔中的图层有关，图层越高，可信度越差
                 // 为了避免出现信息矩阵中元素为负数的情况，这里使用的是sigma^(-2)
-                const float &invSigma2 = pKF->mvInvLevelSigma2[kpUn.octave];
+                const int octave =
+                    std::min(std::max(0, kpUn.octave),
+                              static_cast<int>(pKF->mvInvLevelSigma2.size()) - 1);
+                const float &invSigma2 = pKF->mvInvLevelSigma2[octave];
                 e->setInformation(Eigen::Matrix2d::Identity() * invSigma2);
 
                 // 如果要使用鲁棒核函数
@@ -3015,7 +3020,10 @@ void Optimizer::BundleAdjustment(
                 e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(pKF->mnId)));
                 e->setMeasurement(obs);
                 // 信息矩阵这里是相同的，考虑的是左目特征点的所在图层
-                const float &invSigma2 = pKF->mvInvLevelSigma2[kpUn.octave];
+                const int octave =
+                    std::min(std::max(0, kpUn.octave),
+                              static_cast<int>(pKF->mvInvLevelSigma2.size()) - 1);
+                const float &invSigma2 = pKF->mvInvLevelSigma2[octave];
                 Eigen::Matrix3d Info = Eigen::Matrix3d::Identity() * invSigma2;
                 e->setInformation(Info);
 
@@ -3216,6 +3224,16 @@ void Optimizer::BundleAdjustment(
             pMP->mPosGBA = vPoint->estimate().cast<float>();
             pMP->mnBAGlobalForKF = nLoopKF;
         }
+    }
+
+    // Release solver then clear active graph (SparseOptimizer::clear also drops
+    // _activeVertices/_activeEdges before HyperGraph teardown).
+    {
+        g2o::OptimizationAlgorithm* algorithm =
+            const_cast<g2o::OptimizationAlgorithm*>(optimizer.algorithm());
+        optimizer.setAlgorithm(nullptr);
+        delete algorithm;
+        optimizer.clear();
     }
 }
 
@@ -5371,7 +5389,10 @@ void Optimizer::LocalBundleAdjustment(
                 e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(id)));
                 e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(pKF->mnId)));
                 e->setMeasurement(obs);
-                const float &invSigma2 = pKF->mvInvLevelSigma2[kpUn.octave];
+                const int octave =
+                    std::min(std::max(0, kpUn.octave),
+                              static_cast<int>(pKF->mvInvLevelSigma2.size()) - 1);
+                const float &invSigma2 = pKF->mvInvLevelSigma2[octave];
                 e->setInformation(Eigen::Matrix2d::Identity() * invSigma2);
 
                 g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
@@ -5400,7 +5421,10 @@ void Optimizer::LocalBundleAdjustment(
                 e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(id)));
                 e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex *>(optimizer.vertex(pKF->mnId)));
                 e->setMeasurement(obs);
-                const float &invSigma2 = pKF->mvInvLevelSigma2[kpUn.octave];
+                const int octave =
+                    std::min(std::max(0, kpUn.octave),
+                              static_cast<int>(pKF->mvInvLevelSigma2.size()) - 1);
+                const float &invSigma2 = pKF->mvInvLevelSigma2[octave];
                 Eigen::Matrix3d Info = Eigen::Matrix3d::Identity() * invSigma2;
                 e->setInformation(Info);
 

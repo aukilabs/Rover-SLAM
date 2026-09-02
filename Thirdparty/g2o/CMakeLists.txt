@@ -176,3 +176,5 @@ g2o/stuff/string_tools.cpp
 g2o/stuff/property.cpp       
 g2o/stuff/property.h       
 )
+
+set_target_properties(g2o PROPERTIES POSITION_INDEPENDENT_CODE ON)

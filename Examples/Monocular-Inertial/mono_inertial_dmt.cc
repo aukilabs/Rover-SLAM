@@ -145,7 +145,8 @@ int main(int argc, char *argv[])
     cout.precision(17);
 
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
-    bool bUseViewer = true;
+    const char* headless = std::getenv("ROVER_SLAM_HEADLESS");
+    bool bUseViewer = headless == nullptr || std::string(headless) == "0";
     ORB_SLAM3::System SLAM(
         argv[1],argv[2],
         bUseIMU ? ORB_SLAM3::System::IMU_MONOCULAR : ORB_SLAM3::System::MONOCULAR,

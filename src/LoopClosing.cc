@@ -47,6 +47,7 @@ LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, SPVocabulary *pVo
 {
     // 连续性阈值
     mnCovisibilityConsistencyTh = 3;
+    mpCurrentKF = static_cast<KeyFrame*>(NULL);
     mpLastCurrentKF = static_cast<KeyFrame*>(NULL);
 
 #ifdef REGISTER_TIMES
@@ -104,7 +105,19 @@ void LoopClosing::Run()
     // 线程主循环
     while(1)
     {
-        //continue;
+        // loopClosing: 0 — do not touch BoW DB or SPmatcher (ALIKED path not validated for LC)
+        if(!mbActiveLC)
+        {
+            {
+                unique_lock<mutex> lock(mMutexLoopQueue);
+                mlpLoopKeyFrameQueue.clear();
+            }
+            ResetIfRequested();
+            if(CheckFinish())
+                break;
+            usleep(5000);
+            continue;
+        }
 
         //NEW LOOP AND MERGE DETECTION ALGORITHM
         //----------------------------
@@ -343,7 +356,8 @@ void LoopClosing::Run()
                 }
 
             }
-            mpLastCurrentKF = mpCurrentKF;
+            if(mbActiveLC)
+                mpLastCurrentKF = mpCurrentKF;
         }
         // 查看是否有外部线程请求复位当前线程
         ResetIfRequested();
@@ -389,7 +403,12 @@ bool LoopClosing::NewDetectCommonRegions()
     // To deactivate placerecognition. No loopclosing nor merging will be performed
     // 如果一开始就不做回环的话这里就退出了，这个线程也就名存实亡了
     if(!mbActiveLC)
+    {
+        unique_lock<mutex> lock(mMutexLoopQueue);
+        if(!mlpLoopKeyFrameQueue.empty())
+            mlpLoopKeyFrameQueue.pop_front();
         return false;
+    }
     //cout<<"1111"<<endl;
 
     {

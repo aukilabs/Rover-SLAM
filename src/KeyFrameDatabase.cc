@@ -45,9 +45,14 @@ void KeyFrameDatabase::add(KeyFrame *pKF)
 {
     unique_lock<mutex> lock(mMutex);
 
+    const size_t vocSize = mvInvertedFile.size();
     // 为每一个word添加该KeyFrame
     for (DBoW3::BowVector::const_iterator vit = pKF->mBow3Vec.begin(), vend = pKF->mBow3Vec.end(); vit != vend; vit++)
+    {
+        if (vit->first >= vocSize)
+            continue;
         mvInvertedFile[vit->first].push_back(pKF);
+    }
     //cout<<""<<endl;
     // for (DBoW3::BowVector::const_iterator vit = pKF->mBow3Vec.begin(), vend = pKF->mBow3Vec.end(); vit != vend; vit++)
     //     mvInvertedFile_sp[vit->first].push_back(pKF);
@@ -669,9 +674,12 @@ void KeyFrameDatabase::DetectNBestCandidates_sp(KeyFrame *pKF, vector<KeyFrame *
         // 拿到当前关键帧的共视关键帧
         spConnectedKF = pKF->GetConnectedKeyFrames();
         
+        const size_t vocSize = mvInvertedFile.size();
         // 遍历当前关键帧bow向量的每个单词
         for(DBoW3::BowVector::const_iterator vit=pKF->mBow3Vec.begin(), vend=pKF->mBow3Vec.end(); vit != vend; vit++)
         {
+            if (vit->first >= vocSize)
+                continue;
             list<KeyFrame *> &lKFs = mvInvertedFile[vit->first];//需要改称bow3的逆向索引
             for (list<KeyFrame *>::iterator lit = lKFs.begin(), lend = lKFs.end(); lit != lend; lit++)
             {

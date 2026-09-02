@@ -82,6 +82,8 @@ public:
 
     bool isFinished();
 
+    bool IsActiveLC() const { return mbActiveLC; }
+
     Viewer* mpViewer;
 
 #ifdef REGISTER_TIMES
