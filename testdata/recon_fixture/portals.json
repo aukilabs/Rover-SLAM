@@ -1,0 +1,21 @@
+{
+  "portals": [
+    {
+      "shortId": "FIXTURE01",
+      "physicalSize": 0.2,
+      "pose": {
+        "position": {
+          "x": 0.5,
+          "y": 0.0,
+          "z": 0.0
+        },
+        "rotation": {
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0
+        }
+      }
+    }
+  ]
+}

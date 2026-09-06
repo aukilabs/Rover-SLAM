@@ -547,7 +547,7 @@ int SPextractor::operator()( InputArray _image,  vector<KeyPoint>& _keypoints,
         res = ExtractMultiLayers(image, _keypoints, descriptors);
     }
 #ifdef AUKI_LIGHTGLUE_AVAILABLE
-    MrNerfCudaDrainForHostAlloc();
+    MrNerfCudaSyncAfterInference();
 #endif
     // Pre-compute the scale pyramid
 

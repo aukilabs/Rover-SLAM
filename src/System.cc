@@ -369,6 +369,7 @@ Sophus::SE3f System::TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRight, 
     mTrackingState = mpTracker->mState;
     mTrackedMapPoints = mpTracker->mCurrentFrame.mvpMapPoints;
     mTrackedKeyPointsUn = mpTracker->mCurrentFrame.mvKeysUn;
+    mCurrentFrameDescriptors = mpTracker->mCurrentFrame.mDescriptors.clone();
 
     return Tcw;
 }
@@ -543,6 +544,7 @@ Sophus::SE3f System::TrackMonocular(const cv::Mat &im, const double &timestamp,
     mTrackingState = mpTracker->mState;
     mTrackedMapPoints = mpTracker->mCurrentFrame.mvpMapPoints;
     mTrackedKeyPointsUn = mpTracker->mCurrentFrame.mvKeysUn;
+    mCurrentFrameDescriptors = mpTracker->mCurrentFrame.mDescriptors.clone();
 
     return Tcw;
 }
@@ -1420,6 +1422,60 @@ unsigned long int System::GetCurrentMapId()
     return pMap->GetId();
 }
 
+std::vector<unsigned long> System::GetAtlasMapIds()
+{
+    std::vector<unsigned long> ids;
+    if (!mpAtlas)
+        return ids;
+
+    for (Map *pMap : mpAtlas->GetAllMaps())
+    {
+        if (!pMap || pMap->IsBad())
+            continue;
+        ids.push_back(pMap->GetId());
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+void System::GetMapKeyFrameTrajectory(unsigned long map_id, std::vector<TrajectorySample> &out)
+{
+    out.clear();
+    if (!mpAtlas)
+        return;
+
+    Map *pMap = nullptr;
+    for (Map *candidate : mpAtlas->GetAllMaps())
+    {
+        if (candidate && !candidate->IsBad() && candidate->GetId() == map_id)
+        {
+            pMap = candidate;
+            break;
+        }
+    }
+    if (!pMap)
+        return;
+
+    vector<KeyFrame *> vpKFs = pMap->GetAllKeyFrames();
+    sort(vpKFs.begin(), vpKFs.end(), KeyFrame::lId);
+
+    for (KeyFrame *pKF : vpKFs)
+    {
+        if (!pKF || pKF->isBad())
+            continue;
+        Map *pKFMap = pKF->GetMap();
+        if (!pKFMap || pKFMap != pMap)
+            continue;
+
+        TrajectorySample sample;
+        sample.id = pKF->mnId;
+        sample.timestamp = pKF->mTimeStamp;
+        sample.Twc = pKF->GetPoseInverse();
+        sample.is_keyframe = true;
+        out.push_back(sample);
+    }
+}
+
 void System::GetActiveMapTrajectory(std::vector<TrajectorySample> &out, bool include_live_frame)
 {
     out.clear();
@@ -1477,21 +1533,29 @@ void System::GetActiveMapTrajectory(std::vector<TrajectorySample> &out, bool inc
     out.push_back(live);
 }
 
-void System::GetActiveMapDenseTrajectory(std::vector<TrajectorySample> &out)
+void System::GetMapDenseTrajectory(unsigned long map_id, std::vector<TrajectorySample> &out)
 {
     out.clear();
     if (!mpAtlas || !mpTracker)
         return;
 
-    Map *pMap = mpAtlas->GetCurrentMap();
+    Map *pMap = nullptr;
+    for (Map *candidate : mpAtlas->GetAllMaps())
+    {
+        if (candidate && !candidate->IsBad() && candidate->GetId() == map_id)
+        {
+            pMap = candidate;
+            break;
+        }
+    }
     if (!pMap)
         return;
 
-    std::unordered_set<unsigned long> active_kf_ids;
+    std::unordered_set<unsigned long> map_kf_ids;
     for (KeyFrame *pkf : pMap->GetAllKeyFrames())
     {
         if (pkf && !pkf->isBad())
-            active_kf_ids.insert(pkf->mnId);
+            map_kf_ids.insert(pkf->mnId);
     }
 
     unique_lock<mutex> lock(mMutexState);
@@ -1525,7 +1589,7 @@ void System::GetActiveMapDenseTrajectory(std::vector<TrajectorySample> &out)
             pKF = pKF->GetParent();
         }
 
-        if (!pKF || active_kf_ids.find(pKF->mnId) == active_kf_ids.end())
+        if (!pKF || map_kf_ids.find(pKF->mnId) == map_kf_ids.end())
             continue;
 
         Trw = Trw * pKF->GetPose();
@@ -1543,6 +1607,19 @@ void System::GetActiveMapDenseTrajectory(std::vector<TrajectorySample> &out)
         sample.is_keyframe = false;
         out.push_back(sample);
     }
+}
+
+void System::GetActiveMapDenseTrajectory(std::vector<TrajectorySample> &out)
+{
+    out.clear();
+    if (!mpAtlas)
+        return;
+
+    Map *pMap = mpAtlas->GetCurrentMap();
+    if (!pMap)
+        return;
+
+    GetMapDenseTrajectory(pMap->GetId(), out);
 }
 
 void System::SetViewerAlignment(const Eigen::Matrix3f& R_domain_slam, const Eigen::Vector3f& t_domain_slam, float scale)
@@ -1615,6 +1692,17 @@ vector<cv::KeyPoint> System::GetTrackedKeyPointsUn()
 {
     unique_lock<mutex> lock(mMutexState);
     return mTrackedKeyPointsUn;
+}
+
+cv::Mat System::GetCurrentFrameDescriptors()
+{
+    unique_lock<mutex> lock(mMutexState);
+    return mCurrentFrameDescriptors.clone();
+}
+
+FrameTimingMs System::GetLastFrameTiming()
+{
+    return mpTracker->GetLastFrameTiming();
 }
 
 double System::GetTimeFromIMUInit()

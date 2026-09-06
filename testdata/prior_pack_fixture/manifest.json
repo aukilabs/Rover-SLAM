@@ -1,0 +1,24 @@
+{
+  "format_version": 1,
+  "coordinate_frame": {
+    "name": "domain",
+    "notes": "Synthetic fixture pack for hybrid prior-map initiative S1."
+  },
+  "descriptor": {
+    "type": "aliked",
+    "model": "aliked-n16",
+    "dim": 128
+  },
+  "files": {
+    "images": "images.json",
+    "portals": "portals.json",
+    "covisibility": "covisibility.json",
+    "tracks": "tracks.json",
+    "features_dir": "features"
+  },
+  "counts": {
+    "images": 3,
+    "tracks": 5,
+    "portals": 1
+  }
+}

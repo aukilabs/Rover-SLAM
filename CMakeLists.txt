@@ -280,7 +280,10 @@ add_executable(mono_tum_vi
 target_link_libraries(mono_tum_vi ${PROJECT_NAME})
 
 add_executable(slam_server
-        Examples/Monocular/slam_server.cc)
+        Examples/Monocular/slam_server.cc
+        Examples/Monocular/prior_pack_loader.cc
+        Examples/Monocular/overlay_pose_graph.cc
+        Examples/Monocular/prior_soft_edges.cc)
 target_link_libraries(slam_server ${PROJECT_NAME} ZXing::ZXing)
 if(SLAM_SERVER_ZXING_SYSTEM_HEADERS)
   target_compile_definitions(slam_server PRIVATE SLAM_SERVER_ZXING_SYSTEM_HEADERS)
@@ -309,6 +312,36 @@ if(AUKI_LIGHTGLUE_AVAILABLE)
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS ON)
+
+  add_executable(bench_aliked_topk Examples/Monocular/bench_aliked_topk.cc)
+  target_compile_definitions(bench_aliked_topk PRIVATE AUKI_LIGHTGLUE_AVAILABLE)
+  target_include_directories(bench_aliked_topk PRIVATE "${LIGHT_GLUE_CPP_DIR}/include")
+  target_link_libraries(bench_aliked_topk PRIVATE
+    "-Wl,--no-as-needed"
+    ${PROJECT_NAME}
+    ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so
+    "-Wl,--as-needed")
+  target_compile_options(bench_aliked_topk PRIVATE ${TORCH_CXX_FLAGS} "-std=c++20")
+  set_target_properties(bench_aliked_topk PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS ON
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/Examples/Monocular")
+
+  add_executable(bench_batch_aliked_lg Examples/Monocular/bench_batch_aliked_lg.cc)
+  target_compile_definitions(bench_batch_aliked_lg PRIVATE AUKI_LIGHTGLUE_AVAILABLE)
+  target_include_directories(bench_batch_aliked_lg PRIVATE "${LIGHT_GLUE_CPP_DIR}/include")
+  target_link_libraries(bench_batch_aliked_lg PRIVATE
+    "-Wl,--no-as-needed"
+    ${PROJECT_NAME}
+    ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so
+    "-Wl,--as-needed")
+  target_compile_options(bench_batch_aliked_lg PRIVATE ${TORCH_CXX_FLAGS} "-std=c++20")
+  set_target_properties(bench_batch_aliked_lg PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS ON
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/Examples/Monocular")
 endif()
 
 #Monocular inertial examples

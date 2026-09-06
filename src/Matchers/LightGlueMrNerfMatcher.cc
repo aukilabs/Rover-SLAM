@@ -2,6 +2,8 @@
 
 #include <cstring>
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <stdexcept>
 
 #ifdef AUKI_LIGHTGLUE_AVAILABLE
@@ -9,6 +11,18 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include "matcher/lightglue/matcher.hpp"
 #endif
+
+namespace {
+thread_local LightGlueMatchTimingMs g_lg_timing;
+} // namespace
+
+void LightGlueMatchTimingReset() {
+    g_lg_timing = LightGlueMatchTimingMs();
+}
+
+LightGlueMatchTimingMs LightGlueMatchTimingSnapshot() {
+    return g_lg_timing;
+}
 
 namespace {
 
@@ -99,10 +113,35 @@ int FillMatchesFromOutput(const torch::Dict<std::string, torch::Tensor>& match_o
 
 #ifdef AUKI_LIGHTGLUE_AVAILABLE
 
+namespace {
+
+// Opt-in emptyCache after extract/match. Default is sync-only (recon-server style);
+// full drain remains before Global BA via MrNerfCudaDrainForHostAlloc.
+bool WantEmptyCacheAfterInference() {
+    const char* e = std::getenv("ROVER_LG_EMPTY_CACHE");
+    return e && *e && e[0] != '0';
+}
+
+void CudaSyncOnly() {
+    if (torch::cuda::is_available()) {
+        torch::cuda::synchronize();
+    }
+}
+
+} // namespace
+
 void MrNerfCudaDrainForHostAlloc() {
     if (torch::cuda::is_available()) {
         torch::cuda::synchronize();
         c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+}
+
+void MrNerfCudaSyncAfterInference() {
+    if (WantEmptyCacheAfterInference()) {
+        MrNerfCudaDrainForHostAlloc();
+    } else {
+        CudaSyncOnly();
     }
 }
 
@@ -131,24 +170,41 @@ struct LightGlueMrNerfMatcher::Impl {
                   int image_height1,
                   std::vector<int>& vnMatches12) {
         vnMatches12.assign(kpts0.size(), -1);
+        g_lg_timing.calls += 1;
+        g_lg_timing.last_kpts0 = static_cast<int>(kpts0.size());
+        g_lg_timing.last_kpts1 = static_cast<int>(kpts1.size());
         if (kpts0.empty() || kpts1.empty()) {
             return 0;
         }
 
+        const auto t0 = std::chrono::steady_clock::now();
         auto feats0 =
             BuildFeatureDict(kpts0, desc0, image_width0, image_height0, device_);
         auto feats1 =
             BuildFeatureDict(kpts1, desc1, image_width1, image_height1, device_);
+        const auto t1 = std::chrono::steady_clock::now();
 
         torch::Dict<std::string, torch::Tensor> match_out;
         {
             torch::NoGradGuard no_grad;
             match_out = matcher_->forward(feats0, feats1);
         }
-        MrNerfCudaDrainForHostAlloc();
+        const auto t2 = std::chrono::steady_clock::now();
+        // Default: synchronize only (matches recon-server). Opt-in emptyCache via
+        // ROVER_LG_EMPTY_CACHE=1. Full drain still used before Global BA.
+        MrNerfCudaSyncAfterInference();
+        const auto t3 = std::chrono::steady_clock::now();
 
-        return FillMatchesFromOutput(match_out, match_thresh_,
-                                     static_cast<int>(kpts1.size()), vnMatches12);
+        const int n = FillMatchesFromOutput(match_out, match_thresh_,
+                                            static_cast<int>(kpts1.size()), vnMatches12);
+        const auto t4 = std::chrono::steady_clock::now();
+
+        using Ms = std::chrono::duration<double, std::milli>;
+        g_lg_timing.prep_ms += Ms(t1 - t0).count();
+        g_lg_timing.fwd_ms += Ms(t2 - t1).count();
+        g_lg_timing.drain_ms += Ms(t3 - t2).count();
+        g_lg_timing.post_ms += Ms(t4 - t3).count();
+        return n;
     }
 };
 

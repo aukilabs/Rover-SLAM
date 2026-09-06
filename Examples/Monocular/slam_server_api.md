@@ -20,6 +20,8 @@ The server sets:
 
 Serves the **phone camera stream** static page from `Examples/Monocular/index.html` (loaded at startup from the executable’s directory, or `Examples/Monocular/index.html` relative to the current working directory). Same host/port as the API, so the page can `fetch('/api/v1/track', …)` without CORS issues.
 
+The page also polls **`/api/v1/status`** and **`/api/v1/trajectory`** every ~1 s and draws **live timing** (`timing.series_ms`) and **top-down trajectory** canvases on that same origin (optional `all_maps` / `aligned` toggles). Offline holdout A/B plot HTML is separate (`scripts/_stage_and_serve_holdout_eval.sh`, typically `:8080`).
+
 If the file is missing, returns **404** with a short plain-text hint.
 
 When the file loads successfully, the server logs a line such as: `Phone stream UI: http://<this-host>:<port>/index.html` (replace `<this-host>` with your PC’s LAN IP on the phone).
@@ -166,13 +168,80 @@ X-Run-Detector: 1
 | `avg_processing_time_ms` | Running average processing time per frame (milliseconds). |
 | `tracking_state` | ORB-SLAM3 tracking state (when SLAM is initialized). |
 | `is_lost` | Whether the tracker reports lost (when SLAM is initialized). |
-| `alignment` | Same alignment status object returned by `GET /api/v1/trajectory`. |
+| `map_id` | Current atlas active map id (same as `multi_map_publish.active_map_id` when SLAM is initialized). |
+| `alignment` | Portal alignment status (same object as `GET /api/v1/trajectory`). |
+| `multi_map_publish` | Multi-map trajectory publish policy — see [Multi-map publish policy](#multi-map-publish-policy-multi_map_publish). Present when SLAM is initialized. |
+| `overlay` | Overlay pose-graph status (portal pins, prior soft edges). See [Overlay (`overlay`)](#overlay-overlay). |
+| `nav_pose` | Latest navigation pose (`position`, `orientation`, `frame_id`, …) when tracking has produced a pose. Domain frame when map is pinned / overlay active. |
+| `pose_source` | `slam` or `overlay` — whether `nav_pose` uses raw SLAM or overlay domain transform. |
+| `prior_pack` | Prior pack load status. `loaded: false` when no pack configured; when loaded includes `path`, `format_version`, `coordinate_frame`, `descriptor`, and `counts` (`images`, `tracks`, `portals`, `covis_edges`, `keypoints`). |
+| `timing` | Rolling VO stage timings (last + p50/p95 over ≤300 frames). Optional `series_ms` arrays (`total`, `extract`, `lg_fwd`, `pose_mm_match`, `local_map`) when present. |
+
+**Example (abbreviated):**
+
+```json
+{
+  "queue_size": 0,
+  "is_lost": false,
+  "map_id": 2,
+  "multi_map_publish": {
+    "policy": "active_only",
+    "active_map_id": 2,
+    "active_map_domain_aligned": false,
+    "included_map_ids": [2],
+    "withheld_map_ids": [0],
+    "pinned_map_ids": [0]
+  },
+  "overlay": {
+    "enabled": true,
+    "active_map_id": 2,
+    "pinned_map_ids": [0],
+    "active_map_pinned": false,
+    "prior_soft_edges_accepted": 3,
+    "maps": []
+  },
+  "pose_source": "slam",
+  "nav_pose": {
+    "frame_id": 120,
+    "position": [0.1, -0.2, 0.5],
+    "orientation": [0.99, 0.01, -0.02, 0.03]
+  },
+  "prior_pack": {
+    "loaded": true,
+    "path": "testdata/prior_pack_fixture",
+    "counts": { "images": 3, "tracks": 4, "portals": 1, "covis_edges": 2, "keypoints": 3072 }
+  }
+}
+```
+
+### Overlay (`overlay`)
+
+Present on `GET /api/v1/status` and `GET /api/v1/trajectory`.
+
+| Field | Meaning |
+|--------|---------|
+| `enabled` | Overlay graph is active (`true` in hybrid prior builds). |
+| `active_map_id` | Atlas map id passed to the overlay. |
+| `pinned_map_ids` | Maps with a stored portal `Sim(3)` pin to domain. |
+| `active_map_pinned` | Whether the **active** map is domain-pinned. |
+| `prior_soft_edges_accepted` | Count of gated prior-match soft edges accepted into the overlay graph. **Demo:** watch this increment when live↔prior LightGlue + reprojection succeeds (or set `ROVER_PRIOR_SOFT_EDGE_FIXTURE_SMOKE=1` at startup for fixture smoke). |
+| `prior_soft_edges_last` | When `prior_soft_edges_accepted` > 0: last edge `frame_id`, `prior_image_id`, `inlier_count`, `mean_reproj_px`, `weight`. |
+| `maps` | Per-map rows: `map_id`, `pinned`, `live_node_count`, `portal_factor_count`, `prior_soft_edge_count`, and when pinned `scale`, `scale_source`, `last_portal_short_id`, `last_reprojection_error_px`. |
+
+### `nav_pose` and `pose_source`
+
+- **`nav_pose`:** Same pose JSON shape as `trajectory[]` entries (`position`, `orientation`, `frame_id`, …). Emitted when a recent SLAM pose exists.
+- **`pose_source`:** Top-level on status/trajectory responses.
+  - `slam` — raw ORB-SLAM coordinates (or active unpinned map).
+  - `overlay` — domain navigation pose after portal pin / overlay `Sim(3)` (and trajectory merge policy when domain-aligned).
+
+Per-pose `trajectory[].pose_source` mirrors the transform applied to that sample.
 
 ---
 
 ## `GET /api/v1/trajectory`
 
-Returns poses from the **active atlas map** (not a global multi-map export). By default every tracked frame is included; use `?dense=0` for keyframes only. If portal alignment is enabled and at least one portal has been accepted, poses are returned in the domain/COLMAP frame; use `?aligned=0` for raw SLAM coordinates.
+Returns poses according to the **multi-map publish policy** (see `multi_map_publish` in the response). By default every tracked frame on the active map is included; use `?dense=0` for keyframes only. Use `?all_maps=1` to export every atlas map (eval); with `dense=1` (default) inactive maps get per-frame poses too. If portal alignment is enabled and the publish policy applies domain coordinates, poses are returned in the domain/COLMAP frame; use `?aligned=0` for raw SLAM coordinates.
 
 If the server was started with `--debug-output <dir>`, every trajectory response is also written as pretty JSON to `<dir>/trajectory_latest.json`, overwriting the previous file.
 
@@ -180,7 +249,8 @@ If the server was started with `--debug-output <dir>`, every trajectory response
 
 | Param | Default | Meaning |
 |--------|---------|---------|
-| `dense` | `1` (on) | `dense=0` or `dense=false` → keyframes only; otherwise all frames on the active map. |
+| `dense` | `1` (on) | `dense=0` or `dense=false` → keyframes only; otherwise per-frame poses (all maps when `all_maps=1`). |
+| `all_maps` | `0` (off) | `all_maps=1` → include every atlas map in `trajectory` (ignores publish withhold for eval export). |
 | `aligned` | `1` (on) | `aligned=0` or `aligned=false` → raw ORB-SLAM coordinates, even when portal alignment is available. |
 
 **Response:** JSON
@@ -194,7 +264,8 @@ If the server was started with `--debug-output <dir>`, every trajectory response
       "is_keyframe": false,
       "position": [x, y, z],
       "orientation": [w, x, y, z],
-      "processing_time_ms": 45.2
+      "processing_time_ms": 45.2,
+      "map_id": 2
     }
   ],
   "count": 1,
@@ -220,6 +291,14 @@ If the server was started with `--debug-output <dir>`, every trajectory response
     }
   ],
   "map_id": 0,
+  "multi_map_publish": {
+    "policy": "domain_pinned_merge",
+    "active_map_id": 2,
+    "active_map_domain_aligned": true,
+    "included_map_ids": [0, 2],
+    "withheld_map_ids": [],
+    "pinned_map_ids": [0, 2]
+  },
   "dense": true,
   "source": "active_map_dense_frames",
   "coordinate_frame": "domain_colmap",
@@ -234,6 +313,21 @@ If the server was started with `--debug-output <dir>`, every trajectory response
     "last_reprojection_error_px": 1.2,
     "last_local_points_used": 12
   },
+  "overlay": {
+    "enabled": true,
+    "active_map_id": 2,
+    "pinned_map_ids": [0, 2],
+    "active_map_pinned": true,
+    "prior_soft_edges_accepted": 2,
+    "maps": []
+  },
+  "nav_pose": {
+    "timestamp": 1735689600.123,
+    "frame_id": 42,
+    "position": [0.1, 0.0, 0.5],
+    "orientation": [0.99, 0.0, 0.0, 0.01]
+  },
+  "pose_source": "overlay",
   "custom_detection": {
     "detect_every": 1,
     "enqueued": 8,
@@ -284,6 +378,25 @@ Each trajectory entry is produced by `TwcToClientJson` in `slam_server.cc` from 
 | **`is_keyframe`** | Whether this sample came from a map keyframe (`dense=0`) or is a per-frame track sample (`dense=1`). |
 
 **Not included:** `Tcw` / `cam_from_world`, OpenGL (ARKit) poses, or uncorrected `R_wc` quaternions. Clients that need raw SLAM `Twc` should request `GET /api/v1/trajectory?aligned=0`.
+
+Each trajectory pose includes **`map_id`** (atlas map that produced the sample). When `multi_map_publish.policy` is `domain_pinned_merge`, `trajectory` contains keyframes from every domain-pinned map, each transformed with that map's portal pin.
+
+### Multi-map publish policy (`multi_map_publish`)
+
+Present on `GET /api/v1/status` and `GET /api/v1/trajectory`.
+
+| Field | Meaning |
+|--------|---------|
+| `policy` | `active_only` — active map not domain-pinned; only active map poses are emitted. `domain_pinned_merge` — active map is pinned; merge all pinned maps in domain coordinates. |
+| `active_map_id` | Current atlas active map. |
+| `active_map_domain_aligned` | Whether the active map has a portal pin (`Sim(3)` to domain). |
+| `included_map_ids` | Maps represented in `trajectory` for this response. |
+| `withheld_map_ids` | Maps with a domain pin that are **not** in `trajectory` (prior aligned segments hidden while active map is unpinned). |
+| `pinned_map_ids` | All maps that currently have a stored portal pin. |
+
+**Disappear UX:** After tracking loss (`CreateNewMap`), the new active map is unpinned → `policy` is `active_only`, `withheld_map_ids` lists prior pinned maps, and `trajectory` contains only the new active map (clients that draw all `trajectory` poses stop showing withheld segments). Re-scanning a portal on the new map restores `domain_pinned_merge` and prior pinned maps reappear in domain coordinates.
+
+**Client guidance:** Do not cache and retain trajectory poses from earlier responses when `withheld_map_ids` is non-empty or `policy` flips to `active_only` — replace the drawn path from the latest `trajectory` array. The phone stream page (`index.html`) polls status only; 3D viewers should follow trajectory API semantics above.
 
 ### Portal alignment
 
@@ -336,8 +449,10 @@ Returns a short JSON description and the list of endpoints (same information as 
 ## Command-line (server)
 
 ```text
-./slam_server <vocabulary> <settings.yaml> [--port N] [--output-dir DIR] [--debug-output DIR] [--max-queue N] [--slam-interval-nth N] [--custom-detect-every N] [--min-buffer N] [--portal-manifest refined_manifest.json] [--portal-detect-every N] [--portal-max-reproj-px N] [--occlusion-mesh mesh.obj] [--viewer]
+./slam_server <vocabulary> <settings.yaml> [--port N] [--output-dir DIR] [--debug-output DIR] [--max-queue N] [--slam-interval-nth N] [--custom-detect-every N] [--min-buffer N] [--portal-manifest refined_manifest.json] [--prior-pack <pack_root>] [--portal-detect-every N] [--portal-max-reproj-px N] [--occlusion-mesh mesh.obj] [--viewer]
 ```
+
+Human demo (prior pack, multi-map publish, phone UI): see **Human demo (prior pack + multi-map publish)** in `README_slam_server.md`.
 
 See `README_slam_server.md` for build notes and examples.
 

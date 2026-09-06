@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Holdout pose A/B</title>
+  <style>
+    :root {
+      --bg: #f6f5f2;
+      --ink: #1a1a1a;
+      --muted: #555;
+      --line: #ddd;
+      --card: #fff;
+      --base: #0b57d0;
+      --new: #0f7b3a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.45;
+    }
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 1.5rem 1.25rem 3rem;
+    }
+    h1 { font-size: 1.6rem; margin: 0 0 0.25rem; }
+    .sub { color: var(--muted); margin-bottom: 1.25rem; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 0.75rem;
+      margin-bottom: 1.5rem;
+    }
+    .stat {
+      background: var(--card);
+      border: 1px solid var(--line);
+      padding: 0.85rem 1rem;
+    }
+    .stat .k { font-size: 0.8rem; color: var(--muted); }
+    .stat .v { font-size: 1.15rem; font-weight: 600; }
+    .stat .delta { font-size: 0.75rem; color: var(--muted); margin-top: 0.2rem; }
+    .stat .delta.better { color: var(--new); }
+    .stat .delta.worse { color: #a40000; }
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      padding: 1rem;
+      margin-bottom: 1.25rem;
+    }
+    section h2 { margin: 0 0 0.75rem; font-size: 1.1rem; }
+    .cols {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1rem;
+    }
+    @media (min-width: 900px) {
+      .cols { grid-template-columns: 1fr 1fr; }
+    }
+    .col h3 {
+      margin: 0 0 0.5rem;
+      font-size: 0.95rem;
+    }
+    .col.base h3 { color: var(--base); }
+    .col.new h3 { color: var(--new); }
+    img {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #eee;
+      border: 1px solid var(--line);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 0.4rem 0.5rem;
+      border-bottom: 1px solid var(--line);
+    }
+    th { color: var(--muted); font-weight: 600; }
+    .note { color: var(--muted); font-size: 0.85rem; margin-top: 0.75rem; }
+    a { color: #0b57d0; }
+    .err { color: #a40000; white-space: pre-wrap; }
+    pre.agg {
+      background: #1a1d24;
+      color: #e8eaed;
+      padding: 0.85rem 1rem;
+      overflow: auto;
+      font-size: 0.78rem;
+      line-height: 1.35;
+      margin: 0;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Holdout pose A/B</h1>
+    <p class="sub">
+      Baseline = drain+retry (<code>ROVER_LG_EMPTY_CACHE=1</code> + <code>ROVER_LG_MM_RETRY=1</code>)
+      · New = sync-only, no MM retry (defaults)
+      · VO vs local COLMAP refine · Umeyama Sim3 per atlas map
+    </p>
+
+    <div class="grid" id="summary">
+      <div class="stat"><div class="k">Loading…</div><div class="v">—</div></div>
+    </div>
+
+    <section>
+      <h2>Top-down path</h2>
+      <div class="cols">
+        <div class="col base">
+          <h3>Baseline (drain + retry)</h3>
+          <img src="baseline/holdout_pose_topdown.png" alt="Baseline top-down" />
+        </div>
+        <div class="col new">
+          <h3>New (sync, no retry)</h3>
+          <img src="new/holdout_pose_topdown.png" alt="New top-down" />
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Relative rotation error</h2>
+      <div class="cols">
+        <div class="col base">
+          <h3>Baseline</h3>
+          <img src="baseline/holdout_pose_rot_rel.png" alt="Baseline rot rel" />
+        </div>
+        <div class="col new">
+          <h3>New</h3>
+          <img src="new/holdout_pose_rot_rel.png" alt="New rot rel" />
+        </div>
+      </div>
+      <p class="note">Within each plot: GT path + optional sparse overlay + dense SLAM. Compare columns for A/B.</p>
+    </section>
+
+    <section>
+      <h2>Single-run metrics</h2>
+      <div id="compare"></div>
+    </section>
+
+    <section>
+      <h2>3× repeat aggregate (if staged)</h2>
+      <pre class="agg" id="aggregate">Loading aggregate.txt…</pre>
+    </section>
+
+    <p class="note">
+      Data:
+      <a href="baseline/holdout_pose_metrics.json">baseline metrics</a> ·
+      <a href="new/holdout_pose_metrics.json">new metrics</a> ·
+      <a href="aggregate.txt">aggregate.txt</a>
+      · Live stream + timing/trajectory plots: slam_server <code>/index.html</code> (separate port)
+    </p>
+    <p class="err" id="error"></p>
+  </main>
+  <script>
+    function cm(m) { return (m * 100).toFixed(1) + " cm"; }
+    function deg(d) { return d.toFixed(2) + "°"; }
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    function overall(d) { return (d && d.overall) || {}; }
+    function rotMed(o) {
+      return o.rot_rel && o.rot_rel.rot_median_deg != null ? o.rot_rel.rot_median_deg : null;
+    }
+
+    function loadJson(url) {
+      return fetch(url).then(r => {
+        if (!r.ok) throw new Error(url + " → " + r.status);
+        return r.json();
+      });
+    }
+
+    Promise.all([
+      loadJson("baseline/holdout_pose_metrics.json"),
+      loadJson("new/holdout_pose_metrics.json"),
+    ]).then(([base, neu]) => {
+      const bo = overall(base);
+      const no = overall(neu);
+      const cards = [
+        ["Matched poses", (bo.matched ?? "—") + " → " + (no.matched ?? "—")],
+        ["ATE median",
+          (bo.ate_median_m != null ? cm(bo.ate_median_m) : "—") + " → " +
+          (no.ate_median_m != null ? cm(no.ate_median_m) : "—")],
+        ["ATE RMSE",
+          (bo.ate_rmse_m != null ? cm(bo.ate_rmse_m) : "—") + " → " +
+          (no.ate_rmse_m != null ? cm(no.ate_rmse_m) : "—")],
+        ["Rot rel median",
+          (rotMed(bo) != null ? deg(rotMed(bo)) : "—") + " → " +
+          (rotMed(no) != null ? deg(rotMed(no)) : "—")],
+        ["Dense SLAM poses", (base.slam_poses ?? "—") + " → " + (neu.slam_poses ?? "—")],
+        ["Maps", (bo.num_maps ?? "—") + " → " + (no.num_maps ?? "—")],
+      ];
+      document.getElementById("summary").innerHTML = cards.map(([k, v]) =>
+        `<div class="stat"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`
+      ).join("");
+
+      const rows = [
+        ["Metric", "Baseline", "New", "Δ (new − base)"],
+        ["matched", bo.matched, no.matched,
+          (bo.matched != null && no.matched != null) ? (no.matched - bo.matched) : "—"],
+        ["ATE median", bo.ate_median_m != null ? cm(bo.ate_median_m) : "—",
+          no.ate_median_m != null ? cm(no.ate_median_m) : "—",
+          (bo.ate_median_m != null && no.ate_median_m != null)
+            ? cm(no.ate_median_m - bo.ate_median_m) : "—"],
+        ["ATE RMSE", bo.ate_rmse_m != null ? cm(bo.ate_rmse_m) : "—",
+          no.ate_rmse_m != null ? cm(no.ate_rmse_m) : "—",
+          (bo.ate_rmse_m != null && no.ate_rmse_m != null)
+            ? cm(no.ate_rmse_m - bo.ate_rmse_m) : "—"],
+        ["Rot rel median", rotMed(bo) != null ? deg(rotMed(bo)) : "—",
+          rotMed(no) != null ? deg(rotMed(no)) : "—",
+          (rotMed(bo) != null && rotMed(no) != null)
+            ? deg(rotMed(no) - rotMed(bo)) : "—"],
+        ["slam_poses", base.slam_poses, neu.slam_poses,
+          (base.slam_poses != null && neu.slam_poses != null)
+            ? (neu.slam_poses - base.slam_poses) : "—"],
+      ];
+      const head = rows[0];
+      const body = rows.slice(1);
+      document.getElementById("compare").innerHTML =
+        `<table><thead><tr>${head.map(h => `<th>${esc(h)}</th>`).join("")}</tr></thead>` +
+        `<tbody>${body.map(r => `<tr>${r.map(c => `<td>${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+    }).catch(e => {
+      document.getElementById("error").textContent = String(e);
+    });
+
+    fetch("aggregate.txt")
+      .then(r => r.ok ? r.text() : Promise.reject(new Error("no aggregate.txt")))
+      .then(t => { document.getElementById("aggregate").textContent = t; })
+      .catch(() => {
+        document.getElementById("aggregate").textContent =
+          "(aggregate.txt not staged — single-run A/B plots above still apply)";
+      });
+  </script>
+</body>
+</html>

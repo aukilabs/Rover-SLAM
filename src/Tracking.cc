@@ -29,6 +29,7 @@
 #include "GeometricTools.h"
 
 #include <iostream>
+#include <cstdlib>
 
 #include <mutex>
 #include <chrono>
@@ -1699,6 +1700,9 @@ Sophus::SE3f Tracking::GrabImageMonocular(
     const cv::Mat &im, const double &timestamp, string filename,
     std::vector<float> frameIntrinsics) // CUSTOM
 {
+    mLastFrameTiming = FrameTimingMs();
+    const auto t_grab0 = std::chrono::steady_clock::now();
+
     mImGray = im;
     // Step 1 ：将彩色图像转为灰度图像
     // 若图片是3、4通道的彩色图，还需要转化成单通道灰度图
@@ -1744,6 +1748,7 @@ Sophus::SE3f Tracking::GrabImageMonocular(
     //         mCurrentFrame = Frame(mImGray,timestamp,mpORBextractorLeft,mpORBVocabulary,mpCamera,mDistCoef,mbf,mThDepth);
     // }
 
+    const auto t_extract0 = std::chrono::steady_clock::now();
     if (mSensor == System::MONOCULAR)
     {
         GeometricCamera* cam = mFrameCameras.count(timestamp) ? mFrameCameras[timestamp] : mpCamera;
@@ -1767,6 +1772,8 @@ Sophus::SE3f Tracking::GrabImageMonocular(
         else
             mCurrentFrame = Frame(mImGray,timestamp,mpIniExtractor,mpSPVocabulary,cam,mDistCoef,mbf,mThDepth,&mLastFrame,*mpImuCalib);
     }
+    mLastFrameTiming.extract_ms = std::chrono::duration<double,std::milli>(
+        std::chrono::steady_clock::now() - t_extract0).count();
 
     // t0存储未初始化时的第1帧图像时间戳
     if (mState==NO_IMAGES_YET)
@@ -1788,6 +1795,12 @@ Sophus::SE3f Tracking::GrabImageMonocular(
     // cv::waitKey(0);
     // Step 3 ：跟踪
     Track();
+
+    mLastFrameTiming.track_total_ms = std::chrono::duration<double,std::milli>(
+        std::chrono::steady_clock::now() - t_grab0).count();
+    mLastFrameTiming.state = static_cast<int>(mState);
+    mLastFrameTiming.matches_inliers = mnMatchesInliers;
+    mLastFrameTiming.local_map_points = static_cast<int>(mvpLocalMapPoints.size());
 
     // 返回当前帧的位姿
     return mCurrentFrame.GetPose();
@@ -2195,8 +2208,9 @@ void Tracking::Track()
         // Step 6 系统成功初始化，下面是具体跟踪过程
         bool bOK;
 
-#ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_StartPosePred = std::chrono::steady_clock::now();
+#ifdef REGISTER_TIMES
+        // kept for offline REGISTER_TIMES dumps
 #endif
 
         // Initial camera pose estimation using motion model or relocalization (if tracking is lost)
@@ -2448,17 +2462,14 @@ void Tracking::Track()
         if(!mCurrentFrame.mpReferenceKF)
             mCurrentFrame.mpReferenceKF = mpReferenceKF;
 
-#ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_EndPosePred = std::chrono::steady_clock::now();
-
-        double timePosePred = std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(time_EndPosePred - time_StartPosePred).count();
-        vdPosePred_ms.push_back(timePosePred);
-#endif
-
-
+        mLastFrameTiming.pose_pred_ms = std::chrono::duration<double,std::milli>(time_EndPosePred - time_StartPosePred).count();
 #ifdef REGISTER_TIMES
-        std::chrono::steady_clock::time_point time_StartLMTrack = std::chrono::steady_clock::now();
+        vdPosePred_ms.push_back(mLastFrameTiming.pose_pred_ms);
 #endif
+
+
+        std::chrono::steady_clock::time_point time_StartLMTrack = std::chrono::steady_clock::now();
 
         // Step 7 在跟踪得到当前帧初始姿态后，现在对local map进行跟踪得到更多的匹配，并优化当前位姿
         // 前面只是跟踪一帧得到初始位姿，这里搜索局部关键帧、局部地图点，和当前帧进行投影匹配，得到更多匹配的MapPoints后进行Pose优化
@@ -2567,11 +2578,10 @@ void Tracking::Track()
             }
         }
 
-#ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_EndLMTrack = std::chrono::steady_clock::now();
-
-        double timeLMTrack = std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(time_EndLMTrack - time_StartLMTrack).count();
-        vdLMTrack_ms.push_back(timeLMTrack);
+        mLastFrameTiming.local_map_ms = std::chrono::duration<double,std::milli>(time_EndLMTrack - time_StartLMTrack).count();
+#ifdef REGISTER_TIMES
+        vdLMTrack_ms.push_back(mLastFrameTiming.local_map_ms);
 #endif
 
         // Update drawer
@@ -2643,9 +2653,7 @@ void Tracking::Track()
             // 不能够直接执行这个是因为其中存储的都是指针,之前的操作都是为了避免内存泄露
             mlpTemporalPoints.clear();
 
-#ifdef REGISTER_TIMES
             std::chrono::steady_clock::time_point time_StartNewKF = std::chrono::steady_clock::now();
-#endif
             // 判断是否需要插入关键帧
             bool bNeedKF = NeedNewKeyFrame();
             //cout<<"bNeedKF: "<<bNeedKF<<endl;
@@ -2660,11 +2668,10 @@ void Tracking::Track()
                                    (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD))))
                 CreateNewKeyFrame();  // 创建关键帧，对于双目或RGB-D会产生新的地图点
 
+            mLastFrameTiming.new_kf_ms = std::chrono::duration<double,std::milli>(
+                std::chrono::steady_clock::now() - time_StartNewKF).count();
 #ifdef REGISTER_TIMES
-            std::chrono::steady_clock::time_point time_EndNewKF = std::chrono::steady_clock::now();
-
-            double timeNewKF = std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(time_EndNewKF - time_StartNewKF).count();
-            vdNewKF_ms.push_back(timeNewKF);
+            vdNewKF_ms.push_back(mLastFrameTiming.new_kf_ms);
 #endif
 
             // We allow points with high innovation (considererd outliers by the Huber Function)
@@ -3289,6 +3296,16 @@ void Tracking::CheckReplacedInLastFrame()
  */
 bool Tracking::TrackReferenceKeyFrame()
 {
+    const auto t_pose_sub0 = std::chrono::steady_clock::now();
+    struct PoseSubAcc {
+        double& dest;
+        std::chrono::steady_clock::time_point t0;
+        ~PoseSubAcc() {
+            dest += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        }
+    } pose_sub_acc{mLastFrameTiming.pose_refkf_ms, t_pose_sub0};
+
     // Compute Bag of Words vector
     // Step 1：将当前帧的描述子转化为BoW向量
     mCurrentFrame.ComputeBoW3();
@@ -3471,6 +3488,16 @@ void Tracking::UpdateLastFrame()
  */
 bool Tracking::TrackWithMotionModel()
 {
+    const auto t_pose_sub0 = std::chrono::steady_clock::now();
+    struct PoseSubAcc {
+        double& dest;
+        std::chrono::steady_clock::time_point t0;
+        ~PoseSubAcc() {
+            dest += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        }
+    } pose_sub_acc{mLastFrameTiming.pose_mm_ms, t_pose_sub0};
+
     // 最小距离 < 0.9*次小距离 匹配成功，检查旋转
     //ORBmatcher matcher(0.9,true);
     //SPmatcher matcher_sp(0.9);
@@ -3507,27 +3534,33 @@ bool Tracking::TrackWithMotionModel()
 
     // Step 3：用上一帧地图点进行投影匹配，如果匹配点不够，则扩大搜索半径再来一次
     //int nmatches = matcher.SearchByProjection(mCurrentFrame,mLastFrame,th,mSensor==System::MONOCULAR || mSensor==System::IMU_MONOCULAR);
+    LightGlueMatchTimingReset();
+    const auto t_match0 = std::chrono::steady_clock::now();
+    // Default: one LightGlue call. ORB "wider window" retry is a no-op for SP/LG
+    // (same params); keep only behind ROVER_LG_MM_RETRY=1 for A/B experiments.
     int nmatches_sp = mspmatcher.SearchBySP(mCurrentFrame, mLastFrame);
-    //this->mpExtractorLeft->lastmatchnum = nmatches_sp;
-    //cout<<"lastmatchnum : "<<this->mpExtractorLeft->lastmatchnum<<endl;
-    //int nmatches_sp = mspmatcher.SearchByProjection(mCurrentFrame, mLastFrame,th, mSensor==System::MONOCULAR || mSensor==System::IMU_MONOCULAR);
-    int first_nmatches = nmatches_sp;
-    // If few matches, uses a wider window search
-    // 如果匹配点太少，则扩大搜索半径再来一次
-    if(nmatches_sp<20)
     {
-        Verbose::PrintMess("Not enough matches, wider window search!!", Verbose::VERBOSITY_NORMAL);
-        fill(mCurrentFrame.mvpMapPoints.begin(),mCurrentFrame.mvpMapPoints.end(),static_cast<MapPoint*>(NULL));
-        // cv::Mat combined;
-        // cv::vconcat(mCurrentFrame.imgLeft, mLastFrame.imgLeft, combined);
-        // cv::imshow("Combined Image", combined);
-        // cv::imwrite("combined.jpg", combined);
-        // cv::waitKey(0);
-        //nmatches = matcher.SearchByProjection(mCurrentFrame,mLastFrame,2*th,mSensor==System::MONOCULAR || mSensor==System::IMU_MONOCULAR);
-        nmatches_sp = mspmatcher.SearchBySP(mCurrentFrame, mLastFrame);
-
-        Verbose::PrintMess("Matches with wider search: " + to_string(nmatches_sp), Verbose::VERBOSITY_NORMAL);
-
+        const char* retry = std::getenv("ROVER_LG_MM_RETRY");
+        if (retry && *retry && retry[0] != '0' && nmatches_sp < 20) {
+            Verbose::PrintMess("Not enough matches, wider window search!!", Verbose::VERBOSITY_NORMAL);
+            fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(),
+                 static_cast<MapPoint*>(NULL));
+            nmatches_sp = mspmatcher.SearchBySP(mCurrentFrame, mLastFrame);
+            Verbose::PrintMess("Matches with wider search: " + to_string(nmatches_sp),
+                               Verbose::VERBOSITY_NORMAL);
+        }
+    }
+    mLastFrameTiming.pose_mm_match_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_match0).count();
+    {
+        const auto lg = LightGlueMatchTimingSnapshot();
+        mLastFrameTiming.lg_prep_ms += lg.prep_ms;
+        mLastFrameTiming.lg_fwd_ms += lg.fwd_ms;
+        mLastFrameTiming.lg_drain_ms += lg.drain_ms;
+        mLastFrameTiming.lg_post_ms += lg.post_ms;
+        mLastFrameTiming.lg_calls += lg.calls;
+        mLastFrameTiming.lg_kpts0 = lg.last_kpts0;
+        mLastFrameTiming.lg_kpts1 = lg.last_kpts1;
     }
 
     // 这里不同于ORB-SLAM2的方式
@@ -3546,7 +3579,10 @@ bool Tracking::TrackWithMotionModel()
 
     // Optimize frame pose with all matches
     // Step 4：利用3D-2D投影关系，优化当前帧位姿
+    const auto t_opt0 = std::chrono::steady_clock::now();
     Optimizer::PoseOptimization(&mCurrentFrame);
+    mLastFrameTiming.pose_mm_opt_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_opt0).count();
 
     // Discard outliers
     // Step 5：剔除地图点中外点
@@ -4490,6 +4526,16 @@ void Tracking::UpdateLocalKeyFrames()
  */
 bool Tracking::Relocalization()
 {
+    const auto t_pose_sub0 = std::chrono::steady_clock::now();
+    struct PoseSubAcc {
+        double& dest;
+        std::chrono::steady_clock::time_point t0;
+        ~PoseSubAcc() {
+            dest += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        }
+    } pose_sub_acc{mLastFrameTiming.pose_reloc_ms, t_pose_sub0};
+
     cout<<"Relocalization!!"<<endl;
     Verbose::PrintMess("Starting relocalization", Verbose::VERBOSITY_NORMAL);
     // Compute Bag of Words Vector

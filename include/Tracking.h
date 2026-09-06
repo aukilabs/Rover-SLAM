@@ -38,6 +38,7 @@
 #include "Settings.h"
 #include "Matchers/SPmatcher.h"
 #include "GeometricCamera.h"
+#include "FrameTimingMs.h"
 #include "Extractors/SPextractor.h"
 #include <mutex>
 #include <unordered_set>
@@ -107,6 +108,8 @@ public:
     void SaveSubTrajectory(string strNameFile_frames, string strNameFile_kf, Map* pMap);
 
     float GetImageScale();
+
+    FrameTimingMs GetLastFrameTiming() const { return mLastFrameTiming; }
 
 #ifdef REGISTER_LOOP
     void RequestStop();
@@ -360,6 +363,8 @@ protected:
     double mTime_PosePred;
     double mTime_LocalMapTrack;
     double mTime_NewKF_Dec;
+
+    FrameTimingMs mLastFrameTiming;
 
     GeometricCamera* mpCamera, *mpCamera2;
 

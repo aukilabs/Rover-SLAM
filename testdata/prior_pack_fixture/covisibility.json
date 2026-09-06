@@ -1,0 +1,14 @@
+{
+  "edges": [
+    {
+      "i": 0,
+      "j": 1,
+      "shared_tracks": 3
+    },
+    {
+      "i": 1,
+      "j": 2,
+      "shared_tracks": 2
+    }
+  ]
+}

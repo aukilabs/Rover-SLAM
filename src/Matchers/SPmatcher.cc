@@ -6,6 +6,9 @@
 #include "Matchers/SPmatcher.h"
 #include <opencv2/core.hpp>
 #include <opencv2/core/eigen.hpp>
+#include <algorithm>
+#include <cstdlib>
+#include <numeric>
 using namespace std;
 
 namespace ORB_SLAM3
@@ -13,6 +16,38 @@ namespace ORB_SLAM3
     const float SPmatcher::TH_HIGH = 1.4;
     const float SPmatcher::TH_LOW = 1.2;
     const int SPmatcher::HISTO_LENGTH = 30;
+
+namespace {
+
+// Motion-model LightGlue input cap. Unset / 0 / negative => use all extracted kpts.
+int LgMmTopKFromEnv() {
+    const char* e = std::getenv("ROVER_LG_MM_TOPK");
+    if (!e || !*e) return 0;
+    char* end = nullptr;
+    const long v = std::strtol(e, &end, 10);
+    if (end == e || v <= 0) return 0;
+    return static_cast<int>(v);
+}
+
+std::vector<int> TopResponseIndices(const std::vector<cv::KeyPoint>& kpts, int k) {
+    std::vector<int> idx(kpts.size());
+    std::iota(idx.begin(), idx.end(), 0);
+    if (k <= 0 || k >= static_cast<int>(kpts.size())) return idx;
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                      [&](int a, int b) { return kpts[a].response > kpts[b].response; });
+    idx.resize(static_cast<size_t>(k));
+    return idx;
+}
+
+cv::Mat RowsByIndex(const cv::Mat& desc, const std::vector<int>& idx) {
+    cv::Mat out(static_cast<int>(idx.size()), desc.cols, desc.type());
+    for (int i = 0; i < static_cast<int>(idx.size()); ++i) {
+        desc.row(idx[static_cast<size_t>(i)]).copyTo(out.row(i));
+    }
+    return out;
+}
+
+}  // namespace
 
 SPmatcher::SPmatcher(float thre)
 {
@@ -1024,16 +1059,47 @@ int SPmatcher::SearchBySP(Frame &F, const std::vector<MapPoint*> &vpMapPoints)
 
 int SPmatcher::SearchBySP(Frame &CurrentFrame, Frame &LastFrame)
 {
-    vector<cv::Point2f> vbPrevMatched;
     vector<int> vnMatches1;
-    int size = MatchingPoints_onnx(CurrentFrame, LastFrame, vnMatches1);
+    const int mm_topk = LgMmTopKFromEnv();
+    if (mm_topk > 0 &&
+        (static_cast<int>(CurrentFrame.mvKeys.size()) > mm_topk ||
+         static_cast<int>(LastFrame.mvKeys.size()) > mm_topk)) {
+        // Extract stays full; only LightGlue sees strongest-K per side (response = ALIKED score).
+        const auto idx0 = TopResponseIndices(CurrentFrame.mvKeys, mm_topk);
+        const auto idx1 = TopResponseIndices(LastFrame.mvKeys, mm_topk);
+        std::vector<cv::KeyPoint> k0, k1;
+        k0.reserve(idx0.size());
+        k1.reserve(idx1.size());
+        for (int i : idx0) k0.push_back(CurrentFrame.mvKeys[static_cast<size_t>(i)]);
+        for (int i : idx1) k1.push_back(LastFrame.mvKeys[static_cast<size_t>(i)]);
+        cv::Mat d0 = RowsByIndex(CurrentFrame.mDescriptors, idx0);
+        cv::Mat d1 = RowsByIndex(LastFrame.mDescriptors, idx1);
+        std::vector<int> sub_matches;
+        featureMatcher->Match(
+            k0, k1, d0, d1,
+            CurrentFrame.imgLeft.cols, CurrentFrame.imgLeft.rows,
+            LastFrame.imgLeft.cols, LastFrame.imgLeft.rows,
+            sub_matches);
+        vnMatches1.assign(CurrentFrame.mvKeys.size(), -1);
+        for (size_t si = 0; si < sub_matches.size(); ++si) {
+            const int sj = sub_matches[si];
+            if (sj < 0) continue;
+            vnMatches1[static_cast<size_t>(idx0[si])] = idx1[static_cast<size_t>(sj)];
+        }
+        static bool logged = false;
+        if (!logged) {
+            std::cout << "[SPmatcher] ROVER_LG_MM_TOPK=" << mm_topk
+                      << " (MM LightGlue input cap; extract unchanged)\n";
+            logged = true;
+        }
+    } else {
+        MatchingPoints_onnx(CurrentFrame, LastFrame, vnMatches1);
+    }
     int nmatches = 0;
     for(int i = 0; i < static_cast<int>(vnMatches1.size());++i)
     {
         int IdxLF = vnMatches1[i];
         int IdxCF = i;
-        // if(matches[i].distance > TH_LOW)
-        //     continue;
         if(IdxLF != -1){
             MapPoint* pMP = LastFrame.mvpMapPoints[IdxLF];
             if(!pMP)
@@ -1045,12 +1111,8 @@ int SPmatcher::SearchBySP(Frame &CurrentFrame, Frame &LastFrame)
              nmatches++;
              vnMatches1[i]=-1;
         }
-        // if(CurrentFrame.mnId%100 == 0){
-        //     plotspmatch(CurrentFrame.imgLeft, LastFrame.imgLeft, CurrentFrame.mvKeys, LastFrame.mvKeys, vnMatches1);
-        // }
-        
     }
-    
+
     return nmatches;
 }
 

@@ -6,7 +6,9 @@ This is the Phase 1 implementation of the real-time SLAM server that converts th
 
 **Full HTTP API reference (request headers, raw vs JSON, errors, CORS):** [slam_server_api.md](slam_server_api.md).
 
-**Phone camera UI:** with the server running, open `http://<PC-LAN-IP>:<port>/index.html` on your phone (same Wi‑Fi). Source file: [index.html](index.html) (served by the binary from that path next to `slam_server`).
+**Phone camera UI:** with the server running, open `http://<PC-LAN-IP>:<port>/index.html` on your phone (same Wi‑Fi). Source file: [index.html](index.html) (served by the binary from that path next to `slam_server`). The same page draws live **timing** and **top-down trajectory** plots from `/api/v1/status` and `/api/v1/trajectory` (restart `slam_server` after editing the HTML — it is loaded once at startup).
+
+**Holdout pose plots (SLAM vs GT / baseline):** separate static page via `scripts/serve_holdout_pose_eval.py` (default `0.0.0.0:8080`, dir `out/holdout_pose_eval/`).
 
 ## Features Implemented (Phase 1)
 
@@ -43,9 +45,9 @@ Submit an image for SLAM tracking.
 ```
 
 #### `GET /api/v1/status`
-Get current server status and statistics.
+Get current server status and statistics (queue, tracker, portal alignment, **prior pack**, **multi-map publish**, **overlay**, **nav_pose**, **pose_source**). See **[slam_server_api.md](slam_server_api.md)** for the full schema.
 
-**Response Format:**
+**Response Format (core fields):**
 ```json
 {
     "queue_size": 2,
@@ -55,7 +57,11 @@ Get current server status and statistics.
     "failed_tracks": 8,
     "avg_processing_time_ms": 45.2,
     "tracking_state": 2,
-    "is_lost": false
+    "is_lost": false,
+    "multi_map_publish": { "policy": "active_only", "withheld_map_ids": [] },
+    "prior_pack": { "loaded": true },
+    "overlay": { "prior_soft_edges_accepted": 0 },
+    "pose_source": "slam"
 }
 ```
 
@@ -162,6 +168,114 @@ Loop closure and relocalization are **not available** in v1 (no ALIKED DBoW voca
 
 Example configs (`iphoneSLAM.yaml`, `DMT.yaml`, `Mentra.yaml`) ship with `loopClosing: 0`.
 
+### Prior pack (offline converter, S1)
+
+Hybrid prior-map work uses an on-disk **prior pack** (manifest, images, ALIKED features, covisibility, tracks, portals). Schema: `scripts/prior_pack/schema.md`.
+
+```bash
+# Generate synthetic fixture under testdata/
+python scripts/convert_to_prior_pack.py --generate-fixture
+
+# Convert recon layout → pack
+python scripts/convert_to_prior_pack.py --input <recon_root> --output <pack_root>
+
+# Validate required parts (exit 1 + clear error on missing/corrupt)
+python scripts/validate_prior_pack.py <pack_root>
+```
+
+Pack loading in `slam_server` is optional (slice S2). Without a pack, startup and tracking behave as before.
+
+```bash
+# CLI (overrides settings YAML)
+./slam_server vocabulary.txt settings.yaml --prior-pack testdata/prior_pack_fixture
+
+# Or in settings YAML:
+# Server.priorPack: testdata/prior_pack_fixture
+# (alternate key: prior_pack)
+```
+
+`GET /api/v1/status` includes a `prior_pack` object when loaded (`loaded`, `path`, `counts.images`, `counts.tracks`, `counts.portals`, `counts.covis_edges`, `counts.keypoints`). When no pack is configured, `prior_pack.loaded` is `false`.
+
+Invalid or incomplete packs fail at startup with a clear error (same as `--occlusion-mesh`). JSON feature files are supported; `.npz` features are rejected until a later slice adds NumPy archive parsing.
+
+## Human demo (prior pack + multi-map publish)
+
+Use this walkthrough to confirm §5 human checks: pack load, domain pin, lose-track history vanish, re-pin restore, and overlay status fields.
+
+### 1. Build and fixture pack
+
+From the repo root (after [ALIKED + LightGlue build](#aliked--lightglue-default-stack)):
+
+```bash
+# Fixture pack (if missing)
+python scripts/convert_to_prior_pack.py --generate-fixture
+python scripts/validate_prior_pack.py testdata/prior_pack_fixture
+```
+
+### 2. Start `slam_server`
+
+Run from repo root so `testdata/` and `Examples/Monocular/index.html` resolve. Default HTTP port is **8080** (`--port` to change).
+
+```bash
+./build/Examples/Monocular/slam_server \
+  Vocabulary/voc_binary_tartan_8u_6.yml.gz \
+  Examples/Monocular/iphoneSLAM.yaml \
+  --port 8080 \
+  --prior-pack testdata/prior_pack_fixture \
+  --portal-manifest testdata/prior_pack_fixture/portals.json \
+  --max-queue 10 \
+  --slam-interval-nth 1 \
+  --viewer \
+  --debug-output ./outputs/slam_server/debug
+```
+
+Optional: `ROVER_PRIOR_SOFT_EDGE_FIXTURE_SMOKE=1` before launch exercises prior soft-edge acceptance at startup (sets `overlay.prior_soft_edges_accepted` ≥ 1 on GPU/LibTorch builds).
+
+Startup log includes `Phone stream UI: http://<this-host>:<port>/index.html` — replace `<this-host>` with your PC LAN IP on the phone.
+
+### 3. Phone stream + status legend
+
+On the phone (same Wi‑Fi): open `http://<PC-LAN-IP>:8080/index.html`.
+
+- Tap **Start camera** to POST JPEG frames to `/api/v1/track`.
+- The page polls **`GET /api/v1/status` every 2s** and shows:
+  - `prior_pack` — loaded path and image count
+  - `multi_map_publish` — policy, included / **withheld** / pinned map ids
+  - `overlay` — active map pinned, `prior_soft_edges_accepted`
+  - `pose_source` — `slam` vs `overlay` (domain navigation pose)
+  - `nav_pose` — latest navigation pose when tracking
+  - tracker `is_lost` / `tracking_state`
+
+`index.html` is the **camera stream + live plots** page (timing + top-down trajectory). It is **not** a 3D map viewer (use `--viewer` for Pangolin). Offline holdout SLAM-vs-baseline PNGs are served separately via `scripts/_stage_and_serve_holdout_eval.sh` on port **8080**. For other clients, poll **`GET /api/v1/trajectory`** and **draw only returned poses** — withheld pinned maps are omitted server-side when policy is `active_only`.
+
+### 4. Demo script (what humans should see)
+
+| Step | Action | Expect on status / trajectory |
+|------|--------|--------------------------------|
+| A | Walk with camera; no portal yet | `multi_map_publish.policy` = `active_only`; trajectory = active map only; `pose_source` = `slam`; `overlay.active_map_pinned` = false |
+| B | Scan portal QR (`https://r8.hr/<shortId>`) matching manifest | `alignment.status` → aligned; `policy` → `domain_pinned_merge`; `pose_source` → `overlay`; Pangolin viewer (`--viewer`) shows domain-aligned map |
+| C | Lose track (cover lens / fast motion until relocal fails) | New map; `policy` → `active_only`; `withheld_map_ids` lists prior pinned map(s); trajectory **drops** old segment — history “vanishes” in any client that redraws from API |
+| D | Re-scan same portal on new map | `policy` → `domain_pinned_merge` again; withheld clears; trajectory merges **all** pinned maps in domain coords — history “returns” |
+
+### 5. CLI / API spot checks
+
+```bash
+curl -s http://localhost:8080/api/v1/status | jq '.prior_pack,.multi_map_publish,.overlay,.pose_source,.nav_pose'
+curl -s http://localhost:8080/api/v1/trajectory | jq '.count,.multi_map_publish,.pose_source'
+```
+
+### 6. Ops notes
+
+| Topic | Notes |
+|--------|--------|
+| **Port** | Default `8080`; set `--port` (e.g. `8000`) if another service occupies it. |
+| **LAN phone** | Phone must reach the PC IP; Windows firewall may need an inbound rule for the chosen port. |
+| **HTTPS / iOS camera** | iOS often blocks `getUserMedia` on plain HTTP; use Android on LAN, or tunnel HTTPS (e.g. **ngrok**) to the same port. The stream page limits in-flight POSTs to avoid ngrok backlog stalls. |
+| **WSL** | GPU builds are typically done inside WSL with LibTorch on Linux ext4; see `plans/aliked-lightglue-mrnerf.md` and `scripts/verify_gpu_smoke.sh`. Run `slam_server` from the same environment that built it. |
+| **Folder replay** | Without a phone: `python3 Examples/Monocular/send_frame.py <image_dir> --fps 10 --server http://localhost:8080 --raw` |
+
+Full field reference: [slam_server_api.md](slam_server_api.md).
+
 ### Vocabulary CLI argument (still required)
 
 You must still pass a vocabulary file at startup, e.g. `Vocabulary/voc_binary_tartan_8u_6.yml.gz`. The binary loads the SuperPoint DBoW vocabulary during `System` construction even when `loopClosing: 0`. Making the argument optional is deferred until EigenPlaces/place-recognition follow-on work.
@@ -201,6 +315,7 @@ make slam_server
 - `--custom-detect-every <N>`: Run custom EAN-13 barcode detection every N accepted frames; use `X-Run-Detector` or JSON `run_detector` to force detection for a single upload (default: disabled)
 - `--min-buffer <number>`: Min frames queued before tracking; oldest timestamp first (default: 3)
 - `--portal-manifest <path>`: Enable portal QR alignment from a refined manifest containing `portals[].shortId`, `portals[].pose`, and metric `portals[].physicalSize`.
+- `--prior-pack <path>`: Load optional prior pack root (`manifest.json` tree). Alternate config key: `Server.priorPack` or `prior_pack` in settings YAML.
 - `--portal-detect-every <N>`: Run portal QR detection every N accepted frames (default: 1)
 - `--portal-max-reproj-px <N>`: Reject portal PnP detections above this mean reprojection error (default: 8)
 - `--viewer`: Enable SLAM viewer window (default: disabled)

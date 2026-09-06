@@ -7,11 +7,11 @@
   <style>
     :root { --bg: #0f1115; --fg: #e8eaed; --muted: #9aa0a6; --accent: #3b82f6; --err: #f87171; }
     * { box-sizing: border-box; }
-    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--fg); padding: 12px; max-width: 520px; margin-inline: auto; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--fg); padding: 12px; max-width: 960px; margin-inline: auto; }
     h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 8px; }
     p.hint { font-size: 0.8rem; color: var(--muted); margin: 0 0 12px; line-height: 1.4; }
     video { display: none; }
-    canvas { width: 100%; border-radius: 8px; background: #000; display: block; margin-bottom: 12px; }
+    canvas#cv { width: 100%; max-width: 520px; border-radius: 8px; background: #000; display: block; margin-bottom: 12px; }
     .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
     label { font-size: 0.85rem; color: var(--muted); }
     button, select { font-size: 1rem; padding: 10px 14px; border-radius: 8px; border: none; cursor: pointer; }
@@ -22,15 +22,58 @@
     input[type="range"] { flex: 1; min-width: 100px; }
     .status { font-size: 0.8rem; color: var(--muted); white-space: pre-wrap; word-break: break-word; min-height: 3.5em; }
     .status.err { color: var(--err); }
+    .legend { font-size: 0.75rem; color: var(--muted); background: #1a1d24; border: 1px solid #2d3340; border-radius: 8px; padding: 10px; margin-bottom: 12px; line-height: 1.45; }
+    .legend h2 { font-size: 0.85rem; font-weight: 600; color: var(--fg); margin: 0 0 8px; }
+    .legend dl { margin: 0; }
+    .legend dt { font-weight: 600; color: #c4c8cc; margin-top: 6px; }
+    .legend dt:first-child { margin-top: 0; }
+    .legend dd { margin: 2px 0 0; }
+    .legend .warn { color: #fbbf24; }
+    .legend .ok { color: #34d399; }
     fieldset { border: 1px solid #2d3340; border-radius: 8px; margin: 12px 0; padding: 10px; }
     legend { font-size: 0.8rem; color: var(--muted); padding: 0 6px; }
     .intrinsics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .intrinsics input { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid #2d3340; background: #1a1d24; color: var(--fg); }
+    .plots { display: grid; grid-template-columns: 1fr; gap: 12px; margin: 16px 0; }
+    @media (min-width: 800px) { .plots { grid-template-columns: 1fr 1fr; } }
+    .plot-card { background: #1a1d24; border: 1px solid #2d3340; border-radius: 8px; padding: 10px; }
+    .plot-card h2 { font-size: 0.85rem; font-weight: 600; margin: 0 0 6px; color: var(--fg); }
+    .plot-card .meta { font-size: 0.72rem; color: var(--muted); margin: 0 0 8px; line-height: 1.35; min-height: 2.6em; }
+    .plot-card canvas { width: 100%; height: auto; display: block; border-radius: 6px; background: #0b0d11; }
+    .plot-legend { display: flex; flex-wrap: wrap; gap: 8px 12px; margin-top: 8px; font-size: 0.7rem; color: var(--muted); }
+    .plot-legend span { display: inline-flex; align-items: center; gap: 5px; }
+    .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
   </style>
 </head>
 <body>
   <h1>Rover-SLAM stream</h1>
-  <p class="hint">Same Wi‑Fi as this PC. Start camera, then frames POST to this server’s <code>/api/v1/track</code>. Use <strong>--viewer</strong> on the PC to see the map. iOS may require HTTPS for camera; try Android or <code>localhost</code> tunnel first.</p>
+  <p class="hint">Same Wi‑Fi as this PC. Start camera, then frames POST to this server’s <code>/api/v1/track</code>. Live timing + trajectory plots below poll the same host/port (<code>/api/v1/status</code>, <code>/api/v1/trajectory</code>). Use <strong>--viewer</strong> on the PC for the 3D map. Trajectory clients should draw only published poses (withheld maps are omitted server-side). iOS may require HTTPS for camera; try Android or an HTTPS tunnel (e.g. ngrok) first.</p>
+
+  <div class="legend" id="slamLegend" aria-live="polite">
+    <h2>SLAM status (polls <code>/api/v1/status</code>)</h2>
+    <dl id="slamLegendBody">
+      <dt>Server</dt><dd>Waiting for status…</dd>
+    </dl>
+  </div>
+
+  <div class="plots">
+    <section class="plot-card">
+      <h2>Timing (ms)</h2>
+      <p class="meta" id="timingMeta">Waiting for <code>timing.series_ms</code>…</p>
+      <canvas id="timingPlot" width="640" height="280"></canvas>
+      <div class="plot-legend" id="timingLegend"></div>
+    </section>
+    <section class="plot-card">
+      <h2>Trajectory (top-down)</h2>
+      <p class="meta" id="trajMeta">Waiting for <code>/api/v1/trajectory</code>…</p>
+      <div class="row" style="margin-bottom:8px">
+        <label><input type="checkbox" id="trajAllMaps" /> <code>all_maps=1</code> (eval export)</label>
+        <label><input type="checkbox" id="trajAligned" checked /> aligned</label>
+      </div>
+      <canvas id="trajPlot" width="640" height="280"></canvas>
+      <div class="plot-legend" id="trajLegend"></div>
+    </section>
+  </div>
 
   <video id="vid" playsinline muted></video>
   <canvas id="cv"></canvas>
@@ -88,8 +131,18 @@
   const fy = document.getElementById('fy');
   const cx = document.getElementById('cx');
   const cy = document.getElementById('cy');
+  const slamLegendBody = document.getElementById('slamLegendBody');
+  const timingCanvas = document.getElementById('timingPlot');
+  const trajCanvas = document.getElementById('trajPlot');
+  const timingMeta = document.getElementById('timingMeta');
+  const trajMeta = document.getElementById('trajMeta');
+  const timingLegend = document.getElementById('timingLegend');
+  const trajLegend = document.getElementById('trajLegend');
+  const trajAllMaps = document.getElementById('trajAllMaps');
+  const trajAligned = document.getElementById('trajAligned');
 
   let stream = null;
+  let statusTimer = null;
   let timer = null;
   let frameId = 1;
   let inFlight = 0;
@@ -99,13 +152,322 @@
   const maxInFlight = 1;
   const maxW = 960;
 
+  const TIMING_SERIES = [
+    { key: 'total', label: 'total', color: '#e8eaed' },
+    { key: 'extract', label: 'extract', color: '#34d399' },
+    { key: 'lg_fwd', label: 'lg_fwd', color: '#f87171' },
+    { key: 'pose_mm_match', label: 'mm_match', color: '#fbbf24' },
+    { key: 'local_map', label: 'local_map', color: '#60a5fa' }
+  ];
+  const MAP_COLORS = ['#3b82f6', '#34d399', '#fbbf24', '#f87171', '#a78bfa', '#22d3ee', '#fb7185', '#94a3b8'];
+
   function setStatus(msg, isErr) {
     status.textContent = msg;
     status.classList.toggle('err', !!isErr);
   }
 
+  function fmtIds(arr) {
+    if (!arr || !arr.length) return '[]';
+    return '[' + arr.join(', ') + ']';
+  }
+
+  function fmtMs(v) {
+    if (v == null || isNaN(v)) return '—';
+    return Number(v).toFixed(1);
+  }
+
+  function updateSlamLegend(j) {
+    if (!slamLegendBody) return;
+    const prior = j.prior_pack || {};
+    const publish = j.multi_map_publish || {};
+    const overlay = j.overlay || {};
+    const align = j.alignment || {};
+    const withheld = publish.withheld_map_ids || [];
+    const policy = publish.policy || '—';
+    let publishNote = policy;
+    if (policy === 'active_only' && withheld.length) {
+      publishNote = 'active_only — prior pinned maps hidden (lose-track UX)';
+    } else if (policy === 'domain_pinned_merge') {
+      publishNote = 'domain_pinned_merge — all pinned maps in trajectory';
+    }
+    const publishClass =
+      policy === 'domain_pinned_merge' ? 'ok' :
+      (withheld.length ? 'warn' : '');
+    const softEdges = overlay.prior_soft_edges_accepted || 0;
+    const nav = j.nav_pose;
+    const navText = nav && nav.frame_id != null
+      ? 'frame ' + nav.frame_id + ' @ ' + (nav.position ? nav.position.map(function (v) { return v.toFixed(2); }).join(', ') : '—')
+      : '—';
+    const timing = j.timing || {};
+    const p50 = timing.p50_ms || {};
+    const p95 = timing.p95_ms || {};
+    const rows = [
+      ['Prior pack', prior.loaded
+        ? 'loaded — ' + (prior.path || '') + ' (' + (prior.counts && prior.counts.images) + ' images)'
+        : 'not loaded'],
+      ['Publish policy', '<span class="' + publishClass + '">' + publishNote + '</span>'],
+      ['Maps', 'active ' + (publish.active_map_id != null ? publish.active_map_id : j.map_id) +
+        ', included ' + fmtIds(publish.included_map_ids) +
+        ', withheld ' + fmtIds(withheld) +
+        ', pinned ' + fmtIds(publish.pinned_map_ids || overlay.pinned_map_ids)],
+      ['Overlay', 'active pinned ' + (overlay.active_map_pinned ? 'yes' : 'no') +
+        ', soft edges accepted ' + softEdges],
+      ['Pose source', (j.pose_source || '—') + (align.status ? ' (alignment ' + align.status + ')' : '')],
+      ['Nav pose', navText],
+      ['Tracker', 'state ' + (j.tracking_state != null ? j.tracking_state : '—') +
+        ', lost ' + (j.is_lost ? 'yes' : 'no')],
+      ['Timing', 'samples ' + (timing.samples || 0) +
+        ', over100 ' + (timing.over_100ms_count || 0) +
+        ', p50 total/extract/lg_fwd ' + fmtMs(p50.total) + '/' + fmtMs(p50.extract) + '/' + fmtMs(p50.lg_fwd) +
+        ', p95 ' + fmtMs(p95.total) + '/' + fmtMs(p95.extract) + '/' + fmtMs(p95.lg_fwd)]
+    ];
+    slamLegendBody.innerHTML = rows.map(function (row) {
+      return '<dt>' + row[0] + '</dt><dd>' + row[1] + '</dd>';
+    }).join('');
+  }
+
+  function drawEmpty(canvas, msg) {
+    const c = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+    c.clearRect(0, 0, w, h);
+    c.fillStyle = '#0b0d11';
+    c.fillRect(0, 0, w, h);
+    c.fillStyle = '#9aa0a6';
+    c.font = '13px system-ui, sans-serif';
+    c.fillText(msg || 'No data', 16, 28);
+  }
+
+  function drawTimingPlot(timing) {
+    const series = (timing && timing.series_ms) || null;
+    if (!series || !series.total || !series.total.length) {
+      drawEmpty(timingCanvas, 'No timing samples yet');
+      timingMeta.textContent = 'Waiting for frames…';
+      return;
+    }
+    const n = series.total.length;
+    const pad = { l: 42, r: 12, t: 12, b: 28 };
+    const w = timingCanvas.width;
+    const h = timingCanvas.height;
+    const plotW = w - pad.l - pad.r;
+    const plotH = h - pad.t - pad.b;
+    let ymax = 100;
+    TIMING_SERIES.forEach(function (s) {
+      const arr = series[s.key] || [];
+      for (let i = 0; i < arr.length; i++) {
+        if (arr[i] > ymax) ymax = arr[i];
+      }
+    });
+    ymax = Math.max(120, Math.ceil(ymax / 20) * 20);
+
+    const c = timingCanvas.getContext('2d');
+    c.clearRect(0, 0, w, h);
+    c.fillStyle = '#0b0d11';
+    c.fillRect(0, 0, w, h);
+
+    // grid + budget line
+    c.strokeStyle = '#2d3340';
+    c.lineWidth = 1;
+    c.font = '11px system-ui, sans-serif';
+    c.fillStyle = '#9aa0a6';
+    for (let g = 0; g <= 4; g++) {
+      const yv = (ymax * g) / 4;
+      const y = pad.t + plotH - (yv / ymax) * plotH;
+      c.beginPath();
+      c.moveTo(pad.l, y);
+      c.lineTo(pad.l + plotW, y);
+      c.stroke();
+      c.fillText(String(Math.round(yv)), 4, y + 4);
+    }
+    const budget = (timing.budget_ms != null) ? timing.budget_ms : 100;
+    const by = pad.t + plotH - (budget / ymax) * plotH;
+    c.strokeStyle = '#f87171';
+    c.setLineDash([4, 4]);
+    c.beginPath();
+    c.moveTo(pad.l, by);
+    c.lineTo(pad.l + plotW, by);
+    c.stroke();
+    c.setLineDash([]);
+    c.fillStyle = '#f87171';
+    c.fillText(budget + 'ms', pad.l + plotW - 36, by - 4);
+
+    TIMING_SERIES.forEach(function (s) {
+      const arr = series[s.key] || [];
+      if (!arr.length) return;
+      c.strokeStyle = s.color;
+      c.lineWidth = s.key === 'total' ? 2 : 1.25;
+      c.beginPath();
+      for (let i = 0; i < arr.length; i++) {
+        const x = pad.l + (n <= 1 ? 0 : (i / (n - 1)) * plotW);
+        const y = pad.t + plotH - (Math.max(0, arr[i]) / ymax) * plotH;
+        if (i === 0) c.moveTo(x, y);
+        else c.lineTo(x, y);
+      }
+      c.stroke();
+    });
+
+    const p50 = timing.p50_ms || {};
+    const p95 = timing.p95_ms || {};
+    timingMeta.textContent =
+      'samples ' + (timing.samples || n) +
+      ' · over100 ' + (timing.over_100ms_count || 0) +
+      ' · p50 total/extract/lg_fwd ' + fmtMs(p50.total) + '/' + fmtMs(p50.extract) + '/' + fmtMs(p50.lg_fwd) +
+      ' · p95 ' + fmtMs(p95.total) + '/' + fmtMs(p95.extract) + '/' + fmtMs(p95.lg_fwd);
+
+    timingLegend.innerHTML = TIMING_SERIES.map(function (s) {
+      return '<span><i class="swatch" style="background:' + s.color + '"></i>' + s.label + '</span>';
+    }).join('');
+  }
+
+  function topdownAxes(positions) {
+    // Least-variance axis as "up"; plot the other two (same idea as holdout eval).
+    const axes = [0, 1, 2];
+    const vars = axes.map(function (a) {
+      let mean = 0;
+      for (let i = 0; i < positions.length; i++) mean += positions[i][a];
+      mean /= positions.length;
+      let v = 0;
+      for (let i = 0; i < positions.length; i++) {
+        const d = positions[i][a] - mean;
+        v += d * d;
+      }
+      return v / positions.length;
+    });
+    let up = 0;
+    if (vars[1] < vars[up]) up = 1;
+    if (vars[2] < vars[up]) up = 2;
+    const horiz = axes.filter(function (a) { return a !== up; });
+    return { up: up, a: horiz[0], b: horiz[1], labels: ['X', 'Y', 'Z'] };
+  }
+
+  function drawTrajectoryPlot(resp) {
+    const traj = (resp && resp.trajectory) || [];
+    if (!traj.length) {
+      drawEmpty(trajCanvas, 'No trajectory poses yet');
+      trajMeta.textContent = 'count 0';
+      return;
+    }
+    const positions = [];
+    const byMap = {};
+    for (let i = 0; i < traj.length; i++) {
+      const p = traj[i].position;
+      if (!p || p.length < 3) continue;
+      const mid = traj[i].map_id != null ? traj[i].map_id : 0;
+      const pt = [Number(p[0]), Number(p[1]), Number(p[2])];
+      positions.push(pt);
+      if (!byMap[mid]) byMap[mid] = [];
+      byMap[mid].push(pt);
+    }
+    if (!positions.length) {
+      drawEmpty(trajCanvas, 'No valid positions');
+      return;
+    }
+    const ax = topdownAxes(positions);
+    let minA = Infinity, maxA = -Infinity, minB = Infinity, maxB = -Infinity;
+    for (let i = 0; i < positions.length; i++) {
+      const u = positions[i][ax.a];
+      const v = positions[i][ax.b];
+      if (u < minA) minA = u;
+      if (u > maxA) maxA = u;
+      if (v < minB) minB = v;
+      if (v > maxB) maxB = v;
+    }
+    const pad = { l: 36, r: 12, t: 12, b: 28 };
+    const w = trajCanvas.width;
+    const h = trajCanvas.height;
+    const plotW = w - pad.l - pad.r;
+    const plotH = h - pad.t - pad.b;
+    const spanA = Math.max(1e-3, maxA - minA);
+    const spanB = Math.max(1e-3, maxB - minB);
+    const span = Math.max(spanA, spanB) * 1.08;
+    const midA = (minA + maxA) * 0.5;
+    const midB = (minB + maxB) * 0.5;
+    const scale = Math.min(plotW, plotH) / span;
+
+    function toXY(pt) {
+      const x = pad.l + plotW * 0.5 + (pt[ax.a] - midA) * scale;
+      const y = pad.t + plotH * 0.5 - (pt[ax.b] - midB) * scale;
+      return [x, y];
+    }
+
+    const c = trajCanvas.getContext('2d');
+    c.clearRect(0, 0, w, h);
+    c.fillStyle = '#0b0d11';
+    c.fillRect(0, 0, w, h);
+    c.strokeStyle = '#2d3340';
+    c.strokeRect(pad.l, pad.t, plotW, plotH);
+    c.fillStyle = '#9aa0a6';
+    c.font = '11px system-ui, sans-serif';
+    c.fillText(ax.labels[ax.a] + ' →', pad.l, h - 10);
+    c.fillText(ax.labels[ax.b] + ' ↑ (up=' + ax.labels[ax.up] + ')', pad.l + 60, h - 10);
+
+    const mapIds = Object.keys(byMap).map(Number).sort(function (a, b) { return a - b; });
+    mapIds.forEach(function (mid, idx) {
+      const pts = byMap[mid];
+      const color = MAP_COLORS[idx % MAP_COLORS.length];
+      c.strokeStyle = color;
+      c.fillStyle = color;
+      c.lineWidth = 1.5;
+      c.beginPath();
+      for (let i = 0; i < pts.length; i++) {
+        const xy = toXY(pts[i]);
+        if (i === 0) c.moveTo(xy[0], xy[1]);
+        else c.lineTo(xy[0], xy[1]);
+      }
+      c.stroke();
+      const last = toXY(pts[pts.length - 1]);
+      c.beginPath();
+      c.arc(last[0], last[1], 3.5, 0, Math.PI * 2);
+      c.fill();
+    });
+
+    const pub = (resp.multi_map_publish) || {};
+    trajMeta.textContent =
+      'count ' + (resp.count != null ? resp.count : traj.length) +
+      (resp.source ? ' · ' + resp.source : '') +
+      (resp.coordinate_frame ? ' · ' + resp.coordinate_frame : '') +
+      (pub.policy ? ' · policy ' + pub.policy : '') +
+      ' · maps ' + mapIds.join(',');
+
+    trajLegend.innerHTML = mapIds.map(function (mid, idx) {
+      return '<span><i class="swatch" style="background:' + MAP_COLORS[idx % MAP_COLORS.length] + '"></i>map ' + mid + ' (' + byMap[mid].length + ')</span>';
+    }).join('');
+  }
+
+  function pollTrajectory() {
+    const qs = [];
+    qs.push('dense=1');
+    if (trajAllMaps.checked) qs.push('all_maps=1');
+    if (!trajAligned.checked) qs.push('aligned=0');
+    fetch('/api/v1/trajectory?' + qs.join('&'))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (j) drawTrajectoryPlot(j);
+      })
+      .catch(function () { /* ignore transient poll errors */ });
+  }
+
+  function pollSlamStatus() {
+    fetch('/api/v1/status')
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j) return;
+        updateSlamLegend(j);
+        drawTimingPlot(j.timing || {});
+      })
+      .catch(function () { /* ignore transient poll errors */ });
+    pollTrajectory();
+  }
+
+  function startStatusPolling() {
+    pollSlamStatus();
+    if (!statusTimer) statusTimer = setInterval(pollSlamStatus, 1000);
+  }
+
   fpsEl.addEventListener('input', function () { fpsVal.textContent = fpsEl.value; });
   qualEl.addEventListener('input', function () { qualVal.textContent = qualEl.value; });
+  trajAllMaps.addEventListener('change', pollTrajectory);
+  trajAligned.addEventListener('change', pollTrajectory);
 
   function layoutCanvas() {
     if (!vid.videoWidth) return;
@@ -242,6 +604,9 @@
 
   btnStart.addEventListener('click', start);
   btnStop.addEventListener('click', stop);
+  drawEmpty(timingCanvas, 'Waiting for status…');
+  drawEmpty(trajCanvas, 'Waiting for trajectory…');
+  startStatusPolling();
 })();
   </script>
 </body>

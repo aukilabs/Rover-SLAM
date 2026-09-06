@@ -55,8 +55,24 @@ private:
 };
 
 #ifdef AUKI_LIGHTGLUE_AVAILABLE
-// Drain LibTorch CUDA work before host-side g2o graph alloc/free (init Global BA).
+// After extract/match: sync only by default; emptyCache if ROVER_LG_EMPTY_CACHE=1.
+void MrNerfCudaSyncAfterInference();
+// Sync + emptyCache before host-side g2o graph alloc/free (init Global BA).
 void MrNerfCudaDrainForHostAlloc();
 #endif
+
+/** Thread-local LightGlue Match stage accumulators (instrument-only). */
+struct LightGlueMatchTimingMs {
+    double prep_ms = 0;
+    double fwd_ms = 0;
+    double drain_ms = 0;
+    double post_ms = 0;
+    int calls = 0;
+    int last_kpts0 = 0;
+    int last_kpts1 = 0;
+};
+
+void LightGlueMatchTimingReset();
+LightGlueMatchTimingMs LightGlueMatchTimingSnapshot();
 
 #endif

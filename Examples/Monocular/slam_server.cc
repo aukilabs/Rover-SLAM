@@ -30,6 +30,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -71,6 +72,10 @@
 
 // JSON library - official nlohmann/json single-header
 #include "../../include/third_party/nlohmann/json.hpp"
+
+#include "prior_pack_loader.h"
+#include "overlay_pose_graph.h"
+#include "prior_soft_edges.h"
 
 using namespace std;
 using json = nlohmann::json;
@@ -487,6 +492,19 @@ cv::Size loadConfiguredInputSize(const string& settings_path)
     if (width <= 0 || height <= 0)
         return {};
     return cv::Size(width, height);
+}
+
+string loadPriorPackPathFromSettings(const string& settings_path)
+{
+    cv::FileStorage fs(settings_path, cv::FileStorage::READ);
+    if (!fs.isOpened())
+        return {};
+
+    string path;
+    fs["Server.priorPack"] >> path;
+    if (path.empty())
+        fs["prior_pack"] >> path;
+    return path;
 }
 
 bool isValidImageSize(const cv::Size& size)
@@ -1227,6 +1245,32 @@ json alignmentSnapshotToJson(const AlignmentSnapshot& alignment)
     return out;
 }
 
+struct MultiMapPublishPlan {
+    string policy = "active_only";
+    unsigned long active_map_id = 0;
+    bool active_map_domain_aligned = false;
+    vector<unsigned long> included_map_ids;
+    vector<unsigned long> withheld_map_ids;
+    vector<unsigned long> pinned_map_ids;
+};
+
+json multiMapPublishToJson(const MultiMapPublishPlan& plan)
+{
+    json out;
+    out["policy"] = plan.policy;
+    out["active_map_id"] = plan.active_map_id;
+    out["active_map_domain_aligned"] = plan.active_map_domain_aligned;
+    out["included_map_ids"] = plan.included_map_ids;
+    out["withheld_map_ids"] = plan.withheld_map_ids;
+    out["pinned_map_ids"] = plan.pinned_map_ids;
+    return out;
+}
+
+bool mapAlignmentIsDomainPinned(const AlignmentSnapshot& alignment)
+{
+    return alignment.enabled && alignment.has_transform;
+}
+
 /** ORB camera Twc -> Three.js position + quaternion (w,x,y,z). */
 json TwcToClientJson(const Sophus::SE3f &Twc, double timestamp, uint64_t frame_id, bool is_keyframe,
                      double processing_time_ms = 0.0)
@@ -1270,6 +1314,7 @@ struct ServerConfig {
     string output_dir = "./output";
     string debug_output_dir;
     string portal_manifest_path;
+    string prior_pack_path;
     string occlusion_mesh_path;
     LoadedObjMesh occlusion_mesh;
     bool use_viewer = false;
@@ -1279,6 +1324,7 @@ struct ServerConfig {
     /** Wait until this many frames are buffered (unless shutting down); then process oldest by `timestamp`. */
     size_t min_buffer_frames = 3;
     size_t portal_detect_every = 1;
+    size_t prior_match_every_nth = 30;
     float portal_max_reproj_px = 8.0f;
     double processing_timeout = 5.0; // seconds
     /** UTF-8 HTML for GET /index.html (phone camera UI); empty => 404 with hint */
@@ -1354,17 +1400,236 @@ private:
     atomic<uint64_t> custom_detection_dropped_{0};
     atomic<uint64_t> custom_detection_processed_{0};
     atomic<double> avg_processing_time_{0.0};
+
+    // Rolling VO stage timing (instrument-only; no behavior change).
+    struct StageTimingStats {
+        static constexpr size_t kWindow = 300;
+        mutable mutex mu;
+        array<double, kWindow> totals{};
+        array<double, kWindow> extract{};
+        array<double, kWindow> pose_pred{};
+        array<double, kWindow> pose_mm{};
+        array<double, kWindow> pose_refkf{};
+        array<double, kWindow> pose_reloc{};
+        array<double, kWindow> pose_mm_match{};
+        array<double, kWindow> pose_mm_opt{};
+        array<double, kWindow> lg_prep{};
+        array<double, kWindow> lg_fwd{};
+        array<double, kWindow> lg_drain{};
+        array<double, kWindow> lg_post{};
+        array<double, kWindow> local_map{};
+        array<double, kWindow> new_kf{};
+        array<double, kWindow> portal{};
+        array<double, kWindow> prior{};
+        size_t count = 0;
+        size_t next = 0;
+        uint64_t over_100ms = 0;
+        uint64_t last_spike_frame = 0;
+        ORB_SLAM3::FrameTimingMs last_vo{};
+        double last_prepare_ms = 0;
+        double last_portal_ms = 0;
+        double last_prior_ms = 0;
+        double last_total_ms = 0;
+        double max_total_ms = 0;
+        double max_local_map_ms = 0;
+        double max_pose_mm_ms = 0;
+        double max_pose_refkf_ms = 0;
+        double max_pose_reloc_ms = 0;
+        double max_pose_mm_match_ms = 0;
+        double max_pose_mm_opt_ms = 0;
+        double max_lg_fwd_ms = 0;
+        double max_lg_drain_ms = 0;
+        int max_local_map_points = 0;
+
+        static double percentile(vector<double> v, double p) {
+            if (v.empty()) return 0;
+            sort(v.begin(), v.end());
+            const double idx = p * static_cast<double>(v.size() - 1);
+            const size_t i = static_cast<size_t>(idx);
+            const double f = idx - static_cast<double>(i);
+            if (i + 1 < v.size())
+                return v[i] * (1.0 - f) + v[i + 1] * f;
+            return v[i];
+        }
+
+        void record(uint64_t frame_id,
+                    double prepare_ms,
+                    const ORB_SLAM3::FrameTimingMs& vo,
+                    double portal_ms,
+                    double prior_ms,
+                    double total_ms) {
+            lock_guard<mutex> lock(mu);
+            totals[next] = total_ms;
+            extract[next] = vo.extract_ms;
+            pose_pred[next] = vo.pose_pred_ms;
+            pose_mm[next] = vo.pose_mm_ms;
+            pose_refkf[next] = vo.pose_refkf_ms;
+            pose_reloc[next] = vo.pose_reloc_ms;
+            pose_mm_match[next] = vo.pose_mm_match_ms;
+            pose_mm_opt[next] = vo.pose_mm_opt_ms;
+            lg_prep[next] = vo.lg_prep_ms;
+            lg_fwd[next] = vo.lg_fwd_ms;
+            lg_drain[next] = vo.lg_drain_ms;
+            lg_post[next] = vo.lg_post_ms;
+            local_map[next] = vo.local_map_ms;
+            new_kf[next] = vo.new_kf_ms;
+            portal[next] = portal_ms;
+            prior[next] = prior_ms;
+            next = (next + 1) % kWindow;
+            if (count < kWindow) count++;
+
+            last_vo = vo;
+            last_prepare_ms = prepare_ms;
+            last_portal_ms = portal_ms;
+            last_prior_ms = prior_ms;
+            last_total_ms = total_ms;
+            if (total_ms > max_total_ms) max_total_ms = total_ms;
+            if (vo.local_map_ms > max_local_map_ms) max_local_map_ms = vo.local_map_ms;
+            if (vo.pose_mm_ms > max_pose_mm_ms) max_pose_mm_ms = vo.pose_mm_ms;
+            if (vo.pose_refkf_ms > max_pose_refkf_ms) max_pose_refkf_ms = vo.pose_refkf_ms;
+            if (vo.pose_reloc_ms > max_pose_reloc_ms) max_pose_reloc_ms = vo.pose_reloc_ms;
+            if (vo.pose_mm_match_ms > max_pose_mm_match_ms) max_pose_mm_match_ms = vo.pose_mm_match_ms;
+            if (vo.pose_mm_opt_ms > max_pose_mm_opt_ms) max_pose_mm_opt_ms = vo.pose_mm_opt_ms;
+            if (vo.lg_fwd_ms > max_lg_fwd_ms) max_lg_fwd_ms = vo.lg_fwd_ms;
+            if (vo.lg_drain_ms > max_lg_drain_ms) max_lg_drain_ms = vo.lg_drain_ms;
+            if (vo.local_map_points > max_local_map_points) max_local_map_points = vo.local_map_points;
+            if (total_ms > 100.0) {
+                over_100ms++;
+                last_spike_frame = frame_id;
+            }
+        }
+
+        json toJson() const {
+            lock_guard<mutex> lock(mu);
+            auto copy_window = [&](const array<double, kWindow>& src) {
+                vector<double> out;
+                out.reserve(count);
+                if (count < kWindow) {
+                    for (size_t i = 0; i < count; ++i) out.push_back(src[i]);
+                } else {
+                    for (size_t i = 0; i < kWindow; ++i)
+                        out.push_back(src[(next + i) % kWindow]);
+                }
+                return out;
+            };
+            const auto tot = copy_window(totals);
+            const auto ext = copy_window(extract);
+            const auto pred = copy_window(pose_pred);
+            const auto mm = copy_window(pose_mm);
+            const auto refkf = copy_window(pose_refkf);
+            const auto reloc = copy_window(pose_reloc);
+            const auto mm_match = copy_window(pose_mm_match);
+            const auto mm_opt = copy_window(pose_mm_opt);
+            const auto lgprep = copy_window(lg_prep);
+            const auto lgfwd = copy_window(lg_fwd);
+            const auto lgdrain = copy_window(lg_drain);
+            const auto lgpost = copy_window(lg_post);
+            const auto loc = copy_window(local_map);
+            const auto nkf = copy_window(new_kf);
+            json j;
+            j["budget_ms"] = 100.0;
+            j["samples"] = count;
+            j["over_100ms_count"] = over_100ms;
+            j["last_spike_frame"] = last_spike_frame;
+            j["max_total_ms"] = max_total_ms;
+            j["max_local_map_ms"] = max_local_map_ms;
+            j["max_pose_mm_ms"] = max_pose_mm_ms;
+            j["max_pose_refkf_ms"] = max_pose_refkf_ms;
+            j["max_pose_reloc_ms"] = max_pose_reloc_ms;
+            j["max_pose_mm_match_ms"] = max_pose_mm_match_ms;
+            j["max_pose_mm_opt_ms"] = max_pose_mm_opt_ms;
+            j["max_lg_fwd_ms"] = max_lg_fwd_ms;
+            j["max_lg_drain_ms"] = max_lg_drain_ms;
+            j["max_local_map_points"] = max_local_map_points;
+            j["last"] = {
+                {"prepare_ms", last_prepare_ms},
+                {"extract_ms", last_vo.extract_ms},
+                {"pose_pred_ms", last_vo.pose_pred_ms},
+                {"pose_mm_ms", last_vo.pose_mm_ms},
+                {"pose_refkf_ms", last_vo.pose_refkf_ms},
+                {"pose_reloc_ms", last_vo.pose_reloc_ms},
+                {"pose_mm_match_ms", last_vo.pose_mm_match_ms},
+                {"pose_mm_opt_ms", last_vo.pose_mm_opt_ms},
+                {"lg_prep_ms", last_vo.lg_prep_ms},
+                {"lg_fwd_ms", last_vo.lg_fwd_ms},
+                {"lg_drain_ms", last_vo.lg_drain_ms},
+                {"lg_post_ms", last_vo.lg_post_ms},
+                {"lg_calls", last_vo.lg_calls},
+                {"lg_kpts0", last_vo.lg_kpts0},
+                {"lg_kpts1", last_vo.lg_kpts1},
+                {"local_map_ms", last_vo.local_map_ms},
+                {"new_kf_ms", last_vo.new_kf_ms},
+                {"portal_ms", last_portal_ms},
+                {"prior_ms", last_prior_ms},
+                {"track_total_ms", last_vo.track_total_ms},
+                {"total_ms", last_total_ms},
+                {"local_map_points", last_vo.local_map_points},
+                {"matches_inliers", last_vo.matches_inliers},
+                {"state", last_vo.state}
+            };
+            j["p50_ms"] = {
+                {"total", percentile(tot, 0.50)},
+                {"extract", percentile(ext, 0.50)},
+                {"pose_pred", percentile(pred, 0.50)},
+                {"pose_mm", percentile(mm, 0.50)},
+                {"pose_refkf", percentile(refkf, 0.50)},
+                {"pose_reloc", percentile(reloc, 0.50)},
+                {"pose_mm_match", percentile(mm_match, 0.50)},
+                {"pose_mm_opt", percentile(mm_opt, 0.50)},
+                {"lg_prep", percentile(lgprep, 0.50)},
+                {"lg_fwd", percentile(lgfwd, 0.50)},
+                {"lg_drain", percentile(lgdrain, 0.50)},
+                {"lg_post", percentile(lgpost, 0.50)},
+                {"local_map", percentile(loc, 0.50)},
+                {"new_kf", percentile(nkf, 0.50)}
+            };
+            j["p95_ms"] = {
+                {"total", percentile(tot, 0.95)},
+                {"extract", percentile(ext, 0.95)},
+                {"pose_pred", percentile(pred, 0.95)},
+                {"pose_mm", percentile(mm, 0.95)},
+                {"pose_refkf", percentile(refkf, 0.95)},
+                {"pose_reloc", percentile(reloc, 0.95)},
+                {"pose_mm_match", percentile(mm_match, 0.95)},
+                {"pose_mm_opt", percentile(mm_opt, 0.95)},
+                {"lg_prep", percentile(lgprep, 0.95)},
+                {"lg_fwd", percentile(lgfwd, 0.95)},
+                {"lg_drain", percentile(lgdrain, 0.95)},
+                {"lg_post", percentile(lgpost, 0.95)},
+                {"local_map", percentile(loc, 0.95)},
+                {"new_kf", percentile(nkf, 0.95)}
+            };
+            // Chronological rolling window for live plots on /index.html.
+            j["series_ms"] = {
+                {"total", tot},
+                {"extract", ext},
+                {"lg_fwd", lgfwd},
+                {"pose_mm_match", mm_match},
+                {"local_map", loc}
+            };
+            return j;
+        }
+    };
+    mutable StageTimingStats stage_timing_;
     string index_html_body_;
     atomic<bool> shutdown_done_{false};
     vector<float> default_intrinsics_;
     cv::Size slam_input_size_;
     unordered_map<string, PortalDefinition> portals_;
-    mutex alignment_mutex_;
+    mutable mutex alignment_mutex_;
     mutex debug_output_mutex_;
     vector<PortalObservation> portal_observations_;
     vector<PortalCornerObservation> portal_corner_observations_;
     vector<CustomDetectionObservation> custom_detection_observations_;
     AlignmentSnapshot alignment_;
+    unordered_map<unsigned long, AlignmentSnapshot> map_alignments_;
+    unordered_map<unsigned long, vector<PortalObservation>> map_portal_observations_;
+    unsigned long last_synced_map_id_ = numeric_limits<unsigned long>::max();
+    prior_pack::PriorPack prior_pack_;
+    overlay::OverlayPoseGraph overlay_graph_;
+    prior_soft::PriorMatchConfig prior_match_config_;
+    unique_ptr<prior_soft::PriorSoftEdgeMatcher> prior_soft_matcher_;
+    int last_prior_seed_image_id_ = -1;
 
 public:
     SLAMServer(const ServerConfig& config) : config_(config), index_html_body_(config.index_html_body) {
@@ -1379,8 +1644,27 @@ public:
                  << "SLAM will receive request image resolution directly." << endl;
         }
 
+        prior_match_config_.match_every_nth_frame = config_.prior_match_every_nth;
+        if (const char* every_nth = getenv("ROVER_PRIOR_MATCH_EVERY_NTH")) {
+            try {
+                const size_t n = static_cast<size_t>(stoul(every_nth));
+                if (n > 0)
+                    prior_match_config_.match_every_nth_frame = n;
+            } catch (...) {
+                cerr << "Warning: invalid ROVER_PRIOR_MATCH_EVERY_NTH" << endl;
+            }
+        }
+        prior_match_config_.fixture_smoke = priorSoftEdgeFixtureSmokeEnabled();
+        prior_soft_matcher_ =
+            make_unique<prior_soft::PriorSoftEdgeMatcher>(prior_match_config_);
+
         if (!config_.portal_manifest_path.empty()) {
             loadPortalManifest(config_.portal_manifest_path);
+        }
+
+        if (!config_.prior_pack_path.empty()) {
+            loadPriorPack(config_.prior_pack_path);
+            runPriorPackFixtureSmokeIfEnabled();
         }
 
         // Initialize SLAM system
@@ -1442,6 +1726,11 @@ public:
         if (!config_.portal_manifest_path.empty())
             cout << "Portal manifest: " << config_.portal_manifest_path
                  << " (" << portals_.size() << " usable portal(s))" << endl;
+        if (prior_pack_.loaded)
+            cout << "Prior pack: " << prior_pack_.pack_root
+                 << " (" << prior_pack_.image_count() << " images, "
+                 << prior_pack_.track_count() << " tracks, "
+                 << prior_pack_.portal_count() << " portals)" << endl;
         if (!config_.occlusion_mesh_path.empty())
             cout << "Occlusion mesh: " << config_.occlusion_mesh_path
                  << " (" << config_.occlusion_mesh.triangles.size() << " triangle(s))" << endl;
@@ -1578,6 +1867,147 @@ private:
         if (skipped > 0)
             cout << " (" << skipped << " skipped)";
         cout << endl;
+    }
+
+    void loadPriorPack(const string& pack_path) {
+        try {
+            prior_pack_ = prior_pack::load_prior_pack(pack_path);
+        } catch (const prior_pack::PriorPackError& e) {
+            throw runtime_error(string("Failed to load --prior-pack: ") + e.what());
+        }
+        cout << "Loaded prior pack from " << pack_path << ": "
+             << prior_pack_.image_count() << " image(s), "
+             << prior_pack_.track_count() << " track(s), "
+             << prior_pack_.portal_count() << " portal(s), "
+             << prior_pack_.covis_edge_count() << " covis edge(s), "
+             << prior_pack_.total_keypoints() << " keypoint(s)" << endl;
+    }
+
+    static bool priorSoftEdgeFixtureSmokeEnabled() {
+        const char* v = getenv("ROVER_PRIOR_SOFT_EDGE_FIXTURE_SMOKE");
+        if (!v)
+            return false;
+        return strcmp(v, "1") == 0 || strcmp(v, "true") == 0;
+    }
+
+    void runPriorPackFixtureSmokeIfEnabled() {
+        if (!prior_match_config_.fixture_smoke || !prior_soft_matcher_ || !prior_pack_.loaded ||
+            prior_pack_.images.empty())
+            return;
+
+        const prior_pack::ImageRecord& img = prior_pack_.images.front();
+        prior_soft::PriorMatchInput input;
+        input.pack = &prior_pack_;
+        for (const auto& kp : img.features.keypoints) {
+            cv::KeyPoint keypoint;
+            keypoint.pt = cv::Point2f(kp.first, kp.second);
+            input.live_kpts.push_back(keypoint);
+        }
+        if (input.live_kpts.empty() || img.features.descriptors.empty())
+            return;
+
+        const int desc_dim = prior_pack_.descriptor_dim;
+        input.live_desc = cv::Mat(static_cast<int>(img.features.descriptors.size()),
+                                  desc_dim,
+                                  CV_32F);
+        for (int r = 0; r < input.live_desc.rows; ++r) {
+            for (int c = 0; c < desc_dim; ++c)
+                input.live_desc.at<float>(r, c) = img.features.descriptors[r][c];
+        }
+
+        Eigen::Quaternionf q(img.pose.rotation.w,
+                             img.pose.rotation.x,
+                             img.pose.rotation.y,
+                             img.pose.rotation.z);
+        q.normalize();
+        const Eigen::Vector3f t(img.pose.position.x, img.pose.position.y, img.pose.position.z);
+        const Sophus::SE3f Twc(q.toRotationMatrix(), t);
+        input.Twc_slam = Twc;
+        input.has_domain_pose = true;
+        input.Twc_domain = Twc;
+        input.intrinsics = {img.intrinsics.fx, img.intrinsics.fy, img.intrinsics.cx, img.intrinsics.cy};
+        input.image_width = static_cast<int>(2.f * img.intrinsics.cx);
+        input.image_height = static_cast<int>(2.f * img.intrinsics.cy);
+        if (input.image_width <= 0 || input.image_height <= 0) {
+            input.image_width = 128;
+            input.image_height = 96;
+        }
+        input.frame_id = 0;
+        input.timestamp = 0.0;
+        input.seed_prior_image_id = img.id;
+
+        const prior_soft::PriorMatchResult result = prior_soft_matcher_->tryMatch(input);
+        if (result.accepted) {
+            overlay_graph_.addPriorSoftEdgeFactor(0, result.factor);
+            last_prior_seed_image_id_ = result.matched_prior_image_id;
+            cout << "[prior] fixture smoke accepted image=" << result.matched_prior_image_id
+                 << " inliers=" << result.factor.inlier_count
+                 << " reproj_px=" << result.factor.mean_reproj_px
+                 << " total_accepted=" << overlay_graph_.priorSoftEdgesAccepted() << endl;
+        } else {
+            cout << "[prior] fixture smoke skip: " << result.skip_reason << endl;
+        }
+    }
+
+    bool shouldRunPriorMatch(uint64_t frame_id) const {
+        return prior_pack_.loaded &&
+               config_.prior_match_every_nth > 0 &&
+               (frame_id % config_.prior_match_every_nth) == 0;
+    }
+
+    void tryPriorSoftEdgesAfterTrack(unsigned long map_id,
+                                     uint64_t frame_id,
+                                     double timestamp,
+                                     const Sophus::SE3f& Tcw_slam,
+                                     const vector<cv::KeyPoint>& live_kpts,
+                                     const cv::Mat& live_desc,
+                                     const vector<float>& intrinsics,
+                                     int image_width,
+                                     int image_height) {
+        if (!prior_soft_matcher_ || live_desc.empty() || live_kpts.empty())
+            return;
+
+        prior_soft::PriorMatchInput input;
+        input.pack = &prior_pack_;
+        input.live_kpts = live_kpts;
+        input.live_desc = live_desc;
+        input.Twc_slam = Tcw_slam.inverse();
+        input.intrinsics = intrinsics;
+        input.image_width = image_width;
+        input.image_height = image_height;
+        input.frame_id = frame_id;
+        input.timestamp = timestamp;
+        input.seed_prior_image_id = last_prior_seed_image_id_;
+
+        const Sophus::SE3f Twc_slam = input.Twc_slam;
+        if (overlay_graph_.isMapPinned(map_id)) {
+            input.has_domain_pose = true;
+            input.Twc_domain = overlay_graph_.applyPinToTwc(map_id, Twc_slam);
+        } else {
+            const AlignmentSnapshot alignment = getAlignmentSnapshot(true);
+            if (alignment.has_transform) {
+                input.has_domain_pose = true;
+                const Eigen::Matrix3f R =
+                    alignment.R_domain_slam * Twc_slam.so3().matrix();
+                const Eigen::Vector3f t =
+                    alignment.scale * (alignment.R_domain_slam * Twc_slam.translation()) +
+                    alignment.t_domain_slam;
+                input.Twc_domain = Sophus::SE3f(R, t);
+            }
+        }
+
+        const prior_soft::PriorMatchResult result = prior_soft_matcher_->tryMatch(input);
+        if (result.accepted) {
+            overlay_graph_.addPriorSoftEdgeFactor(map_id, result.factor);
+            last_prior_seed_image_id_ = result.matched_prior_image_id;
+            cout << "[prior] soft edge accepted image=" << result.matched_prior_image_id
+                 << " inliers=" << result.factor.inlier_count
+                 << " reproj_px=" << result.factor.mean_reproj_px
+                 << " total_accepted=" << overlay_graph_.priorSoftEdgesAccepted() << endl;
+        } else if (result.attempted && !result.skip_reason.empty()) {
+            cout << "[prior] soft edge skip frame " << frame_id << ": " << result.skip_reason
+                 << endl;
+        }
     }
 
     bool shouldRunPortalDetection(uint64_t frame_id) const {
@@ -2935,11 +3365,130 @@ private:
         return estimate;
     }
 
+    void syncActiveMapAlignmentState(unsigned long current_map_id) {
+        lock_guard<mutex> lock(alignment_mutex_);
+        if (last_synced_map_id_ == current_map_id)
+            return;
+
+        last_synced_map_id_ = current_map_id;
+
+        portal_observations_.clear();
+        const auto obs_it = map_portal_observations_.find(current_map_id);
+        if (obs_it != map_portal_observations_.end())
+            portal_observations_ = obs_it->second;
+
+        const auto align_it = map_alignments_.find(current_map_id);
+        if (align_it != map_alignments_.end() && align_it->second.has_transform) {
+            alignment_ = align_it->second;
+            alignment_.enabled = !portals_.empty();
+            return;
+        }
+
+        alignment_.enabled = !portals_.empty();
+        alignment_.has_transform = false;
+        alignment_.R_domain_slam = Eigen::Matrix3f::Identity();
+        alignment_.t_domain_slam = Eigen::Vector3f::Zero();
+        alignment_.scale = 1.0f;
+        alignment_.has_scale_update_observation = false;
+        alignment_.last_scale_update_p_slam = Eigen::Vector3f::Zero();
+        alignment_.last_scale_update_p_domain = Eigen::Vector3f::Zero();
+        alignment_.scale_source = "none";
+        alignment_.last_portal_short_id.clear();
+        alignment_.last_reproj_px = 0.0f;
+        alignment_.last_local_points_used = 0;
+        alignment_.portal_observations = portal_observations_.size();
+        alignment_.status = portals_.empty()
+            ? "disabled"
+            : "portal_manifest_loaded_waiting_for_detection";
+    }
+
+    AlignmentSnapshot mapAlignmentSnapshot(unsigned long map_id, bool request_aligned) const {
+        lock_guard<mutex> lock(alignment_mutex_);
+        AlignmentSnapshot snapshot;
+        const auto it = map_alignments_.find(map_id);
+        if (it != map_alignments_.end())
+            snapshot = it->second;
+        if (!request_aligned) {
+            snapshot.enabled = false;
+            snapshot.has_transform = false;
+            snapshot.status = portals_.empty() ? "disabled" : "raw_requested";
+        }
+        return snapshot;
+    }
+
+    void syncOverlayFromPortalAlignment(unsigned long map_id,
+                                        const PortalObservation& obs,
+                                        const AlignmentSnapshot& alignment) {
+        overlay::PortalHardFactor factor;
+        factor.frame_id = obs.frame_id;
+        factor.timestamp = obs.timestamp;
+        factor.short_id = obs.short_id;
+        factor.p_slam = obs.p_slam;
+        factor.p_domain = obs.p_domain;
+        factor.R_domain_slam = obs.R_domain_slam;
+        factor.reproj_px = obs.reproj_px;
+        factor.weight = portalObservationWeight(obs);
+        overlay_graph_.addPortalHardFactor(map_id, factor);
+
+        if (!alignment.has_transform)
+            return;
+
+        overlay::MapSim3Pin pin;
+        pin.pinned = true;
+        pin.R_domain_slam = alignment.R_domain_slam;
+        pin.t_domain_slam = alignment.t_domain_slam;
+        pin.scale = alignment.scale;
+        pin.scale_source = alignment.scale_source;
+        pin.last_portal_short_id = alignment.last_portal_short_id;
+        pin.last_reproj_px = alignment.last_reproj_px;
+        pin.portal_factor_count = alignment.portal_observations;
+        overlay_graph_.setMapPin(map_id, pin);
+
+        cout << "[overlay] map " << map_id << " pinned via portal " << obs.short_id
+             << " scale=" << pin.scale << " scale_source=" << pin.scale_source
+             << " portal_factors=" << pin.portal_factor_count
+             << " reproj_px=" << obs.reproj_px << endl;
+    }
+
+    MultiMapPublishPlan buildMultiMapPublishPlan(unsigned long active_map_id) const {
+        MultiMapPublishPlan plan;
+        plan.active_map_id = active_map_id;
+
+        lock_guard<mutex> lock(alignment_mutex_);
+        for (const auto& kv : map_alignments_) {
+            if (mapAlignmentIsDomainPinned(kv.second))
+                plan.pinned_map_ids.push_back(kv.first);
+        }
+        sort(plan.pinned_map_ids.begin(), plan.pinned_map_ids.end());
+
+        const auto active_it = map_alignments_.find(active_map_id);
+        plan.active_map_domain_aligned =
+            active_it != map_alignments_.end() &&
+            mapAlignmentIsDomainPinned(active_it->second);
+
+        if (!plan.active_map_domain_aligned) {
+            plan.policy = "active_only";
+            plan.included_map_ids = {active_map_id};
+            for (unsigned long pinned_id : plan.pinned_map_ids) {
+                if (pinned_id != active_map_id)
+                    plan.withheld_map_ids.push_back(pinned_id);
+            }
+            return plan;
+        }
+
+        plan.policy = "domain_pinned_merge";
+        plan.included_map_ids = plan.pinned_map_ids;
+        return plan;
+    }
+
     void updatePortalAlignment(const PortalPnPResult& pnp,
                                const Sophus::SE3f& Tcw_slam,
                                const LocalScaleEstimate& local_scale,
                                uint64_t frame_id,
-                               double timestamp) {
+                               double timestamp,
+                               unsigned long map_id) {
+        syncActiveMapAlignmentState(map_id);
+
         const Sophus::SE3f Twc_slam = Tcw_slam.inverse();
         const Sophus::SE3f Twc_domain = pnp.T_cam_domain.inverse();
 
@@ -3095,6 +3644,10 @@ private:
                  << " observations=" << alignment_.portal_observations
                  << " raw_rot_delta_deg=" << raw_rotation_delta_deg
                  << " published_rot_step_deg=" << published_rotation_step_deg << endl;
+
+            map_alignments_[map_id] = alignment_;
+            map_portal_observations_[map_id] = portal_observations_;
+            syncOverlayFromPortalAlignment(map_id, obs, alignment_);
         }
 
         if (publish_viewer_alignment && slam_system_) {
@@ -3310,6 +3863,7 @@ private:
             response["custom_detection_queue_size"] = custom_detection_queue_.size();
         }
         response["avg_processing_time_ms"] = avg_processing_time_.load() * 1000.0;
+        response["timing"] = stage_timing_.toJson();
         
         if (slam_system_) {
             response["tracking_state"] = slam_system_->GetTrackingState();
@@ -3317,6 +3871,31 @@ private:
         }
 
         response["alignment"] = alignmentSnapshotToJson(getAlignmentSnapshot(true));
+
+        unsigned long active_map_id = 0;
+        if (slam_system_) {
+            lock_guard<mutex> slam_lock(slam_mutex_);
+            active_map_id = slam_system_->GetCurrentMapId();
+            syncActiveMapAlignmentState(active_map_id);
+            response["multi_map_publish"] = multiMapPublishToJson(
+                buildMultiMapPublishPlan(active_map_id));
+            response["map_id"] = active_map_id;
+        }
+
+        response["overlay"] = overlay_graph_.statusJson(active_map_id);
+
+        const LatestSlamFrame latest = latestSlamFrameSnapshot();
+        if (latest.valid) {
+            const overlay::NavPoseResult nav =
+                overlay_graph_.navPoseFromSlam(active_map_id, latest.Tcw_slam.inverse());
+            if (nav.valid) {
+                response["nav_pose"] = TwcToClientJson(
+                    nav.Twc, latest.timestamp, latest.frame_id, false);
+                response["pose_source"] = nav.pose_source;
+            }
+        }
+
+        response["prior_pack"] = prior_pack::prior_pack_status_json(prior_pack_);
         
         res.set_content(response.dump(), "application/json");
     }
@@ -3327,26 +3906,75 @@ private:
 
         const bool dense = trajectoryUseDense(req);
         const bool request_aligned = !requestParamIsFalse(req, "aligned");
-        const AlignmentSnapshot alignment = getAlignmentSnapshot(request_aligned);
+        const bool all_maps =
+            req.has_param("all_maps") && !requestParamIsFalse(req, "all_maps");
 
         unsigned long current_map_id = 0;
-        vector<ORB_SLAM3::System::TrajectorySample> samples;
+        MultiMapPublishPlan publish_plan;
+        vector<ORB_SLAM3::System::TrajectorySample> active_samples;
+        unordered_map<uint64_t, Sophus::SE3f> Twc_raw_by_frame;
+
         if (slam_system_) {
             lock_guard<mutex> slam_lock(slam_mutex_);
             current_map_id = slam_system_->GetCurrentMapId();
+            syncActiveMapAlignmentState(current_map_id);
+            publish_plan = buildMultiMapPublishPlan(current_map_id);
+
+            vector<unsigned long> map_ids = publish_plan.included_map_ids;
+            if (all_maps) {
+                map_ids = slam_system_->GetAtlasMapIds();
+                // Eval export: include every atlas map even when publish policy withholds them.
+            }
+
+            for (unsigned long map_id : map_ids) {
+                vector<ORB_SLAM3::System::TrajectorySample> samples;
+                const bool is_active = map_id == current_map_id;
+                if (is_active) {
+                    if (dense)
+                        slam_system_->GetActiveMapDenseTrajectory(samples);
+                    else
+                        slam_system_->GetActiveMapTrajectory(samples, true);
+                } else {
+                    if (dense)
+                        slam_system_->GetMapDenseTrajectory(map_id, samples);
+                    else
+                        slam_system_->GetMapKeyFrameTrajectory(map_id, samples);
+                }
+
+                const AlignmentSnapshot map_alignment =
+                    request_aligned ? mapAlignmentSnapshot(map_id, true) : mapAlignmentSnapshot(map_id, false);
+
+                for (const auto& sample : samples) {
+                    if (is_active)
+                        Twc_raw_by_frame[sample.id] = sample.Twc;
+
+                    const bool apply_domain =
+                        request_aligned && mapAlignmentIsDomainPinned(map_alignment) &&
+                        (publish_plan.policy == "domain_pinned_merge" ||
+                         (publish_plan.policy == "active_only" && is_active));
+                    const Sophus::SE3f Twc = apply_domain
+                        ? overlay_graph_.applyPinToTwc(map_id, sample.Twc)
+                        : sample.Twc;
+
+                    json pose_json = TwcToClientJson(
+                        Twc, sample.timestamp, sample.id, sample.is_keyframe);
+                    pose_json["map_id"] = map_id;
+                    pose_json["pose_source"] = apply_domain ? "overlay" : "slam";
+                    trajectory_json.push_back(pose_json);
+                }
+            }
+
             if (dense)
-                slam_system_->GetActiveMapDenseTrajectory(samples);
+                slam_system_->GetActiveMapDenseTrajectory(active_samples);
             else
-                slam_system_->GetActiveMapTrajectory(samples, true);
+                slam_system_->GetActiveMapTrajectory(active_samples, true);
+            if (Twc_raw_by_frame.empty()) {
+                for (const auto& sample : active_samples)
+                    Twc_raw_by_frame[sample.id] = sample.Twc;
+            }
         }
 
-        unordered_map<uint64_t, Sophus::SE3f> Twc_raw_by_frame;
-        for (const auto& sample : samples) {
-            const Sophus::SE3f Twc = applyAlignment(sample.Twc, alignment);
-            Twc_raw_by_frame[sample.id] = sample.Twc;
-            trajectory_json.push_back(
-                TwcToClientJson(Twc, sample.timestamp, sample.id, sample.is_keyframe));
-        }
+        const AlignmentSnapshot alignment = getAlignmentSnapshot(request_aligned);
 
         const vector<PortalCornerObservation> portal_corner_observations =
             portalCornerObservationsSnapshot();
@@ -3356,7 +3984,7 @@ private:
             computePortalSquares(portal_corner_observations, Twc_raw_by_frame, alignment);
         const vector<ORB_SLAM3::MapDrawer::CustomPoint> custom_points =
             computeCustomPlacedPoints(
-                custom_detection_observations, Twc_raw_by_frame, samples, alignment);
+                custom_detection_observations, Twc_raw_by_frame, active_samples, alignment);
         json placed_data = placedDataToJson(portal_squares);
         for (const auto& row : customPlacedDataToJson(custom_points)) {
             placed_data.push_back(row);
@@ -3367,7 +3995,7 @@ private:
             portalFrameDetectionsToJson(portal_corner_observations, Twc_raw_by_frame);
         for (const auto& row :
              customFrameDetectionsToJson(
-                 custom_detection_observations, Twc_raw_by_frame, samples)) {
+                 custom_detection_observations, Twc_raw_by_frame, active_samples)) {
             frame_detections.push_back(row);
         }
 
@@ -3376,11 +4004,40 @@ private:
         response["placed_data"] = placed_data;
         response["frame_detections"] = frame_detections;
         response["map_id"] = current_map_id;
+        response["multi_map_publish"] = multiMapPublishToJson(publish_plan);
         response["dense"] = dense;
-        response["source"] = dense ? "active_map_dense_frames" : "active_map_keyframes";
-        response["coordinate_frame"] =
-            (alignment.enabled && alignment.has_transform) ? "domain_colmap" : "slam";
+        response["all_maps"] = all_maps;
+        if (all_maps) {
+            response["source"] = dense
+                ? "all_atlas_maps_dense_frames"
+                : "all_atlas_maps_keyframes";
+        } else if (publish_plan.policy == "domain_pinned_merge") {
+            response["source"] = dense
+                ? "multi_map_domain_pinned_merge_dense_frames"
+                : "multi_map_domain_pinned_merge_keyframes";
+        } else {
+            response["source"] = dense ? "active_map_dense_frames" : "active_map_keyframes";
+        }
+        const bool domain_output =
+            request_aligned &&
+            (publish_plan.policy == "domain_pinned_merge" ||
+             (publish_plan.policy == "active_only" && publish_plan.active_map_domain_aligned));
+        response["coordinate_frame"] = domain_output ? "domain_colmap" : "slam";
+        response["pose_source"] = domain_output ? "overlay" : "slam";
         response["alignment"] = alignmentSnapshotToJson(alignment);
+        response["overlay"] = overlay_graph_.statusJson(current_map_id);
+        if (!active_samples.empty()) {
+            const overlay::NavPoseResult nav =
+                overlay_graph_.navPoseFromSlam(current_map_id, active_samples.back().Twc);
+            if (nav.valid) {
+                const auto& latest_sample = active_samples.back();
+                response["nav_pose"] = TwcToClientJson(
+                    nav.Twc,
+                    latest_sample.timestamp,
+                    latest_sample.id,
+                    latest_sample.is_keyframe);
+            }
+        }
         response["custom_detection"] = {
             {"detect_every", config_.custom_detect_every},
             {"enqueued", custom_detection_enqueued_.load()},
@@ -3419,7 +4076,7 @@ private:
             {"GET /index.html", "Phone camera stream UI (static page)"},
             {"POST /api/v1/track", "Submit image for tracking; X-Run-Detector or JSON run_detector queues full-resolution custom detection"},
             {"GET /api/v1/status", "Get server status"},
-            {"GET /api/v1/trajectory", "Active-map trajectory (dense default; ?dense=0 keyframes only; ?aligned=0 raw SLAM frame)"},
+            {"GET /api/v1/trajectory", "Trajectory (dense default; ?all_maps=1 every atlas map; ?dense=0 keyframes; ?aligned=0 raw SLAM)"},
             {"GET /api/v1/health", "Health check"}
         };
         response["portal_alignment_enabled"] = !portals_.empty();
@@ -3658,12 +4315,19 @@ private:
                             request->frame_id,
                             request->timestamp,
                             request->intrinsics);
+                        unsigned long map_id = 0;
+                        {
+                            lock_guard<mutex> slam_lock(slam_mutex_);
+                            if (slam_system_)
+                                map_id = slam_system_->GetCurrentMapId();
+                        }
                         updatePortalAlignment(
                             pnp,
                             request->associated_Tcw_slam,
                             LocalScaleEstimate(),
                             request->frame_id,
-                            request->timestamp);
+                            request->timestamp,
+                            map_id);
                         refreshViewerPortalSquares();
                         refreshViewerCustomPoints();
                     }
@@ -3683,7 +4347,10 @@ private:
         auto start_time = chrono::high_resolution_clock::now();
 
         vector<float> slam_intrinsics;
+        const auto t_prepare0 = chrono::steady_clock::now();
         const cv::Mat slam_image = prepareSlamImage(request, slam_intrinsics);
+        const double prepare_ms = chrono::duration<double, milli>(
+            chrono::steady_clock::now() - t_prepare0).count();
 
         cout << "Frame " << request->frame_id << " image resolution: "
              << request->image.cols << " x " << request->image.rows;
@@ -3697,6 +4364,12 @@ private:
         vector<ORB_SLAM3::MapPoint*> tracked_map_points;
         vector<cv::KeyPoint> tracked_keypoints;
         vector<float> portal_intrinsics;
+        vector<cv::KeyPoint> prior_match_kpts;
+        cv::Mat prior_match_desc;
+        unsigned long current_map_id = 0;
+        ORB_SLAM3::FrameTimingMs vo_timing;
+        double portal_ms = 0.0;
+        double prior_ms = 0.0;
         try {
             {
                 lock_guard<mutex> slam_lock(slam_mutex_);
@@ -3708,15 +4381,28 @@ private:
                     "",
                     slam_intrinsics
                 );
+                vo_timing = slam_system_->GetLastFrameTiming();
 
                 success = !pose.matrix().isZero();
                 if (success) {
                     successful_tracks_++;
+                    current_map_id = slam_system_->GetCurrentMapId();
+                    syncActiveMapAlignmentState(current_map_id);
+                    overlay_graph_.recordLivePose(
+                        current_map_id,
+                        request->frame_id,
+                        request->timestamp,
+                        pose.inverse(),
+                        false);
                     updateLatestSlamFrame(request->frame_id, request->timestamp, pose);
                     if (shouldRunPortalDetection(request->frame_id)) {
                         tracked_map_points = slam_system_->GetTrackedMapPoints();
                         tracked_keypoints = slam_system_->GetTrackedKeyPointsUn();
                         portal_intrinsics = slam_intrinsics;
+                    }
+                    if (prior_pack_.loaded && shouldRunPriorMatch(request->frame_id)) {
+                        prior_match_kpts = slam_system_->GetTrackedKeyPointsUn();
+                        prior_match_desc = slam_system_->GetCurrentFrameDescriptors();
                     }
                 } else {
                     failed_tracks_++;
@@ -3724,6 +4410,7 @@ private:
             }
 
             if (success && shouldRunPortalDetection(request->frame_id)) {
+                const auto t_portal0 = chrono::steady_clock::now();
                 if (portal_intrinsics.size() < 4) {
                     cerr << "[portal] skipping QR PnP for frame " << request->frame_id
                          << ": no intrinsics available" << endl;
@@ -3739,11 +4426,29 @@ private:
                         const LocalScaleEstimate local_scale = estimateLocalScaleFromPortalRegion(
                             pnp, pose, tracked_map_points, tracked_keypoints, portal_intrinsics);
                         updatePortalAlignment(
-                            pnp, pose, local_scale, request->frame_id, request->timestamp);
+                            pnp, pose, local_scale, request->frame_id, request->timestamp, current_map_id);
                         refreshViewerPortalSquares();
                         refreshViewerCustomPoints();
                     }
                 }
+                portal_ms = chrono::duration<double, milli>(
+                    chrono::steady_clock::now() - t_portal0).count();
+            }
+
+            if (success && !prior_match_desc.empty()) {
+                const auto t_prior0 = chrono::steady_clock::now();
+                tryPriorSoftEdgesAfterTrack(
+                    current_map_id,
+                    request->frame_id,
+                    request->timestamp,
+                    pose,
+                    prior_match_kpts,
+                    prior_match_desc,
+                    slam_intrinsics,
+                    slam_image.cols,
+                    slam_image.rows);
+                prior_ms = chrono::duration<double, milli>(
+                    chrono::steady_clock::now() - t_prior0).count();
             }
 
         } catch (const exception& e) {
@@ -3754,6 +4459,36 @@ private:
         auto end_time = chrono::high_resolution_clock::now();
         const double processing_time =
             chrono::duration<double>(end_time - start_time).count();
+        const double total_ms = processing_time * 1000.0;
+
+        stage_timing_.record(
+            request->frame_id, prepare_ms, vo_timing, portal_ms, prior_ms, total_ms);
+        if (total_ms > 100.0) {
+            cerr << fixed << setprecision(1)
+                 << "[timing] spike frame " << request->frame_id
+                 << " total=" << total_ms
+                 << "ms prepare=" << prepare_ms
+                 << " extract=" << vo_timing.extract_ms
+                 << " pose=" << vo_timing.pose_pred_ms
+                 << " mm=" << vo_timing.pose_mm_ms
+                 << " mm_match=" << vo_timing.pose_mm_match_ms
+                 << " mm_opt=" << vo_timing.pose_mm_opt_ms
+                 << " lg_prep=" << vo_timing.lg_prep_ms
+                 << " lg_fwd=" << vo_timing.lg_fwd_ms
+                 << " lg_drain=" << vo_timing.lg_drain_ms
+                 << " lg_post=" << vo_timing.lg_post_ms
+                 << " lg_calls=" << vo_timing.lg_calls
+                 << " lg_kpts=" << vo_timing.lg_kpts0 << "/" << vo_timing.lg_kpts1
+                 << " refkf=" << vo_timing.pose_refkf_ms
+                 << " reloc=" << vo_timing.pose_reloc_ms
+                 << " local_map=" << vo_timing.local_map_ms
+                 << " new_kf=" << vo_timing.new_kf_ms
+                 << " portal=" << portal_ms
+                 << " prior=" << prior_ms
+                 << " local_pts=" << vo_timing.local_map_points
+                 << " inliers=" << vo_timing.matches_inliers
+                 << endl;
+        }
         
         double current_avg = avg_processing_time_.load();
         const auto n = successful_tracks_.load() + failed_tracks_.load();
@@ -3812,6 +4547,8 @@ void printUsage() {
     cout << "  --custom-detect-every <N> Run custom detection every N accepted frames (default: disabled)" << endl;
     cout << "  --min-buffer <number>  Min frames in queue before tracking; oldest timestamp first (default: 3)" << endl;
     cout << "  --portal-manifest <path>  refined_manifest.json with portals[].pose and physicalSize" << endl;
+    cout << "  --prior-pack <path>       prior pack root (manifest.json); or set Server.priorPack in settings YAML" << endl;
+    cout << "  --prior-match-every <N>   Run prior soft-edge match every N frames (default: 30)" << endl;
     cout << "  --portal-detect-every <N> Run portal QR detection every N accepted frames (default: 1)" << endl;
     cout << "  --portal-max-reproj-px <N> Reject portal PnP above this mean reprojection error (default: 8)" << endl;
     cout << "  --occlusion-mesh <path> OBJ mesh in domain coordinates for barcode ray placement and viewer rendering" << endl;
@@ -3855,6 +4592,12 @@ int main(int argc, char* argv[]) {
             config.min_buffer_frames = static_cast<size_t>(stoul(argv[++i]));
         } else if (arg == "--portal-manifest" && i + 1 < argc) {
             config.portal_manifest_path = argv[++i];
+        } else if (arg == "--prior-pack" && i + 1 < argc) {
+            config.prior_pack_path = argv[++i];
+        } else if (arg == "--prior-match-every" && i + 1 < argc) {
+            config.prior_match_every_nth = static_cast<size_t>(stoul(argv[++i]));
+            if (config.prior_match_every_nth < 1)
+                config.prior_match_every_nth = 1;
         } else if (arg == "--portal-detect-every" && i + 1 < argc) {
             config.portal_detect_every = static_cast<size_t>(stoul(argv[++i]));
             if (config.portal_detect_every < 1)
@@ -3871,6 +4614,9 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+
+    if (config.prior_pack_path.empty())
+        config.prior_pack_path = loadPriorPackPathFromSettings(config.settings_path);
     
     if (!config.occlusion_mesh_path.empty()) {
         string error;
