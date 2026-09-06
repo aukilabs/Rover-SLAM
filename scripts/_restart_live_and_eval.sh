@@ -45,7 +45,7 @@ echo "=== start slam_server :$LIVE_PORT ==="
   Examples/Monocular/iphoneSLAM.yaml \
   --prior-pack testdata/prior_pack_fixture \
   --port "$LIVE_PORT" \
-  --max-queue 100 \
+  --max-queue 10 \
   >"$LOG" 2>&1 &
 SPID=$!
 echo "slam_server pid=$SPID log=$LOG"
