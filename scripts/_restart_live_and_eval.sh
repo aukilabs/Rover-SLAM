@@ -5,6 +5,7 @@ ROOT=/mnt/d/agent-workspaces/Rover-SLAM
 LIVE_PORT=18080
 EVAL_PORT=8080
 LOG=$HOME/build/rover-slam-live.log
+EVAL_LOG=$HOME/build/holdout_eval_serve.log
 
 export LIBTORCH_ROOT="${LIBTORCH_ROOT:-$HOME/build/libtorch-cu128}"
 export CMAKE_PREFIX_PATH="${HOME}/.local${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"
@@ -30,6 +31,8 @@ stop_port() {
 
 cd "$ROOT"
 stop_port "$LIVE_PORT"
+pkill -f 'serve_holdout_pose_eval.py' 2>/dev/null || true
+stop_port "$EVAL_PORT"
 
 BIN="$ROOT/Examples/Monocular/slam_server"
 if [[ ! -x "$BIN" ]]; then
@@ -40,13 +43,14 @@ fi
 mkdir -p "$HOME/build"
 : > "$LOG"
 echo "=== start slam_server :$LIVE_PORT ==="
-"$BIN" \
+nohup "$BIN" \
   Vocabulary/voc_binary_tartan_8u_6.yml.gz \
   Examples/Monocular/iphoneSLAM.yaml \
   --prior-pack testdata/prior_pack_fixture \
   --port "$LIVE_PORT" \
   --max-queue 10 \
   >"$LOG" 2>&1 &
+disown || true
 SPID=$!
 echo "slam_server pid=$SPID log=$LOG"
 
@@ -74,15 +78,13 @@ for i in $(seq 1 90); do
   fi
 done
 
-# Restart A/B static serve on 8080 (pkill only the python serve script)
-stop_port "$EVAL_PORT"
-pkill -f 'serve_holdout_pose_eval.py' 2>/dev/null || true
-sleep 0.3
 sed -i 's/\r$//' "$ROOT/scripts/serve_holdout_pose_eval.py"
 DST="$ROOT/out/holdout_pose_eval"
-python3 "$ROOT/scripts/serve_holdout_pose_eval.py" --host 0.0.0.0 --port "$EVAL_PORT" --dir "$DST" \
-  >"$HOME/build/holdout_eval_serve.log" 2>&1 &
+nohup python3 "$ROOT/scripts/serve_holdout_pose_eval.py" --host 0.0.0.0 --port "$EVAL_PORT" --dir "$DST" \
+  >"$EVAL_LOG" 2>&1 &
+disown || true
 echo "eval_serve pid=$!"
 sleep 0.5
 curl -sf -m 2 -o /dev/null -w "EVAL_HTTP:%{http_code}\n" "http://127.0.0.1:$EVAL_PORT/" || echo "EVAL_FAIL"
+curl -sf -m 2 "http://127.0.0.1:$LIVE_PORT/api/v1/status" | python3 -c 'import json,sys; print("max_queue", json.load(sys.stdin).get("max_queue_size"))'
 echo DONE
