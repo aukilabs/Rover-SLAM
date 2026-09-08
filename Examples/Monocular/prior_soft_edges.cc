@@ -564,6 +564,8 @@ PriorMatchResult PriorSoftEdgeMatcher::tryMatch(const PriorMatchInput& input) {
             best_gate = gate;
             best_factor.frame_id = input.frame_id;
             best_factor.timestamp = input.timestamp;
+            best_factor.vertex_keyframe_id = overlay::kMapOriginVertexId;
+            best_factor.Tcr = input.Twc_slam.inverse();
             best_factor.prior_image_id = prior_image_id;
             best_factor.inlier_count = gate.inliers;
             best_factor.mean_reproj_px = gate.mean_reproj_px;

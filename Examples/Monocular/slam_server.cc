@@ -2050,8 +2050,7 @@ private:
 
         const prior_soft::PriorMatchResult result = prior_soft_matcher_->tryMatch(input);
         if (result.accepted) {
-            overlay::AtlasSnapshot atlas;
-            overlay_graph_.addPriorSoftEdgeFactor(0, result.factor, atlas);
+            overlay_graph_.addPriorSoftEdgeFactor(0, result.factor);
             last_prior_seed_image_id_ = result.matched_prior_image_id;
             cout << "[prior] fixture smoke accepted image=" << result.matched_prior_image_id
                  << " inliers=" << result.factor.inlier_count
@@ -2106,23 +2105,8 @@ private:
         const prior_soft::PriorMatchResult result = prior_soft_matcher_->tryMatch(input);
         if (result.accepted) {
             overlay::PriorSoftEdgeFactor factor = result.factor;
-            overlay::AtlasSnapshot atlas;
-            {
-                lock_guard<mutex> slam_lock(slam_mutex_);
-                if (slam_system_) {
-                    unsigned long orb_id = 0;
-                    unsigned long ref_kf = 0;
-                    Sophus::SE3f Tcr;
-                    if (slam_system_->GetCurrentFrameOverlayAnchor(orb_id, ref_kf, Tcr)) {
-                        factor.vertex_keyframe_id = ref_kf;
-                        factor.Tcr = Tcr;
-                        (void)orb_id;
-                    }
-                }
-                atlas = buildAtlasSnapshot(map_id);
-            }
             const overlay::RefineResult refine =
-                overlay_graph_.addPriorSoftEdgeFactor(map_id, factor, atlas);
+                overlay_graph_.addPriorSoftEdgeFactor(map_id, factor);
             if (refine.published) {
                 applyOverlayRefineToAlignment(map_id, refine);
             }
@@ -3666,38 +3650,6 @@ private:
         return plan;
     }
 
-    overlay::AtlasSnapshot buildAtlasSnapshot(unsigned long map_id) {
-        overlay::AtlasSnapshot snap;
-        if (!slam_system_)
-            return snap;
-
-        std::vector<ORB_SLAM3::System::KeyFrameGraphSample> kf_graph;
-        slam_system_->GetMapKeyFrameGraph(map_id, kf_graph);
-        snap.keyframes.reserve(kf_graph.size());
-        for (const auto& kf : kf_graph) {
-            overlay::KeyFrameGraphSample node;
-            node.id = kf.id;
-            node.timestamp = kf.timestamp;
-            node.Tcw = kf.Tcw;
-            node.parent_id = kf.parent_id;
-            node.covisibles = kf.covisibles;
-            snap.keyframes.push_back(std::move(node));
-        }
-
-        std::vector<ORB_SLAM3::System::TrajectorySample> dense;
-        slam_system_->GetMapDenseTrajectory(map_id, dense);
-        snap.frame_refs.reserve(dense.size());
-        for (const auto& sample : dense) {
-            overlay::FrameRefSample ref;
-            ref.frame_id = sample.id;
-            ref.ref_keyframe_id = sample.ref_keyframe_id;
-            ref.Tcr = sample.Tcr;
-            ref.is_keyframe = sample.is_keyframe;
-            snap.frame_refs.push_back(ref);
-        }
-        return snap;
-    }
-
     void updatePortalAlignment(const PortalPnPResult& pnp,
                                const Sophus::SE3f& Tcw_slam,
                                const LocalScaleEstimate& local_scale,
@@ -3752,17 +3704,7 @@ private:
              << " local_scale=" << local_scale.scale
              << endl;
 
-        overlay::RefineResult refine;
-        overlay::AtlasSnapshot atlas;
-        {
-            lock_guard<mutex> slam_lock(slam_mutex_);
-            if (slam_system_) {
-                sight.has_overlay_anchor = slam_system_->GetCurrentFrameOverlayAnchor(
-                    sight.orb_frame_mn_id, sight.ref_keyframe_id, sight.Tcr);
-            }
-            atlas = buildAtlasSnapshot(map_id);
-        }
-        refine = overlay_graph_.ingestPortalSight(map_id, sight, atlas);
+        overlay::RefineResult refine = overlay_graph_.ingestPortalSight(map_id, sight);
 
         bool publish_viewer_alignment = false;
         Eigen::Matrix3f viewer_R_domain_slam = Eigen::Matrix3f::Identity();
@@ -4133,13 +4075,7 @@ private:
                         (all_maps || publish_plan.policy == "domain_pinned_merge" ||
                          (publish_plan.policy == "active_only" && is_active));
                     const Sophus::SE3f Twc = apply_domain
-                        ? overlay_graph_.applyPinToTwc(
-                              map_id,
-                              sample.Twc,
-                              sample.id,
-                              sample.ref_keyframe_id,
-                              sample.Tcr,
-                              sample.is_keyframe)
+                        ? overlay_graph_.applyPinToTwc(map_id, sample.Twc)
                         : sample.Twc;
 
                     json pose_json = TwcToClientJson(
@@ -4563,14 +4499,12 @@ private:
                     successful_tracks_++;
                     current_map_id = slam_system_->GetCurrentMapId();
                     syncActiveMapAlignmentState(current_map_id);
-                    const overlay::AtlasSnapshot atlas = buildAtlasSnapshot(current_map_id);
                     const overlay::RefineResult live_refine = overlay_graph_.recordLivePose(
                         current_map_id,
                         request->frame_id,
                         request->timestamp,
                         pose.inverse(),
-                        false,
-                        atlas);
+                        false);
                     if (live_refine.published) {
                         applyOverlayRefineToAlignment(current_map_id, live_refine);
                         cout << "[overlay] live_edge " << live_refine.status
