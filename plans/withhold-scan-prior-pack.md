@@ -2,7 +2,7 @@
 
 Status: active  
 Tier: feature  
-Stage: 2-feature  
+Stage: 7-implement  
 Skips: _(none)_  
 Last updated: 2026-09-06
 
@@ -13,6 +13,14 @@ h2k:
   awaiting_human: false
   plan: plans/withhold-scan-prior-pack.md
 ```
+
+### Bounce log
+
+- **2026-09-06:** Rejected “synthetic portal / GT Sim3 seed” pin. New truth: holdout must pin via **real QR portal detection** on `slam_server`, and map ingestion must carry **placed portals from the refined map** (global `refined_manifest.json`), not a fake seed.
+
+### Approvals
+
+- **2026-09-06:** Slice shape **A–E locked**. **Mass-approve all remaining slices** (A→E). Implement one slice per implementer; review/verify between slices; no re-ask until blocked or done.
 
 - **Dynamics note (2026-09-05):** moving people / dynamic objects are **out of scope** for Rover-SLAM v1 (see `plans/hybrid-prior-pose-graph.md` §4). Holdout validation assumes relatively static scenes; do not treat foot-traffic failures as pack/bridge blockers.
 - **Alt stack (2026-09-05):** possible swap to another paper/code (remembered as “*-W … SLAM”, candidate WildGS-SLAM) **deferred** — keep investigating Rover-SLAM processing spikes / VO budget first.
@@ -63,8 +71,8 @@ Living document — update in place when later work changes earlier conclusions.
 - **Customer / internal need:** Prove MrNeRF-refined reconstruction can feed `slam_server` as a prior map, and that a held-out scan localizes against that map.
 - **Framing:** Build a prior pack from refined global outputs for the three map scans; withhold `13-42-53` frames as the query stream; run `slam_server` with the pack loaded and measure localization / prior soft-edge evidence.
 - **Why now:** Refined global artifacts are on disk; prior-pack path in Rover-SLAM is ready once the COLMAP→pack bridge exists.
-- **Success look like:** Validated prior pack from refined (map = `13-38-55`+`13-40-15`+`13-41-55`); `slam_server` loads it; holdout `13-42-53` frames produce measurable localization / prior soft-edge or pose evidence (§5).
-- **Locked:** 2026-09-04 (holdout `13-42-53`; map = all three non-holdout; refined-only).
+- **Success look like:** Validated prior pack from **global refined** (map = `13-38-55`+`13-40-15`+`13-41-55`) including **placed portals**; `slam_server` loads pack; holdout `13-42-53` **detects real portal QRs**, domain-pins, then shows prior soft-edge / ATE evidence (§5).
+- **Locked:** 2026-09-04 (holdout `13-42-53`; map = all three non-holdout; refined-only). **Bounce 2026-09-06:** pin = real portal detection + pack-embedded map portals (no synthetic/GT seed).
 
 ## 2. Alternatives
 
@@ -84,17 +92,79 @@ Living document — update in place when later work changes earlier conclusions.
 
 ## 4. System design
 
-_(pending — architecture choice below)_
+- **Decision:** **Design change needed** (bridge + wire pack portals into live portal alignment).
+- **Products / codebases:** Rover-SLAM `slam_server` + prior-pack scripts; consume reconstruction-server job artifact (read-only).
+- **Pack geometry (locked):** Build from **`refined/global`** COLMAP (`refined_sfm_combined`) for the three map scans + per-scan local `features.h5` for those images → recon layout → `convert_to_prior_pack`. Exclude holdout `13-42-53` images/tracks from the pack. (Already the 2026-09-04 refined-only choice; confirm exporter does **not** fall back to local-only SfM for poses/points.)
+- **Pack portals (locked 2026-09-06 bounce):** Embed **placed portals from global refinement** — source = `refined/global/refined_manifest.json` (`MQAUVO7PXZ1`, `HBORRXLUOD6` with metric `physicalSize` + domain poses). Write into recon `portals.json` → pack `portals.json`. Do **not** invent synthetic portals.
+- **Live pin path (locked):** On holdout replay, run **actual portal QR detection** in `slam_server` (existing detect + PnP path). Domain pin comes from detecting holdout frames’ real QRs against the **map’s placed portal catalog**.
+- **Ingestion wiring (gap today):** Pack loader already parses `portals[]`, but alignment only loads `--portal-manifest`. Change: when `--prior-pack` is loaded, **use pack portals as the portal catalog** for detection/alignment (same shape as manifest). Separate `--portal-manifest` remains optional override; for this holdout run, pack alone should suffice.
+- **Holdout replay:** `slam_server --prior-pack <real_pack>` (portal detect on); feed `13-42-53/Frames`. Expect ≥1 accepted portal observation → domain pin → prior soft edges can fire.
+- **ATE framing:** After portal pin, compare SLAM trajectory to holdout local COLMAP **in domain frame** (one global check — not per-map Umeyama as the success metric). Soft guide in §5.
+- **Risks / unknowns:** Holdout may see portals only in early/late windows; detect-every / replay FPS must not skip those frames. Soft edges need covisible prior matches after pin. Exporter bridge (COLMAP+h5→recon) still missing.
+- **Coordinate / image / QR conventions (hard — human callout 2026-09-06):** Treat frame bugs as first-class failure mode (meters-scale ATE / bad pin), not tuneables. **If unsure, copy math from reconstruction-server** (`utils/data_utils.py`, `refinement_util.py`) — do not invent transforms.
+  - **Cam-from-world vs cam-to-world (locked):**
+    - COLMAP / pycolmap: `image.cam_from_world` = **world→camera** (`T_cw`). Camera center = `cam_from_world.inverse().translation` (see recon-server viz / holdout eval).
+    - ARKit ingest in recon-server: OpenGL pose → `convert_pose_opengl_to_colmap` → treat as **cam_to_world** → `.inverse()` → store as `cam_from_world`.
+    - Prior pack schema + soft edges (`poseToTwc`): image `pose` is **camera-to-world Twc** (position = camera center in domain; rotation = R_wc). Exporter **must invert** COLMAP `cam_from_world`; writing `cam_from_world.translation` as pack position is wrong.
+  - **Portal catalog frame (from recon-server write path):** `refined_manifest` portals are written as **OpenGL** after `rectify_portal_pose` in COLMAP then `convert_pose_colmap_to_opengl` (`data_utils` manifest builder). `slam_server::loadPortalManifest` loads those JSON poses **as-is** + wall→QR-plane `−π/2` about Y (API text claiming OpenGL→COLMAP on load is **stale vs code**). Pack portals from `refined_manifest` must go through that **same** load path.
+  - **Pack domain consistency:** Image Twc + track XYZ + portal poses (after load) must share **one** domain. Pack exporter uses world remap `M`: `t'=M t`, `R'=M R`, `P'=M P` (left-multiply only — **not** recon-server componentwise quaternion conjugation). Portals from `refined_manifest`: position unchanged, `R_pack=R_conj@M`. Self-reproj gate on export.
+  - **physicalSize (locked):** Assume **same metric QR size in SLAM PnP as in the map** — copy `physicalSize` from `refined_manifest` / scan Manifest unchanged (~0.05 m). No rescaling / guessing.
+  - **Features vs pixels:** `features.h5` keypoints must align with the **exact** image pixels fed to LightGlue (no silent EXIF rotate/flip, no mismatched resize). If COLMAP names imply a rotated view vs on-disk `Frames` JPGs, fix in exporter or document the required decode path.
+  - **Holdout replay images:** Same uprightness/intrinsics as during map build for QR + VO; `--raw` replay must not introduce a different orientation than COLMAP registration.
+  - **QR corner order:** OpenCV `detectAndDecodeMulti` corners must stay matched to `portalObjectPoints` order `(-s,-s,0),(+s,-s,0),(+s,+s,0),(-s,+s,0)`. Wrong order → flipped/rotated PnP → bad Sim3. Prefer reproj gate + sanity check (scale ~1, portal plane normal) over silent accept.
+  - **ATE compare:** Domain-pinned trajectory vs holdout COLMAP — convert GT with the **same** OpenGL/COLMAP policy as pack/portals; don’t mix `cv_to_three` orientation-only flip into position ATE; don’t Umeyama-away a frame bug. Gross error → bounce conventions, don’t loosen §5 soft bar.
+- **Out of scope:** Synthetic/GT Sim3 seed; prior-PnP-without-QR bootstrap (deferred).
 
 ## 5. Verification design
 
-_(pending)_
+- **End-to-end acceptance (holdout `13-42-53` + real prior pack):**
+  1. Pack builds from **global refined** + `refined_manifest` portals; `validate_prior_pack` passes; `counts.portals ≥ 2` (MQAU…, HBOR…).
+  2. `slam_server --prior-pack <real_pack>` (no synthetic seed; portal detect on) loads pack; `/status` shows `prior_pack.loaded` and non-zero portal count used for alignment.
+  3. Replay holdout Frames → **`portal_observations ≥ 1`** and active map **domain-pinned** (`overlay` / alignment status).
+  4. After pin: **`overlay.prior_soft_edges_accepted > 0`** (real matches, not `ROVER_PRIOR_SOFT_EDGE_FIXTURE_SMOKE`).
+  5. **ATE (soft guide, 2026-09-06):** vs holdout local COLMAP in **domain frame** after pin — expect roughly **median ≤ 15 cm**, **RMSE ≤ 30 cm**. Not a hard CI fail yet; **way higher** (e.g. meters / large bias) → treat as **incorrect implementation** (often frame/corner/flip bug) and bounce, not “tune thresholds.”
+  6. **Convention smoke (required before trusting ATE):** pack notes state Twc vs cam_from_world; portal pin scale sensible (~O(1)); mean portal reproj within `portal_max_reproj_px`; `physicalSize` matches manifest; spot-check one QR shortId; image size == feature image size (no EXIF skew).
+- **Integration / regression:** Fixture pack still loads; `--portal-manifest` override still works if set; timing scripts unchanged unless they must pass portal args.
+- **Concrete observables:** `/api/v1/status` (`prior_pack`, `overlay.prior_soft_edges_accepted`, portal/alignment fields); trajectory + `scripts/eval_holdout_pose_accuracy.py` (domain-aligned mode); pack validate CLI.
+- **Out of scope for v1 verify:** prior-PnP-without-QR; dynamic-object robustness; hard ATE CI gate.
 
 ## 6. Work breakdown (AI-oriented)
 
-_(pending)_
+_Locked 2026-09-06 (mass-approved A–E):_
+
+| # | Slice | Boundary | Depends | Human check? |
+|---|--------|----------|---------|--------------|
+| A | **Wire pack portals → alignment catalog** | When `--prior-pack` loaded, feed pack `portals[]` into the **same** catalog path as `loadPortalManifest` (wall→QR Y fix, corner object model unchanged). `--portal-manifest` overrides if both set. Audit docs vs code on OpenGL↔COLMAP. No exporter yet. | — | no |
+| B | **COLMAP+h5 → recon exporter** | Script: global `refined_sfm_combined` + map-scan `features.h5` + `refined_manifest` portals → recon layout; **exclude** holdout. **Math:** COLMAP `cam_from_world` → pack **Twc** via `.inverse()`; `t'=M t`, `R'=M R`, `P'=M P`; portals `R_pack=R_conj@M`; self-reproj gate. | — | no |
+| C | **Build + validate real prior pack** | Run exporter → `convert_to_prior_pack` → validate; document one-liner / artifact path under `out/` or `~/build`. | B | spot-check portals/counts + image/feature size |
+| D | **Holdout replay w/ real pack + portal detect** | Runner: start server with real pack, replay Frames (same orientation as map), assert pin + `prior_soft_edges_accepted > 0`; log portal reproj / scale. | A, C | yes — eyeball status |
+| E | **Domain-frame ATE report** | Adapt pose eval for portal-pinned / domain trajectory; report median/RMSE vs soft guide; if meters-scale, dump frame-convention suspects before any threshold change. | D | yes — interpret ATE |
+
+- **Stop / escalate:** Pack has 0 portals; no QR detections on holdout; soft edges stay 0 after pin; ATE meters-scale → reopen §4 (wiring/frame/export), don’t threshold-fiddle.
+- **Agent vs human:** A–C agent; D–E agent run + human read of status/ATE.
+- **Convention constraints:** see §4 (Twc vs cam_from_world, OpenGL portals, physicalSize, QR corners, flips).
 
 ## 7. Implementation notes
+
+### Slice A — pack portals → alignment (e7ab1f44, 2026-09-06)
+
+- **Done:** Review approve; verify pass. Shared `ingestPortalCatalogEntries`; pack portals load when no `--portal-manifest`; manifest path overrides. Fixture: alignment.enabled + `prior_pack_portals_loaded_waiting_for_detection`. Script: `scripts/_verify_slice_a_portals.sh`.
+
+### Slice B — COLMAP+h5 → recon (b83774a7, 2026-09-06)
+
+- **Done:** `scripts/export_colmap_h5_to_recon.py`. Verify: 1655 images, 2 portals, holdout excluded; `out/recon_verify_slice_b/`.
+
+### Slice C — real prior pack (e8a690c2, 2026-09-06)
+
+- **Done:** `out/prior_pack_map_refined` (1655 images, 2 portals); `scripts/build_holdout_prior_pack.sh` (WSL).
+
+### Slice D — holdout + portal detect (8e2529dd, 2026-09-06) — BLOCKED on soft edges
+
+- **Runner:** `scripts/run_holdout_prior_pack_replay.sh`; pack prep `scripts/ensure_prior_pack_for_slam_server.py` (cnpy needs uncompressed npz).
+- **Portal pin: PASS** — HBORRXLUOD6 ×10; reproj ~3–8 px; scale ≈0.843 (`portal_camera_baseline`); overlay map 0 pinned.
+- **Soft edges: FAIL** — `prior_soft_edges_accepted=0`; early `no_gated_match`, later `no_domain_pose` after map resets. Supporting fixes landed: full-res QR detect, cnpy loader, LightGlue build flag, prior image size to matcher.
+- **Artifacts:** `~/build/holdout_prior_pack_evidence.json`, `out/holdout_prior_pack_replay/`.
+- **Escalate:** do not threshold-fiddle; need decision on soft-edge investigate vs defer.
 
 ### pose_pred sub-instrumentation (slice 087781d0, 2026-09-06)
 

@@ -96,7 +96,7 @@ python3 Examples/Monocular/send_frame.py "$HOLD" \
   --server "http://127.0.0.1:$PORT" \
   --fps 10 \
   --raw \
-  --intrinsics 1335.984 1335.984 716.9096 963.1064 \
+  --intrinsics 1335.984 1335.984 963.1064 716.9096 \
   2>&1 | tee "$HOME/build/holdout_replay.log"
 
 echo "=== post-replay /status ==="

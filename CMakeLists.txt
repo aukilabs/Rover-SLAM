@@ -279,12 +279,16 @@ add_executable(mono_tum_vi
         Examples/Monocular/mono_tum_vi.cc)
 target_link_libraries(mono_tum_vi ${PROJECT_NAME})
 
+find_package(ZLIB REQUIRED)
+
 add_executable(slam_server
         Examples/Monocular/slam_server.cc
         Examples/Monocular/prior_pack_loader.cc
         Examples/Monocular/overlay_pose_graph.cc
-        Examples/Monocular/prior_soft_edges.cc)
-target_link_libraries(slam_server ${PROJECT_NAME} ZXing::ZXing)
+        Examples/Monocular/prior_soft_edges.cc
+        Thirdparty/cnpy/cnpy.cpp)
+target_include_directories(slam_server PRIVATE Thirdparty/cnpy)
+target_link_libraries(slam_server ${PROJECT_NAME} ZXing::ZXing ZLIB::ZLIB)
 if(SLAM_SERVER_ZXING_SYSTEM_HEADERS)
   target_compile_definitions(slam_server PRIVATE SLAM_SERVER_ZXING_SYSTEM_HEADERS)
 endif()
@@ -299,6 +303,8 @@ else()
 endif()
 
 if(AUKI_LIGHTGLUE_AVAILABLE)
+  target_compile_definitions(slam_server PRIVATE AUKI_LIGHTGLUE_AVAILABLE)
+  target_include_directories(slam_server PRIVATE "${LIGHT_GLUE_CPP_DIR}/include")
   add_executable(smoke_aliked_lightglue Examples/Monocular/smoke_aliked_lightglue.cc)
   target_compile_definitions(smoke_aliked_lightglue PRIVATE AUKI_LIGHTGLUE_AVAILABLE)
   target_include_directories(smoke_aliked_lightglue PRIVATE "${LIGHT_GLUE_CPP_DIR}/include")

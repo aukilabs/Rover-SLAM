@@ -20,7 +20,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import requests
@@ -152,11 +152,39 @@ def load_frames_csv(path: Path) -> List[float]:
     return ts
 
 
-def load_gt_opengl(colmap_dir: Path) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
-    """image_index -> (camera center, quat xyzw) in OpenGL world."""
+def load_camera_intrinsics_csv(path: Path) -> List[List[float]]:
+    intrinsics = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.replace(",", " ").split()
+            if len(parts) < 5:
+                raise RuntimeError(
+                    f"expected timestamp,fx,fy,cx,cy,... in {path}: {line!r}"
+                )
+            intrinsics.append(
+                [float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])]
+            )
+    return intrinsics
+
+
+def load_gt_opengl(
+    colmap_dir: Path,
+    name_contains: Optional[str] = None,
+) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+    """image_index -> (camera center, quat xyzw) in OpenGL world.
+
+    If name_contains is set (e.g. holdout scan id), only images whose name
+    contains that substring are kept — required for global SfM where multiple
+    scans share trailing frame indices.
+    """
     rec = pycolmap.Reconstruction(str(colmap_dir))
     out: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
     for img in rec.images.values():
+        if name_contains is not None and name_contains not in img.name:
+            continue
         idx = parse_image_index(img.name)
         if idx is None:
             continue
@@ -236,23 +264,30 @@ def replay(
     server: str,
     frames_dir: Path,
     timestamps: List[float],
-    intrinsics: List[float],
+    intrinsics: Union[List[float], List[List[float]]],
     fps: float,
 ) -> None:
     images = list_images(frames_dir)
     if len(images) != len(timestamps):
         raise RuntimeError(f"Frames count {len(images)} != Frames.csv rows {len(timestamps)}")
+    per_frame = bool(intrinsics) and isinstance(intrinsics[0], (list, tuple))
+    if per_frame:
+        if len(intrinsics) != len(images):
+            raise RuntimeError(
+                f"Intrinsics count {len(intrinsics)} != Frames count {len(images)}"
+            )
     interval = 1.0 / fps if fps > 0 else 0.0
     url = server.rstrip("/") + "/api/v1/track"
     for idx, img_path in enumerate(images):
         t0 = time.time()
         data = img_path.read_bytes()
+        frame_intrinsics = intrinsics[idx] if per_frame else intrinsics
         headers = {
             "Content-Type": "image/jpeg" if img_path.suffix.lower() in (".jpg", ".jpeg") else "image/png",
             "X-Client-ID": "eval_holdout_pose",
             "X-Frame-Id": str(idx),
             "X-Capture-Timestamp": f"{timestamps[idx]:.9f}",
-            "X-Intrinsics": ",".join(str(x) for x in intrinsics),
+            "X-Intrinsics": ",".join(str(x) for x in frame_intrinsics),
         }
         r = requests.post(url, data=data, headers=headers, timeout=60)
         if r.status_code != 200:
@@ -591,6 +626,18 @@ def main() -> int:
         type=Path,
         default=Path.home() / "build" / "holdout_pose_eval",
     )
+    ap.add_argument(
+        "--gt-colmap",
+        type=Path,
+        default=None,
+        help="COLMAP model for GT (default: local refine for scan)",
+    )
+    ap.add_argument(
+        "--gt-name-contains",
+        type=str,
+        default=None,
+        help="Optional substring filter for image names (needed for global SfM)",
+    )
     args = ap.parse_args()
 
     root = Path("/mnt/d/agent-workspaces/Rover-SLAM")
@@ -601,18 +648,33 @@ def main() -> int:
     scan = "2026-04-02_13-42-53"
     frames_dir = job / "datasets" / scan / "Frames"
     frames_csv = job / "datasets" / scan / "Frames.csv"
-    colmap_dir = job / "refined" / "local" / scan / "sfm"
+    colmap_dir = args.gt_colmap or (job / "refined" / "local" / scan / "sfm")
     bin_path = root / "Examples" / "Monocular" / "slam_server"
     vocab = root / "Vocabulary" / "voc_binary_tartan_8u_6.yml.gz"
     settings = root / "Examples" / "Monocular" / "iphoneSLAM.yaml"
     prior = root / "testdata" / "prior_pack_fixture"
     server = f"http://127.0.0.1:{args.port}"
-    intrinsics = [1335.984, 1335.984, 716.9096, 963.1064]
+    # cx/cy in landscape order; the YAML historically had these two transposed.
+    fallback_intrinsics = [1335.984, 1335.984, 963.1064, 716.9096]
+    intrinsics_csv = job / "datasets" / scan / "CameraIntrinsics.csv"
+    if intrinsics_csv.is_file():
+        intrinsics = load_camera_intrinsics_csv(intrinsics_csv)
+        print(f"CameraIntrinsics.csv: {len(intrinsics)} per-frame rows")
+    else:
+        intrinsics = fallback_intrinsics
+        print(
+            f"WARNING: missing {intrinsics_csv}; using fallback intrinsics "
+            f"{fallback_intrinsics}",
+            file=sys.stderr,
+        )
 
     timestamps = load_frames_csv(frames_csv)
     print(f"GT Frames.csv timestamps: {len(timestamps)}")
-    gt = load_gt_opengl(colmap_dir)
-    print(f"GT COLMAP OpenGL poses (pos+quat): {len(gt)}")
+    gt = load_gt_opengl(colmap_dir, name_contains=args.gt_name_contains)
+    print(
+        f"GT COLMAP OpenGL poses (pos+quat): {len(gt)} "
+        f"source={colmap_dir} filter={args.gt_name_contains!r}"
+    )
 
     traj_path = args.trajectory_json or (args.out_dir / "trajectory_all_maps.json")
     if not args.skip_replay:

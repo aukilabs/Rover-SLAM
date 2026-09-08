@@ -1605,7 +1605,59 @@ void System::GetMapDenseTrajectory(unsigned long map_id, std::vector<TrajectoryS
         sample.timestamp = *lT;
         sample.Twc = Twc;
         sample.is_keyframe = false;
+        sample.ref_keyframe_id = pKF->mnId;
+        sample.Tcr = *lit;
         out.push_back(sample);
+    }
+}
+
+void System::GetMapKeyFrameGraph(unsigned long map_id, std::vector<KeyFrameGraphSample> &out)
+{
+    out.clear();
+    if (!mpAtlas)
+        return;
+
+    Map *pMap = nullptr;
+    for (Map *candidate : mpAtlas->GetAllMaps())
+    {
+        if (candidate && !candidate->IsBad() && candidate->GetId() == map_id)
+        {
+            pMap = candidate;
+            break;
+        }
+    }
+    if (!pMap)
+        return;
+
+    unique_lock<mutex> lock(mMutexState);
+
+    const int min_feat = 100;
+    vector<KeyFrame *> vpKFs = pMap->GetAllKeyFrames();
+    sort(vpKFs.begin(), vpKFs.end(), KeyFrame::lId);
+
+    for (KeyFrame *pKF : vpKFs)
+    {
+        if (!pKF || pKF->isBad())
+            continue;
+        Map *pKFMap = pKF->GetMap();
+        if (!pKFMap || pKFMap != pMap)
+            continue;
+
+        KeyFrameGraphSample node;
+        node.id = pKF->mnId;
+        node.timestamp = pKF->mTimeStamp;
+        node.Tcw = pKF->GetPose();
+        KeyFrame *pParent = pKF->GetParent();
+        node.parent_id = pParent ? pParent->mnId : 0;
+
+        const vector<KeyFrame *> vpCovis = pKF->GetCovisiblesByWeight(min_feat);
+        for (KeyFrame *pCov : vpCovis)
+        {
+            if (!pCov || pCov->isBad())
+                continue;
+            node.covisibles.emplace_back(pCov->mnId, pKF->GetWeight(pCov));
+        }
+        out.push_back(std::move(node));
     }
 }
 
@@ -1620,6 +1672,27 @@ void System::GetActiveMapDenseTrajectory(std::vector<TrajectorySample> &out)
         return;
 
     GetMapDenseTrajectory(pMap->GetId(), out);
+}
+
+bool System::GetCurrentFrameOverlayAnchor(unsigned long &frame_mn_id,
+                                          unsigned long &ref_keyframe_id,
+                                          Sophus::SE3f &Tcr)
+{
+    frame_mn_id = 0;
+    ref_keyframe_id = 0;
+    Tcr = Sophus::SE3f();
+    if (!mpTracker)
+        return false;
+
+    unique_lock<mutex> lock(mMutexState);
+    KeyFrame *pRef = mpTracker->mCurrentFrame.mpReferenceKF;
+    if (!pRef)
+        return false;
+
+    frame_mn_id = mpTracker->mCurrentFrame.mnId;
+    ref_keyframe_id = pRef->mnId;
+    Tcr = mpTracker->mCurrentFrame.GetPose() * pRef->GetPoseInverse();
+    return true;
 }
 
 void System::SetViewerAlignment(const Eigen::Matrix3f& R_domain_slam, const Eigen::Vector3f& t_domain_slam, float scale)

@@ -5,6 +5,8 @@
 #include <sstream>
 #include <unordered_set>
 
+#include "cnpy.h"
+
 #ifdef _WIN32
 #include <direct.h>
 #include <sys/stat.h>
@@ -140,6 +142,56 @@ ImageFeatures load_features_json(const std::string& path, int desc_dim) {
     return out;
 }
 
+ImageFeatures load_features_npz(const std::string& path, int desc_dim) {
+    cnpy::npz_t npz;
+    try {
+        npz = cnpy::npz_load(path);
+    } catch (const std::exception& e) {
+        throw PriorPackError(std::string("cannot load npz features: ") + path + ": " + e.what());
+    }
+
+    const auto it_k = npz.find("keypoints");
+    const auto it_d = npz.find("descriptors");
+    if (it_k == npz.end() || it_d == npz.end())
+        throw PriorPackError("features npz missing keypoints or descriptors: " + path);
+
+    const cnpy::NpyArray& karr = it_k->second;
+    const cnpy::NpyArray& darr = it_d->second;
+    if (karr.word_size != sizeof(float) || darr.word_size != sizeof(float))
+        throw PriorPackError("features npz must use float32 arrays: " + path);
+    if (karr.shape.size() != 2 || karr.shape[1] != 2)
+        throw PriorPackError("features npz keypoints must be shape N×2: " + path);
+    if (darr.shape.size() != 2 || static_cast<int>(darr.shape[1]) != desc_dim)
+        throw PriorPackError("features npz descriptors must be shape N×" + std::to_string(desc_dim) +
+                             ": " + path);
+    if (karr.shape[0] != darr.shape[0])
+        throw PriorPackError("features npz keypoints/descriptors row count mismatch: " + path);
+
+    const size_t n = karr.shape[0];
+    const float* kpts = karr.data<float>();
+    const float* desc = darr.data<float>();
+
+    ImageFeatures out;
+    out.keypoints.reserve(n);
+    out.descriptors.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        out.keypoints.emplace_back(kpts[i * 2], kpts[i * 2 + 1]);
+        const float* row = desc + i * static_cast<size_t>(desc_dim);
+        out.descriptors.emplace_back(row, row + desc_dim);
+    }
+
+    const auto it_s = npz.find("scores");
+    if (it_s != npz.end()) {
+        const cnpy::NpyArray& sarr = it_s->second;
+        if (sarr.word_size == sizeof(float) && sarr.shape.size() == 1 &&
+            sarr.shape[0] == n) {
+            const float* scores = sarr.data<float>();
+            out.scores.assign(scores, scores + n);
+        }
+    }
+    return out;
+}
+
 ImageFeatures load_features_for_image(
     const std::string& features_dir, int image_id, int desc_dim) {
     const std::string json_path = join_path(features_dir, std::to_string(image_id) + ".json");
@@ -148,9 +200,7 @@ ImageFeatures load_features_for_image(
 
     const std::string npz_path = join_path(features_dir, std::to_string(image_id) + ".npz");
     if (file_exists(npz_path))
-        throw PriorPackError(
-            "npz features are not supported by slam_server loader yet (image " +
-            std::to_string(image_id) + "); use .json features for fixtures");
+        return load_features_npz(npz_path, desc_dim);
 
     throw PriorPackError(
         "missing features for image id " + std::to_string(image_id) + ": expected " +

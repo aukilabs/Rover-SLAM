@@ -87,7 +87,7 @@ exts = {".jpg", ".jpeg", ".png", ".bmp"}
 images = sorted(p for p in hold.iterdir() if p.is_file() and p.suffix.lower() in exts)
 fps = 10.0
 interval = 1.0 / fps
-intr = "1335.984,1335.984,716.9096,963.1064"
+intr = "1335.984,1335.984,963.1064,716.9096"
 counts = {}
 t0 = time.time()
 for i, p in enumerate(images):

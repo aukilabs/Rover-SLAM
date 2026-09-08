@@ -86,8 +86,19 @@ constexpr float kMinScale = 0.01f;
 constexpr float kMaxScale = 100.0f;
 constexpr int kMinLocalScalePoints = 2;
 constexpr float kPortalRegionExpand = 0.35f;
-constexpr float kMinSlamPairDistance = 1e-4f;
+// Min SLAM separation for a camera-baseline ratio. Tiny slam motion with noisy
+// PnP domain motion produces absurd ratios (e.g. slam_dist=0.01 → ratio≈8).
+constexpr float kMinSlamBaselinePairDistance = 0.05f;
+// Local map-point scale pairs can be denser near the QR.
+constexpr float kMinSlamLocalPointPairDistance = 1e-4f;
 constexpr float kMinScaleBaselineDistanceM = 0.10f;
+// Scale-update gate: require SLAM motion since last accepted scale. Do NOT
+// require domain motion — at correct scale, domain moves ~s×slam; requiring
+// 10 cm domain blocked updates while slam moved ~30 cm (held_stationary).
+constexpr float kMinScaleUpdateSlamDistance = 0.05f;
+// Collapse portal obs that share nearly the same slam pose (e.g. first N
+// frames stuck at origin) so pairwise ratios are not N× the same baseline.
+constexpr float kSlamPoseClusterEps = 0.02f;
 constexpr size_t kMaxPortalAlignmentObservations = 64;
 constexpr size_t kMaxPortalCornerObservations = 5000;
 constexpr size_t kMaxCustomDetectionObservations = 10000;
@@ -492,6 +503,22 @@ cv::Size loadConfiguredInputSize(const string& settings_path)
     if (width <= 0 || height <= 0)
         return {};
     return cv::Size(width, height);
+}
+
+/** ALIKED keypoints/descriptors live in Settings newImSize when Camera.newWidth/Height set. */
+cv::Size loadFeatureImageSize(const string& settings_path)
+{
+    cv::FileStorage fs(settings_path, cv::FileStorage::READ);
+    if (!fs.isOpened())
+        return {};
+
+    int new_width = 0;
+    int new_height = 0;
+    fs["Camera.newWidth"] >> new_width;
+    fs["Camera.newHeight"] >> new_height;
+    if (new_width > 0 && new_height > 0)
+        return cv::Size(new_width, new_height);
+    return loadConfiguredInputSize(settings_path);
 }
 
 string loadPriorPackPathFromSettings(const string& settings_path)
@@ -1110,7 +1137,7 @@ bool hasMeaningfulScaleBaseline(const Eigen::Vector3f& slam_a,
 
     const float slam_dist = (slam_a - slam_b).norm();
     const float domain_dist = (domain_a - domain_b).norm();
-    return slam_dist > kMinSlamPairDistance &&
+    return slam_dist > kMinSlamBaselinePairDistance &&
            domain_dist > kMinScaleBaselineDistanceM;
 }
 
@@ -1125,6 +1152,36 @@ bool scaleBaselineRatio(const PortalObservation& a,
     const float domain_dist = (a.p_domain - b.p_domain).norm();
     ratio = domain_dist / slam_dist;
     return isValidScale(ratio);
+}
+
+/** One observation per slam-pose cluster (best reprojection). */
+vector<PortalObservation> dedupePortalObservationsBySlamPose(
+    const vector<PortalObservation>& observations)
+{
+    vector<PortalObservation> unique;
+    unique.reserve(observations.size());
+    for (const auto& obs : observations) {
+        if (!obs.p_slam.allFinite() || !obs.p_domain.allFinite())
+            continue;
+        size_t match = unique.size();
+        for (size_t i = 0; i < unique.size(); ++i) {
+            if ((unique[i].p_slam - obs.p_slam).norm() <= kSlamPoseClusterEps) {
+                match = i;
+                break;
+            }
+        }
+        if (match == unique.size()) {
+            unique.push_back(obs);
+            continue;
+        }
+        // Prefer lower reprojection error within a slam cluster.
+        if (std::isfinite(obs.reproj_px) &&
+            (!std::isfinite(unique[match].reproj_px) ||
+             obs.reproj_px < unique[match].reproj_px)) {
+            unique[match] = obs;
+        }
+    }
+    return unique;
 }
 
 float portalObservationWeight(const PortalObservation& obs)
@@ -1615,6 +1672,7 @@ private:
     atomic<bool> shutdown_done_{false};
     vector<float> default_intrinsics_;
     cv::Size slam_input_size_;
+    cv::Size feature_image_size_;
     unordered_map<string, PortalDefinition> portals_;
     mutable mutex alignment_mutex_;
     mutex debug_output_mutex_;
@@ -1635,6 +1693,9 @@ public:
     SLAMServer(const ServerConfig& config) : config_(config), index_html_body_(config.index_html_body) {
         default_intrinsics_ = loadDefaultIntrinsics(config_.settings_path);
         slam_input_size_ = loadConfiguredInputSize(config_.settings_path);
+        feature_image_size_ = loadFeatureImageSize(config_.settings_path);
+        if (!isValidImageSize(feature_image_size_))
+            feature_image_size_ = slam_input_size_;
         if (default_intrinsics_.empty()) {
             cerr << "Warning: could not load default Camera1.fx/fy/cx/cy from settings; "
                  << "portal PnP requires per-frame intrinsics." << endl;
@@ -1720,12 +1781,21 @@ public:
             cout << "SLAM input resolution: " << slam_input_size_.width
                  << " x " << slam_input_size_.height << endl;
         }
+        if (isValidImageSize(feature_image_size_) &&
+            !sameImageSize(feature_image_size_, slam_input_size_)) {
+            cout << "Feature extraction resolution: " << feature_image_size_.width
+                 << " x " << feature_image_size_.height << endl;
+        }
         if (!config_.debug_output_dir.empty())
             cout << "Debug trajectory output: "
                  << joinPath(config_.debug_output_dir, "trajectory_latest.json") << endl;
-        if (!config_.portal_manifest_path.empty())
+        if (!config_.portal_manifest_path.empty()) {
             cout << "Portal manifest: " << config_.portal_manifest_path
                  << " (" << portals_.size() << " usable portal(s))" << endl;
+        } else if (!portals_.empty()) {
+            cout << "Portal catalog: prior pack (" << portals_.size()
+                 << " usable portal(s) for alignment)" << endl;
+        }
         if (prior_pack_.loaded)
             cout << "Prior pack: " << prior_pack_.pack_root
                  << " (" << prior_pack_.image_count() << " images, "
@@ -1791,27 +1861,13 @@ public:
     }
 
 private:
-    void loadPortalManifest(const string& manifest_path) {
-        ifstream f(manifest_path);
-        if (!f.good()) {
-            cerr << "Warning: portal manifest not found: " << manifest_path << endl;
-            return;
-        }
-
-        json data;
-        try {
-            f >> data;
-        } catch (const exception& e) {
-            cerr << "Warning: failed to parse portal manifest '" << manifest_path << "': "
-                 << e.what() << endl;
-            return;
-        }
-
+    /** Shared portal catalog ingest: JSON entries (manifest or pack shape) → portals_. */
+    size_t ingestPortalCatalogEntries(const json& entries) {
         const Eigen::Quaternionf q_manifest_wall_to_qr_plane(
             Eigen::AngleAxisf(-1.57079632679489661923f, Eigen::Vector3f::UnitY()));
 
         size_t skipped = 0;
-        for (const auto& entry : data.value("portals", json::array())) {
+        for (const auto& entry : entries) {
             try {
                 if (!entry.contains("shortId") || !entry.contains("pose") ||
                     !entry.contains("physicalSize") || entry["physicalSize"].is_null()) {
@@ -1839,7 +1895,7 @@ private:
                     rot["x"].get<float>(),
                     rot["y"].get<float>(),
                     rot["z"].get<float>());
-                // Manifest identity is wall-mounted; QR/PnP points use z=0 as the portal plane.
+                // Wall-mounted pose; QR/PnP object points use z=0 as the portal plane (−π/2 about Y).
                 q_domain_portal = q_domain_portal * q_manifest_wall_to_qr_plane;
                 q_domain_portal.normalize();
 
@@ -1851,19 +1907,74 @@ private:
                 portals_[portal.short_id] = portal;
             } catch (const exception& e) {
                 skipped++;
-                cerr << "Warning: skipping invalid portal manifest entry: " << e.what() << endl;
+                cerr << "Warning: skipping invalid portal catalog entry: " << e.what() << endl;
             }
         }
+        return skipped;
+    }
 
-        {
-            lock_guard<mutex> lock(alignment_mutex_);
-            alignment_.enabled = !portals_.empty();
-            alignment_.status = portals_.empty()
-                ? "portal_manifest_empty"
-                : "portal_manifest_loaded_waiting_for_detection";
+    void setAlignmentPortalCatalogLoaded(const string& empty_status, const string& loaded_status) {
+        lock_guard<mutex> lock(alignment_mutex_);
+        alignment_.enabled = !portals_.empty();
+        alignment_.status = portals_.empty() ? empty_status : loaded_status;
+    }
+
+    void loadPortalManifest(const string& manifest_path) {
+        ifstream f(manifest_path);
+        if (!f.good()) {
+            cerr << "Warning: portal manifest not found: " << manifest_path << endl;
+            return;
         }
 
+        json data;
+        try {
+            f >> data;
+        } catch (const exception& e) {
+            cerr << "Warning: failed to parse portal manifest '" << manifest_path << "': "
+                 << e.what() << endl;
+            return;
+        }
+
+        const size_t skipped =
+            ingestPortalCatalogEntries(data.value("portals", json::array()));
+        setAlignmentPortalCatalogLoaded(
+            "portal_manifest_empty", "portal_manifest_loaded_waiting_for_detection");
+
         cout << "Loaded " << portals_.size() << " portal(s) from " << manifest_path;
+        if (skipped > 0)
+            cout << " (" << skipped << " skipped)";
+        cout << endl;
+    }
+
+    /** When --portal-manifest is unset, prior pack portals[] feed the alignment catalog. */
+    void loadPortalsFromPriorPackIfNoManifest() {
+        if (!config_.portal_manifest_path.empty())
+            return;
+        if (prior_pack_.portals.empty())
+            return;
+
+        json entries = json::array();
+        for (const auto& rec : prior_pack_.portals) {
+            entries.push_back(
+                {{"shortId", rec.short_id},
+                 {"physicalSize", rec.physical_size},
+                 {"pose",
+                  {{"position",
+                    {{"x", rec.pose.position.x},
+                     {"y", rec.pose.position.y},
+                     {"z", rec.pose.position.z}}},
+                   {"rotation",
+                    {{"w", rec.pose.rotation.w},
+                     {"x", rec.pose.rotation.x},
+                     {"y", rec.pose.rotation.y},
+                     {"z", rec.pose.rotation.z}}}}}});
+        }
+
+        const size_t skipped = ingestPortalCatalogEntries(entries);
+        setAlignmentPortalCatalogLoaded(
+            "prior_pack_portals_empty", "prior_pack_portals_loaded_waiting_for_detection");
+
+        cout << "Loaded " << portals_.size() << " portal(s) from prior pack for alignment";
         if (skipped > 0)
             cout << " (" << skipped << " skipped)";
         cout << endl;
@@ -1881,6 +1992,7 @@ private:
              << prior_pack_.portal_count() << " portal(s), "
              << prior_pack_.covis_edge_count() << " covis edge(s), "
              << prior_pack_.total_keypoints() << " keypoint(s)" << endl;
+        loadPortalsFromPriorPackIfNoManifest();
     }
 
     static bool priorSoftEdgeFixtureSmokeEnabled() {
@@ -1938,7 +2050,8 @@ private:
 
         const prior_soft::PriorMatchResult result = prior_soft_matcher_->tryMatch(input);
         if (result.accepted) {
-            overlay_graph_.addPriorSoftEdgeFactor(0, result.factor);
+            overlay::AtlasSnapshot atlas;
+            overlay_graph_.addPriorSoftEdgeFactor(0, result.factor, atlas);
             last_prior_seed_image_id_ = result.matched_prior_image_id;
             cout << "[prior] fixture smoke accepted image=" << result.matched_prior_image_id
                  << " inliers=" << result.factor.inlier_count
@@ -1966,6 +2079,9 @@ private:
                                      int image_height) {
         if (!prior_soft_matcher_ || live_desc.empty() || live_kpts.empty())
             return;
+        if (!overlay_graph_.isMapPinned(map_id)) {
+            return;
+        }
 
         prior_soft::PriorMatchInput input;
         input.pack = &prior_pack_;
@@ -1980,33 +2096,66 @@ private:
         input.seed_prior_image_id = last_prior_seed_image_id_;
 
         const Sophus::SE3f Twc_slam = input.Twc_slam;
-        if (overlay_graph_.isMapPinned(map_id)) {
-            input.has_domain_pose = true;
-            input.Twc_domain = overlay_graph_.applyPinToTwc(map_id, Twc_slam);
-        } else {
-            const AlignmentSnapshot alignment = getAlignmentSnapshot(true);
-            if (alignment.has_transform) {
-                input.has_domain_pose = true;
-                const Eigen::Matrix3f R =
-                    alignment.R_domain_slam * Twc_slam.so3().matrix();
-                const Eigen::Vector3f t =
-                    alignment.scale * (alignment.R_domain_slam * Twc_slam.translation()) +
-                    alignment.t_domain_slam;
-                input.Twc_domain = Sophus::SE3f(R, t);
-            }
+        input.has_domain_pose = true;
+        input.Twc_domain = overlay_graph_.applyPinToTwc(map_id, Twc_slam);
+        if (input.seed_prior_image_id < 0 && prior_pack_.loaded) {
+            input.seed_prior_image_id =
+                prior_soft::PriorSoftEdgeMatcher::nearestPriorImageId(prior_pack_, input.Twc_domain);
         }
 
         const prior_soft::PriorMatchResult result = prior_soft_matcher_->tryMatch(input);
         if (result.accepted) {
-            overlay_graph_.addPriorSoftEdgeFactor(map_id, result.factor);
+            overlay::PriorSoftEdgeFactor factor = result.factor;
+            overlay::AtlasSnapshot atlas;
+            {
+                lock_guard<mutex> slam_lock(slam_mutex_);
+                if (slam_system_) {
+                    unsigned long orb_id = 0;
+                    unsigned long ref_kf = 0;
+                    Sophus::SE3f Tcr;
+                    if (slam_system_->GetCurrentFrameOverlayAnchor(orb_id, ref_kf, Tcr)) {
+                        factor.vertex_keyframe_id = ref_kf;
+                        factor.Tcr = Tcr;
+                        (void)orb_id;
+                    }
+                }
+                atlas = buildAtlasSnapshot(map_id);
+            }
+            const overlay::RefineResult refine =
+                overlay_graph_.addPriorSoftEdgeFactor(map_id, factor, atlas);
+            if (refine.published) {
+                applyOverlayRefineToAlignment(map_id, refine);
+            }
             last_prior_seed_image_id_ = result.matched_prior_image_id;
             cout << "[prior] soft edge accepted image=" << result.matched_prior_image_id
                  << " inliers=" << result.factor.inlier_count
+                 << " obs=" << result.factor.observations.size()
                  << " reproj_px=" << result.factor.mean_reproj_px
+                 << " err_live_p50=" << result.debug_err_live_p50
+                 << " err_prior_p50=" << result.debug_err_prior_p50
+                 << " pass_live=" << result.debug_pass_live
+                 << " pass_prior=" << result.debug_pass_prior
                  << " total_accepted=" << overlay_graph_.priorSoftEdgesAccepted() << endl;
         } else if (result.attempted && !result.skip_reason.empty()) {
+            if (result.skip_reason == "slam_disagreement") {
+                overlay_graph_.recordPriorSoftEdgeReject(result.skip_reason);
+            }
             cout << "[prior] soft edge skip frame " << frame_id << ": " << result.skip_reason
-                 << endl;
+                 << " rejected_total=" << overlay_graph_.priorSoftEdgesRejected();
+            if (result.skip_reason == "no_gated_match") {
+                cout << " lg_matches=" << result.debug_lg_matches
+                     << " best_inliers=" << result.debug_best_inliers
+                     << " with_track=" << result.debug_with_track
+                     << " err_live_p50=" << result.debug_err_live_p50
+                     << " err_prior_p50=" << result.debug_err_prior_p50
+                     << " pass_live=" << result.debug_pass_live
+                     << " pass_prior=" << result.debug_pass_prior
+                     << " pass_both=" << result.debug_pass_both
+                     << " twc_seed_dist_m=" << result.debug_twc_seed_dist_m
+                     << " seed_img=" << result.debug_seed_prior_image_id
+                     << " mean_abs_z_live=" << result.debug_mean_abs_z_live;
+            }
+            cout << endl;
         }
     }
 
@@ -3337,7 +3486,7 @@ private:
             for (size_t j = i + 1; j < slam_cam_points.size(); ++j) {
                 const float slam_dist = (slam_cam_points[i] - slam_cam_points[j]).norm();
                 const float metric_dist = (metric_cam_points[i] - metric_cam_points[j]).norm();
-                if (slam_dist > kMinSlamPairDistance && metric_dist > 1e-4f)
+                if (slam_dist > kMinSlamLocalPointPairDistance && metric_dist > 1e-4f)
                     ratios.push_back(metric_dist / slam_dist);
             }
         }
@@ -3345,7 +3494,7 @@ private:
         if (ratios.empty() && slam_cam_points.size() == 1) {
             const float slam_dist = slam_cam_points.front().norm();
             const float metric_dist = metric_cam_points.front().norm();
-            if (slam_dist > kMinSlamPairDistance && metric_dist > 1e-4f)
+            if (slam_dist > kMinSlamLocalPointPairDistance && metric_dist > 1e-4f)
                 ratios.push_back(metric_dist / slam_dist);
         }
 
@@ -3370,17 +3519,39 @@ private:
         if (last_synced_map_id_ == current_map_id)
             return;
 
+        const unsigned long previous_map_id = last_synced_map_id_;
         last_synced_map_id_ = current_map_id;
 
-        portal_observations_.clear();
-        const auto obs_it = map_portal_observations_.find(current_map_id);
-        if (obs_it != map_portal_observations_.end())
-            portal_observations_ = obs_it->second;
+        if (previous_map_id != numeric_limits<unsigned long>::max() &&
+            !overlay_graph_.isMapPinned(current_map_id)) {
+            overlay_graph_.clearMapAlignment(current_map_id);
+            map_alignments_.erase(current_map_id);
+        }
 
         const auto align_it = map_alignments_.find(current_map_id);
         if (align_it != map_alignments_.end() && align_it->second.has_transform) {
             alignment_ = align_it->second;
             alignment_.enabled = !portals_.empty();
+            const overlay::MapSim3Pin overlay_pin = overlay_graph_.mapPin(current_map_id);
+            if (overlay_pin.pinned) {
+                alignment_.portal_observations = overlay_pin.portal_corner_factor_count / 4;
+            }
+            return;
+        }
+
+        const overlay::MapSim3Pin overlay_pin = overlay_graph_.mapPin(current_map_id);
+        if (overlay_pin.pinned && overlay_pin.seeded) {
+            alignment_.enabled = !portals_.empty();
+            alignment_.has_transform = true;
+            alignment_.R_domain_slam = overlay_pin.R_domain_slam;
+            alignment_.t_domain_slam = overlay_pin.t_domain_slam;
+            alignment_.scale = overlay_pin.scale;
+            alignment_.scale_source = overlay_pin.scale_source;
+            alignment_.last_portal_short_id = overlay_pin.last_portal_short_id;
+            alignment_.last_reproj_px = overlay_pin.last_reproj_px;
+            alignment_.portal_observations = overlay_pin.portal_corner_factor_count / 4;
+            alignment_.status = "aligned_refining";
+            map_alignments_[current_map_id] = alignment_;
             return;
         }
 
@@ -3388,7 +3559,7 @@ private:
         alignment_.has_transform = false;
         alignment_.R_domain_slam = Eigen::Matrix3f::Identity();
         alignment_.t_domain_slam = Eigen::Vector3f::Zero();
-        alignment_.scale = 1.0f;
+        alignment_.scale = 0.0f;
         alignment_.has_scale_update_observation = false;
         alignment_.last_scale_update_p_slam = Eigen::Vector3f::Zero();
         alignment_.last_scale_update_p_domain = Eigen::Vector3f::Zero();
@@ -3396,7 +3567,7 @@ private:
         alignment_.last_portal_short_id.clear();
         alignment_.last_reproj_px = 0.0f;
         alignment_.last_local_points_used = 0;
-        alignment_.portal_observations = portal_observations_.size();
+        alignment_.portal_observations = 0;
         alignment_.status = portals_.empty()
             ? "disabled"
             : "portal_manifest_loaded_waiting_for_detection";
@@ -3416,38 +3587,52 @@ private:
         return snapshot;
     }
 
-    void syncOverlayFromPortalAlignment(unsigned long map_id,
-                                        const PortalObservation& obs,
-                                        const AlignmentSnapshot& alignment) {
-        overlay::PortalHardFactor factor;
-        factor.frame_id = obs.frame_id;
-        factor.timestamp = obs.timestamp;
-        factor.short_id = obs.short_id;
-        factor.p_slam = obs.p_slam;
-        factor.p_domain = obs.p_domain;
-        factor.R_domain_slam = obs.R_domain_slam;
-        factor.reproj_px = obs.reproj_px;
-        factor.weight = portalObservationWeight(obs);
-        overlay_graph_.addPortalHardFactor(map_id, factor);
-
-        if (!alignment.has_transform)
+    void clearDomainAlignmentForMap(unsigned long map_id) {
+        overlay_graph_.clearMapAlignment(map_id);
+        lock_guard<mutex> lock(alignment_mutex_);
+        map_alignments_.erase(map_id);
+        if (last_synced_map_id_ != map_id)
             return;
 
-        overlay::MapSim3Pin pin;
-        pin.pinned = true;
-        pin.R_domain_slam = alignment.R_domain_slam;
-        pin.t_domain_slam = alignment.t_domain_slam;
-        pin.scale = alignment.scale;
-        pin.scale_source = alignment.scale_source;
-        pin.last_portal_short_id = alignment.last_portal_short_id;
-        pin.last_reproj_px = alignment.last_reproj_px;
-        pin.portal_factor_count = alignment.portal_observations;
-        overlay_graph_.setMapPin(map_id, pin);
+        alignment_.enabled = !portals_.empty();
+        alignment_.has_transform = false;
+        alignment_.R_domain_slam = Eigen::Matrix3f::Identity();
+        alignment_.t_domain_slam = Eigen::Vector3f::Zero();
+        alignment_.scale = 0.0f;
+        alignment_.has_scale_update_observation = false;
+        alignment_.last_scale_update_p_slam = Eigen::Vector3f::Zero();
+        alignment_.last_scale_update_p_domain = Eigen::Vector3f::Zero();
+        alignment_.scale_source = "none";
+        alignment_.last_portal_short_id.clear();
+        alignment_.last_reproj_px = 0.0f;
+        alignment_.last_local_points_used = 0;
+        alignment_.portal_observations = 0;
+        alignment_.status = portals_.empty()
+            ? "disabled"
+            : "tracking_lost_domain_cleared";
+    }
 
-        cout << "[overlay] map " << map_id << " pinned via portal " << obs.short_id
-             << " scale=" << pin.scale << " scale_source=" << pin.scale_source
-             << " portal_factors=" << pin.portal_factor_count
-             << " reproj_px=" << obs.reproj_px << endl;
+    void applyOverlayRefineToAlignment(unsigned long map_id,
+                                       const overlay::RefineResult& refine) {
+        if (!refine.published)
+            return;
+
+        lock_guard<mutex> lock(alignment_mutex_);
+        alignment_.enabled = !portals_.empty();
+        alignment_.has_transform = true;
+        alignment_.R_domain_slam = refine.pin.R_domain_slam;
+        alignment_.t_domain_slam = refine.pin.t_domain_slam;
+        alignment_.scale = refine.pin.scale;
+        alignment_.scale_source = refine.pin.scale_source;
+        alignment_.status = refine.status;
+        alignment_.has_scale_update_observation = true;
+        alignment_.portal_observations = refine.pin.portal_corner_factor_count / 4;
+        map_alignments_[map_id] = alignment_;
+
+        if (slam_system_) {
+            slam_system_->SetViewerAlignment(
+                refine.pin.R_domain_slam, refine.pin.t_domain_slam, refine.pin.scale);
+        }
     }
 
     MultiMapPublishPlan buildMultiMapPublishPlan(unsigned long active_map_id) const {
@@ -3481,173 +3666,166 @@ private:
         return plan;
     }
 
+    overlay::AtlasSnapshot buildAtlasSnapshot(unsigned long map_id) {
+        overlay::AtlasSnapshot snap;
+        if (!slam_system_)
+            return snap;
+
+        std::vector<ORB_SLAM3::System::KeyFrameGraphSample> kf_graph;
+        slam_system_->GetMapKeyFrameGraph(map_id, kf_graph);
+        snap.keyframes.reserve(kf_graph.size());
+        for (const auto& kf : kf_graph) {
+            overlay::KeyFrameGraphSample node;
+            node.id = kf.id;
+            node.timestamp = kf.timestamp;
+            node.Tcw = kf.Tcw;
+            node.parent_id = kf.parent_id;
+            node.covisibles = kf.covisibles;
+            snap.keyframes.push_back(std::move(node));
+        }
+
+        std::vector<ORB_SLAM3::System::TrajectorySample> dense;
+        slam_system_->GetMapDenseTrajectory(map_id, dense);
+        snap.frame_refs.reserve(dense.size());
+        for (const auto& sample : dense) {
+            overlay::FrameRefSample ref;
+            ref.frame_id = sample.id;
+            ref.ref_keyframe_id = sample.ref_keyframe_id;
+            ref.Tcr = sample.Tcr;
+            ref.is_keyframe = sample.is_keyframe;
+            snap.frame_refs.push_back(ref);
+        }
+        return snap;
+    }
+
     void updatePortalAlignment(const PortalPnPResult& pnp,
                                const Sophus::SE3f& Tcw_slam,
                                const LocalScaleEstimate& local_scale,
                                uint64_t frame_id,
                                double timestamp,
-                               unsigned long map_id) {
+                               unsigned long map_id,
+                               const vector<float>& intrinsics) {
         syncActiveMapAlignmentState(map_id);
 
+        auto portal_it = portals_.find(pnp.short_id);
+        if (portal_it == portals_.end() || intrinsics.size() < 4)
+            return;
+
+        const PortalDefinition& portal = portal_it->second;
         const Sophus::SE3f Twc_slam = Tcw_slam.inverse();
         const Sophus::SE3f Twc_domain = pnp.T_cam_domain.inverse();
+        const Eigen::Matrix3f R_domain_slam =
+            Twc_domain.so3().matrix() * Twc_slam.so3().matrix().transpose();
 
-        PortalObservation obs;
-        obs.frame_id = frame_id;
-        obs.timestamp = timestamp;
-        obs.short_id = pnp.short_id;
-        obs.p_slam = Twc_slam.translation();
-        obs.p_domain = Twc_domain.translation();
-        obs.R_domain_slam = Twc_domain.so3().matrix() * Twc_slam.so3().matrix().transpose();
-        obs.reproj_px = pnp.mean_reproj_px;
-        obs.has_scale_prior = local_scale.valid;
-        obs.scale_prior = local_scale.scale;
-        obs.local_points_used = local_scale.points_used;
+        overlay::PortalSightInput sight;
+        sight.frame_id = frame_id;
+        sight.timestamp = timestamp;
+        sight.short_id = pnp.short_id;
+        sight.Twc_slam = Twc_slam;
+        sight.Twc_domain = Twc_domain;
+        sight.R_domain_slam = R_domain_slam;
+        sight.fx = intrinsics[0];
+        sight.fy = intrinsics[1];
+        sight.cx = intrinsics[2];
+        sight.cy = intrinsics[3];
+        sight.reproj_px = pnp.mean_reproj_px;
+        sight.physical_size_m = pnp.physical_size_m;
+        sight.metric_depth_m = pnp.T_cam_portal.translation().norm();
+
+        const vector<cv::Point3f> object_points = portalObjectPoints(portal.physical_size_m);
+        const Eigen::Matrix3f R_domain_portal = portal.T_domain_portal.so3().matrix();
+        const Eigen::Vector3f t_domain_portal = portal.T_domain_portal.translation();
+        for (size_t i = 0; i < 4 && i < object_points.size(); ++i) {
+            const cv::Point3f& obj = object_points[i];
+            const Eigen::Vector3f p_portal(obj.x, obj.y, obj.z);
+            sight.corners_domain[i] = R_domain_portal * p_portal + t_domain_portal;
+            if (i < pnp.image_points.size()) {
+                sight.corners_pixel[i] =
+                    Eigen::Vector2f(pnp.image_points[i].x, pnp.image_points[i].y);
+            }
+        }
+
+        cout << "[portal] sight frame=" << frame_id
+             << " id=" << sight.short_id
+             << " reproj_px=" << sight.reproj_px
+             << " local_scale_valid=" << (local_scale.valid ? 1 : 0)
+             << " local_scale=" << local_scale.scale
+             << endl;
+
+        overlay::RefineResult refine;
+        overlay::AtlasSnapshot atlas;
+        {
+            lock_guard<mutex> slam_lock(slam_mutex_);
+            if (slam_system_) {
+                sight.has_overlay_anchor = slam_system_->GetCurrentFrameOverlayAnchor(
+                    sight.orb_frame_mn_id, sight.ref_keyframe_id, sight.Tcr);
+            }
+            atlas = buildAtlasSnapshot(map_id);
+        }
+        refine = overlay_graph_.ingestPortalSight(map_id, sight, atlas);
 
         bool publish_viewer_alignment = false;
         Eigen::Matrix3f viewer_R_domain_slam = Eigen::Matrix3f::Identity();
         Eigen::Vector3f viewer_t_domain_slam = Eigen::Vector3f::Zero();
         float viewer_scale = 1.0f;
+
         {
             lock_guard<mutex> lock(alignment_mutex_);
-            portal_observations_.push_back(obs);
-            if (portal_observations_.size() > kMaxPortalAlignmentObservations)
-                portal_observations_.erase(portal_observations_.begin());
-
-            vector<float> baseline_scales;
-            vector<float> prior_scales;
-            for (const auto& o : portal_observations_) {
-                if (o.has_scale_prior && isValidScale(o.scale_prior))
-                    prior_scales.push_back(o.scale_prior);
-            }
-
-            for (size_t i = 0; i < portal_observations_.size(); ++i) {
-                for (size_t j = i + 1; j < portal_observations_.size(); ++j) {
-                    float baseline_scale = 1.0f;
-                    if (scaleBaselineRatio(
-                            portal_observations_[i], portal_observations_[j], baseline_scale)) {
-                        baseline_scales.push_back(baseline_scale);
-                    }
-                }
-            }
-
-            const bool had_alignment = alignment_.has_transform;
-            const bool previous_scale_valid = had_alignment && isValidScale(alignment_.scale);
-            const bool previous_scale_was_fallback =
-                had_alignment && alignment_.scale_source == "unit_fallback";
-            const bool moved_since_scale_update =
-                alignment_.has_scale_update_observation &&
-                hasMeaningfulScaleBaseline(
-                    alignment_.last_scale_update_p_slam,
-                    obs.p_slam,
-                    alignment_.last_scale_update_p_domain,
-                    obs.p_domain);
-            const bool allow_scale_update =
-                !had_alignment ||
-                previous_scale_was_fallback ||
-                !alignment_.has_scale_update_observation ||
-                moved_since_scale_update;
-
-            string scale_source = previous_scale_valid
-                ? alignment_.scale_source
-                : "unit_fallback";
-            string scale_update_status = allow_scale_update ? "no_candidate" : "held_stationary";
-            float scale = previous_scale_valid ? alignment_.scale : 1.0f;
-            bool accepted_scale_estimate = false;
-            if (allow_scale_update && !baseline_scales.empty()) {
-                const float target_scale = medianFloat(baseline_scales);
-                if (isValidScale(target_scale)) {
-                    scale = previous_scale_valid
-                        ? smoothScale(alignment_.scale, target_scale, kPortalScaleSmoothingAlpha)
-                        : target_scale;
-                    scale_source = "portal_camera_baseline";
-                    scale_update_status = previous_scale_valid ? "smoothed" : "initialized";
-                    accepted_scale_estimate = true;
-                }
-            } else if (allow_scale_update && !prior_scales.empty()) {
-                const float target_scale = medianFloat(prior_scales);
-                if (isValidScale(target_scale)) {
-                    scale = previous_scale_valid
-                        ? smoothScale(alignment_.scale, target_scale, kPortalScaleSmoothingAlpha)
-                        : target_scale;
-                    scale_source = local_scale.valid && !local_scale.source.empty()
-                        ? local_scale.source
-                        : "single_portal_local_points";
-                    scale_update_status = previous_scale_valid ? "smoothed" : "initialized";
-                    accepted_scale_estimate = true;
-                }
-            } else if (!previous_scale_valid) {
-                scale_source = "unit_fallback";
-            }
-            if (!isValidScale(scale)) {
-                scale = 1.0f;
-                scale_source = "unit_fallback";
-                scale_update_status = "invalid_fallback";
-                accepted_scale_estimate = false;
-            }
-
-            const Eigen::Matrix3f previous_R_domain_slam = alignment_.R_domain_slam;
-            const Eigen::Vector3f previous_t_domain_slam = alignment_.t_domain_slam;
-            const Eigen::Matrix3f target_R_domain_slam =
-                averagePortalAlignmentRotation(portal_observations_);
-            const Eigen::Matrix3f smoothed_R_domain_slam = had_alignment
-                ? smoothRotation(
-                      previous_R_domain_slam,
-                      target_R_domain_slam,
-                      kPortalAlignmentSmoothingAlpha)
-                : target_R_domain_slam;
-            const Eigen::Vector3f target_t_domain_slam =
-                averagePortalAlignmentTranslation(
-                    portal_observations_, scale, smoothed_R_domain_slam, obs);
-            const Eigen::Vector3f smoothed_t_domain_slam = had_alignment
-                ? (1.0f - kPortalAlignmentSmoothingAlpha) * previous_t_domain_slam +
-                      kPortalAlignmentSmoothingAlpha * target_t_domain_slam
-                : target_t_domain_slam;
-            const float raw_rotation_delta_deg = had_alignment
-                ? rotationDeltaDegrees(previous_R_domain_slam, target_R_domain_slam)
-                : 0.0f;
-            const float published_rotation_step_deg = had_alignment
-                ? rotationDeltaDegrees(previous_R_domain_slam, smoothed_R_domain_slam)
-                : 0.0f;
-
             alignment_.enabled = true;
-            alignment_.has_transform = true;
-            alignment_.R_domain_slam = smoothed_R_domain_slam;
-            alignment_.scale = scale;
-            if (accepted_scale_estimate) {
+            alignment_.last_portal_short_id = sight.short_id;
+            alignment_.last_reproj_px = sight.reproj_px;
+            alignment_.last_local_points_used = local_scale.points_used;
+            alignment_.portal_observations = refine.pin.portal_corner_factor_count / 4;
+
+            if (!refine.published) {
+                alignment_.has_transform = false;
+                alignment_.scale = 0.0f;
+                alignment_.scale_source = "none";
+                alignment_.status = refine.status;
+                map_alignments_[map_id] = alignment_;
+                cout << "[portal] overlay accumulating via " << sight.short_id
+                     << " corner_factors=" << refine.pin.portal_corner_factor_count
+                     << " live_edges=" << refine.pin.live_relative_edge_count
+                     << " status=" << refine.status
+                     << " scale_update=" << refine.scale_update_status << endl;
+            } else {
+                alignment_.has_transform = true;
+                alignment_.R_domain_slam = refine.pin.R_domain_slam;
+                alignment_.t_domain_slam = refine.pin.t_domain_slam;
+                alignment_.scale = refine.pin.scale;
+                alignment_.scale_source = refine.pin.scale_source;
+                alignment_.status = refine.status;
                 alignment_.has_scale_update_observation = true;
-                alignment_.last_scale_update_p_slam = obs.p_slam;
-                alignment_.last_scale_update_p_domain = obs.p_domain;
+                alignment_.last_scale_update_p_slam = Twc_slam.translation();
+                alignment_.last_scale_update_p_domain = Twc_domain.translation();
+                map_alignments_[map_id] = alignment_;
+
+                publish_viewer_alignment = true;
+                viewer_R_domain_slam = refine.pin.R_domain_slam;
+                viewer_t_domain_slam = refine.pin.t_domain_slam;
+                viewer_scale = refine.pin.scale;
+
+                cout << "[portal] overlay " << refine.status << " via " << sight.short_id
+                     << " reproj_px=" << sight.reproj_px
+                     << " scale=" << refine.pin.scale
+                     << " scale_source=" << refine.pin.scale_source
+                     << " scale_update=" << refine.scale_update_status
+                     << " corner_factors=" << refine.pin.portal_corner_factor_count
+                     << " live_edges=" << refine.pin.live_relative_edge_count
+                     << " corner_rmse_px=" << refine.pin.last_corner_rmse_px
+                     << " opt_passes=" << refine.pin.optimization_passes << endl;
+                cout << "[overlay] map " << map_id << " pinned via portal " << sight.short_id
+                     << " scale=" << refine.pin.scale
+                     << " scale_source=" << refine.pin.scale_source
+                     << " portal_corner_factors=" << refine.pin.portal_corner_factor_count
+                     << " reproj_px=" << sight.reproj_px << endl;
+                if (prior_pack_.loaded) {
+                    last_prior_seed_image_id_ =
+                        prior_soft::PriorSoftEdgeMatcher::nearestPriorImageId(prior_pack_, Twc_domain);
+                    cout << "[prior] covis seed image=" << last_prior_seed_image_id_
+                         << " after portal PnP" << endl;
+                }
             }
-            alignment_.t_domain_slam = smoothed_t_domain_slam;
-            alignment_.scale_source = scale_source;
-            alignment_.last_portal_short_id = obs.short_id;
-            alignment_.last_reproj_px = obs.reproj_px;
-            alignment_.last_local_points_used = obs.local_points_used;
-            alignment_.portal_observations = portal_observations_.size();
-            alignment_.status = scale_source == "unit_fallback"
-                ? "aligned_unit_scale_fallback"
-                : "aligned";
-
-            publish_viewer_alignment = alignment_.enabled && alignment_.has_transform;
-            viewer_R_domain_slam = alignment_.R_domain_slam;
-            viewer_t_domain_slam = alignment_.t_domain_slam;
-            viewer_scale = alignment_.scale;
-
-            cout << "[portal] aligned via " << obs.short_id
-                 << " reproj_px=" << obs.reproj_px
-                 << " scale=" << alignment_.scale
-                 << " scale_source=" << alignment_.scale_source
-                 << " scale_update=" << scale_update_status
-                 << " baseline_candidates=" << baseline_scales.size()
-                 << " prior_candidates=" << prior_scales.size()
-                 << " observations=" << alignment_.portal_observations
-                 << " raw_rot_delta_deg=" << raw_rotation_delta_deg
-                 << " published_rot_step_deg=" << published_rotation_step_deg << endl;
-
-            map_alignments_[map_id] = alignment_;
-            map_portal_observations_[map_id] = portal_observations_;
-            syncOverlayFromPortalAlignment(map_id, obs, alignment_);
         }
 
         if (publish_viewer_alignment && slam_system_) {
@@ -3948,12 +4126,20 @@ private:
                     if (is_active)
                         Twc_raw_by_frame[sample.id] = sample.Twc;
 
+                    // all_maps=1 is an eval export: apply each map's pin when present.
+                    // Live publish policy still withholds unpinned maps unless active_only.
                     const bool apply_domain =
                         request_aligned && mapAlignmentIsDomainPinned(map_alignment) &&
-                        (publish_plan.policy == "domain_pinned_merge" ||
+                        (all_maps || publish_plan.policy == "domain_pinned_merge" ||
                          (publish_plan.policy == "active_only" && is_active));
                     const Sophus::SE3f Twc = apply_domain
-                        ? overlay_graph_.applyPinToTwc(map_id, sample.Twc)
+                        ? overlay_graph_.applyPinToTwc(
+                              map_id,
+                              sample.Twc,
+                              sample.id,
+                              sample.ref_keyframe_id,
+                              sample.Tcr,
+                              sample.is_keyframe)
                         : sample.Twc;
 
                     json pose_json = TwcToClientJson(
@@ -4315,19 +4501,8 @@ private:
                             request->frame_id,
                             request->timestamp,
                             request->intrinsics);
-                        unsigned long map_id = 0;
-                        {
-                            lock_guard<mutex> slam_lock(slam_mutex_);
-                            if (slam_system_)
-                                map_id = slam_system_->GetCurrentMapId();
-                        }
-                        updatePortalAlignment(
-                            pnp,
-                            request->associated_Tcw_slam,
-                            LocalScaleEstimate(),
-                            request->frame_id,
-                            request->timestamp,
-                            map_id);
+                        // Main track thread runs updatePortalAlignment with a fresh pose; skip
+                        // here to avoid duplicate overlay ingests on stale associated_Tcw_slam.
                         refreshViewerPortalSquares();
                         refreshViewerCustomPoints();
                     }
@@ -4388,12 +4563,27 @@ private:
                     successful_tracks_++;
                     current_map_id = slam_system_->GetCurrentMapId();
                     syncActiveMapAlignmentState(current_map_id);
-                    overlay_graph_.recordLivePose(
+                    const overlay::AtlasSnapshot atlas = buildAtlasSnapshot(current_map_id);
+                    const overlay::RefineResult live_refine = overlay_graph_.recordLivePose(
                         current_map_id,
                         request->frame_id,
                         request->timestamp,
                         pose.inverse(),
-                        false);
+                        false,
+                        atlas);
+                    if (live_refine.published) {
+                        applyOverlayRefineToAlignment(current_map_id, live_refine);
+                        cout << "[overlay] live_edge " << live_refine.status
+                             << " map=" << current_map_id
+                             << " scale=" << live_refine.pin.scale
+                             << " scale_update=" << live_refine.scale_update_status
+                             << " corner_factors=" << live_refine.pin.portal_corner_factor_count
+                             << " live_edges=" << live_refine.pin.live_relative_edge_count
+                             << " corner_rmse_px=" << live_refine.pin.last_corner_rmse_px
+                             << " live_edge_rmse_m=" << live_refine.pin.last_live_edge_rmse_m
+                             << " opt_passes=" << live_refine.pin.optimization_passes
+                             << endl;
+                    }
                     updateLatestSlamFrame(request->frame_id, request->timestamp, pose);
                     if (shouldRunPortalDetection(request->frame_id)) {
                         tracked_map_points = slam_system_->GetTrackedMapPoints();
@@ -4406,27 +4596,65 @@ private:
                     }
                 } else {
                     failed_tracks_++;
+                    const unsigned long lost_map_id = slam_system_->GetCurrentMapId();
+                    clearDomainAlignmentForMap(lost_map_id);
+                    cout << "[overlay] tracking lost — cleared domain alignment for map "
+                         << lost_map_id << endl;
                 }
             }
 
             if (success && shouldRunPortalDetection(request->frame_id)) {
                 const auto t_portal0 = chrono::steady_clock::now();
-                if (portal_intrinsics.size() < 4) {
+                const vector<float> portal_detect_intrinsics =
+                    fullResolutionIntrinsicsForRequest(request);
+                const cv::Mat& portal_detect_image = request->image;
+                if (portal_detect_intrinsics.size() < 4 || portal_detect_image.empty()) {
                     cerr << "[portal] skipping QR PnP for frame " << request->frame_id
-                         << ": no intrinsics available" << endl;
+                         << ": no full-resolution image/intrinsics available" << endl;
                 } else {
                     PortalPnPResult pnp;
                     vector<PortalPnPResult> portal_detections;
-                    if (solvePortalPnP(slam_image, portal_intrinsics, pnp, &portal_detections)) {
+                    if (solvePortalPnP(
+                            portal_detect_image, portal_detect_intrinsics, pnp, &portal_detections)) {
                         storePortalCornerObservations(
                             portal_detections,
                             request->frame_id,
                             request->timestamp,
-                            portal_intrinsics);
+                            portal_detect_intrinsics);
+
+                        PortalPnPResult pnp_for_scale = pnp;
+                        vector<float> scale_intrinsics = portal_detect_intrinsics;
+                        const cv::Size detect_size(
+                            portal_detect_image.cols, portal_detect_image.rows);
+                        const cv::Size slam_size(slam_image.cols, slam_image.rows);
+                        if (isValidImageSize(slam_size) && isValidImageSize(detect_size) &&
+                            !sameImageSize(detect_size, slam_size) &&
+                            portal_intrinsics.size() >= 4) {
+                            const float sx = static_cast<float>(slam_size.width) /
+                                             static_cast<float>(detect_size.width);
+                            const float sy = static_cast<float>(slam_size.height) /
+                                             static_cast<float>(detect_size.height);
+                            for (auto& pt : pnp_for_scale.image_points) {
+                                pt.x *= sx;
+                                pt.y *= sy;
+                            }
+                            scale_intrinsics = portal_intrinsics;
+                        }
+
                         const LocalScaleEstimate local_scale = estimateLocalScaleFromPortalRegion(
-                            pnp, pose, tracked_map_points, tracked_keypoints, portal_intrinsics);
+                            pnp_for_scale,
+                            pose,
+                            tracked_map_points,
+                            tracked_keypoints,
+                            scale_intrinsics);
                         updatePortalAlignment(
-                            pnp, pose, local_scale, request->frame_id, request->timestamp, current_map_id);
+                            pnp,
+                            pose,
+                            local_scale,
+                            request->frame_id,
+                            request->timestamp,
+                            current_map_id,
+                            portal_detect_intrinsics);
                         refreshViewerPortalSquares();
                         refreshViewerCustomPoints();
                     }
@@ -4437,6 +4665,12 @@ private:
 
             if (success && !prior_match_desc.empty()) {
                 const auto t_prior0 = chrono::steady_clock::now();
+                vector<float> feature_intrinsics = slam_intrinsics;
+                if (isValidImageSize(slam_input_size_) && isValidImageSize(feature_image_size_) &&
+                    !sameImageSize(slam_input_size_, feature_image_size_)) {
+                    feature_intrinsics =
+                        scaleIntrinsicsToSize(slam_intrinsics, slam_input_size_, feature_image_size_);
+                }
                 tryPriorSoftEdgesAfterTrack(
                     current_map_id,
                     request->frame_id,
@@ -4444,9 +4678,9 @@ private:
                     pose,
                     prior_match_kpts,
                     prior_match_desc,
-                    slam_intrinsics,
-                    slam_image.cols,
-                    slam_image.rows);
+                    feature_intrinsics,
+                    feature_image_size_.width,
+                    feature_image_size_.height);
                 prior_ms = chrono::duration<double, milli>(
                     chrono::steady_clock::now() - t_prior0).count();
             }
@@ -4546,8 +4780,8 @@ void printUsage() {
     cout << "  --slam-interval-nth <N> Run SLAM on one out of every N accepted frames (default: 1)" << endl;
     cout << "  --custom-detect-every <N> Run custom detection every N accepted frames (default: disabled)" << endl;
     cout << "  --min-buffer <number>  Min frames in queue before tracking; oldest timestamp first (default: 3)" << endl;
-    cout << "  --portal-manifest <path>  refined_manifest.json with portals[].pose and physicalSize" << endl;
-    cout << "  --prior-pack <path>       prior pack root (manifest.json); or set Server.priorPack in settings YAML" << endl;
+    cout << "  --portal-manifest <path>  refined_manifest.json with portals[].pose and physicalSize (overrides pack portals)" << endl;
+    cout << "  --prior-pack <path>       prior pack root; pack portals[] enable alignment when manifest unset" << endl;
     cout << "  --prior-match-every <N>   Run prior soft-edge match every N frames (default: 30)" << endl;
     cout << "  --portal-detect-every <N> Run portal QR detection every N accepted frames (default: 1)" << endl;
     cout << "  --portal-max-reproj-px <N> Reject portal PnP above this mean reprojection error (default: 8)" << endl;

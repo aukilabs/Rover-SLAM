@@ -189,6 +189,19 @@ public:
         double timestamp = 0.0;
         Sophus::SE3f Twc;
         bool is_keyframe = true;
+        /** Reference keyframe id for dense frames (0 / unset for keyframe samples). */
+        unsigned long ref_keyframe_id = 0;
+        /** Frame pose relative to ref_keyframe_id (identity for keyframe samples). */
+        Sophus::SE3f Tcr = Sophus::SE3f();
+    };
+
+    /** One atlas keyframe node for overlay per-keyframe Sim(3) graph rebuild. */
+    struct KeyFrameGraphSample {
+        unsigned long id = 0;
+        double timestamp = 0.0;
+        Sophus::SE3f Tcw;
+        unsigned long parent_id = 0;
+        std::vector<std::pair<unsigned long, int>> covisibles;
     };
     /** Active-map keyframe path (post–loop/merge BA), optionally plus the live tracked frame. */
     void GetActiveMapTrajectory(std::vector<TrajectorySample>& out, bool include_live_frame = true);
@@ -200,6 +213,12 @@ public:
     void GetMapKeyFrameTrajectory(unsigned long map_id, std::vector<TrajectorySample>& out);
     /** Per-frame path for a specific atlas map (same logic as active-map dense, filtered by map KFs). */
     void GetMapDenseTrajectory(unsigned long map_id, std::vector<TrajectorySample>& out);
+    /** Keyframe poses + spanning-tree parent + covisibility for overlay graph edges. */
+    void GetMapKeyFrameGraph(unsigned long map_id, std::vector<KeyFrameGraphSample>& out);
+    /** Current tracked frame anchor for overlay observation attachment. */
+    bool GetCurrentFrameOverlayAnchor(unsigned long& frame_mn_id,
+                                      unsigned long& ref_keyframe_id,
+                                      Sophus::SE3f& Tcr);
     /** Viewer-only domain-from-SLAM Sim3; does not mutate the active SLAM map. */
     void SetViewerAlignment(const Eigen::Matrix3f& R_domain_slam, const Eigen::Vector3f& t_domain_slam, float scale);
     void ClearViewerAlignment();

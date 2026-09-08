@@ -400,20 +400,22 @@ Present on `GET /api/v1/status` and `GET /api/v1/trajectory`.
 
 ### Portal alignment
 
-Start the server with `--portal-manifest <refined_manifest.json>` to enable portal alignment. The manifest must contain `portals[].shortId`, `portals[].pose.position`, `portals[].pose.rotation`, and metric `portals[].physicalSize`. Portal poses are loaded with the same OpenGL/domain-to-COLMAP conversion used by the reconstruction server: position `[x,y,z] -> [y,x,-z]`, quaternion `[x,y,z,w] -> [y,x,-z,w]`.
+Start the server with `--portal-manifest <refined_manifest.json>` or `--prior-pack <pack_root>` to enable portal alignment. If both are set, `--portal-manifest` wins. The catalog must contain `portals[].shortId`, `portals[].pose.position`, `portals[].pose.rotation`, and metric `portals[].physicalSize`. Portal poses are loaded **as stored in JSON** (OpenGL/domain frame from refinement), then rotated **−π/2 about Y** so the QR/PnP plane is z=0 (wall-mounted → QR plane); there is no separate OpenGL→COLMAP position/quaternion remap on load.
 
 For each accepted frame, the server can detect QR payloads matching `https://r8.hr/<SHORT_ID>`, solve a metric portal pose with OpenCV `solvePnP` from the QR corners and `physicalSize`, then align ORB-SLAM's monocular trajectory to the domain frame. A single portal can provide an approximate scale by comparing the metric portal-plane geometry to SLAM map points projected near the QR in the same frame. Repeated detections of the same QR, or detections of multiple portals, refine scale from camera-center baselines.
 
 When `--viewer` is enabled, the Pangolin map viewer applies the same domain-from-SLAM transform at render time after the first accepted portal alignment. This affects the displayed active-map points, keyframes, graph lines, and current camera only; the underlying ORB-SLAM map remains in raw SLAM coordinates for tracking, bundle adjustment, and loop closure.
 
-`alignment.scale_source` indicates the active scale estimate:
+`alignment.scale_source` indicates the active scale estimate (only present once a metric pin exists):
 
 | Value | Meaning |
 |--------|---------|
+| `none` | Portal hard factors may be accumulating; no Sim(3) pin yet (no invented scale). |
 | `single_portal_local_points` | Scale from multiple SLAM points projected near one detected portal. |
 | `single_portal_local_depth` | Scale from one nearby SLAM point, less stable than point-pair scale. |
 | `portal_camera_baseline` | Scale refined from repeated same-QR or multi-portal camera baselines. |
-| `unit_fallback` | Portal pose anchored rotation/translation, but no reliable metric scale estimate was available. |
+
+Until a metric scale exists, `alignment.aligned` stays false, status is `portal_factors_accumulating_waiting_for_scale`, and domain poses are withheld (multi-map publish policy `active_only`). Each QR observation still adds an overlay portal hard factor — the pose-graph constraint set grows; the pin is published only when scale is estimated.
 
 **Implementing the same convention elsewhere** (e.g. image localization servers): given world-from-camera `Twc` in an OpenCV-style camera frame,
 

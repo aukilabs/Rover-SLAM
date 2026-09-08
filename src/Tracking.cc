@@ -30,6 +30,8 @@
 
 #include <iostream>
 #include <cstdlib>
+#include <cmath>
+#include <array>
 
 #include <mutex>
 #include <chrono>
@@ -1725,16 +1727,24 @@ Sophus::SE3f Tracking::GrabImageMonocular(
     if (frameIntrinsics.empty()) {
         mFrameCameras[timestamp] = mpCamera;
     } else {
-        GeometricCamera* cam = new Pinhole(frameIntrinsics);
-        cam = mpAtlas->AddCamera(cam);
-        /*
-        cout << "Added pinhole cam for timestamp " << timestamp << ", intrinsics: ";
-        for(size_t i = 0; i < frameIntrinsics.size(); i++) {
-            cout << frameIntrinsics[i];
-            if(i < frameIntrinsics.size() - 1) cout << ", ";
+        // Autofocus drift is a few percent; sub-pixel reprojection noise dominates,
+        // so bucket to 1px to keep Atlas camera growth bounded without affecting VO.
+        const auto q = [](float v) { return static_cast<int>(std::round(v)); };
+        const std::array<int, 4> key{
+            q(frameIntrinsics[0]), q(frameIntrinsics[1]),
+            q(frameIntrinsics[2]), q(frameIntrinsics[3])};
+
+        GeometricCamera* cam = nullptr;
+        const auto it = mQuantizedCameraCache.find(key);
+        if (it != mQuantizedCameraCache.end()) {
+            cam = it->second;
+        } else {
+            Pinhole* fresh = new Pinhole(frameIntrinsics);
+            cam = mpAtlas->AddCamera(fresh);
+            if (cam != fresh)
+                delete fresh;
+            mQuantizedCameraCache[key] = cam;
         }
-        cout << endl;
-        */
 
         mFrameCameras[timestamp] = cam;
     }

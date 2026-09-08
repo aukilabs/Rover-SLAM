@@ -8,6 +8,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include <opencv2/calib3d.hpp>
+
 #ifdef AUKI_LIGHTGLUE_AVAILABLE
 #include "Matchers/LightGlueMrNerfMatcher.h"
 #endif
@@ -15,6 +17,9 @@
 namespace prior_soft {
 
 namespace {
+
+constexpr float kPriorSoftBaseWeight = 0.35f;
+constexpr size_t kMaxPriorSoftObservationsPerFactor = 64;
 
 Sophus::SE3f poseToTwc(const prior_pack::Pose& pose) {
     Eigen::Quaternionf q(pose.rotation.w, pose.rotation.x, pose.rotation.y, pose.rotation.z);
@@ -56,7 +61,7 @@ std::vector<int> covisNeighbors(const prior_pack::PriorPack& pack, int image_id)
     return out;
 }
 
-int nearestPriorImageId(const prior_pack::PriorPack& pack, const Sophus::SE3f& Twc_domain) {
+int findNearestPriorImageId(const prior_pack::PriorPack& pack, const Sophus::SE3f& Twc_domain) {
     int best_id = -1;
     float best_dist = std::numeric_limits<float>::infinity();
     for (const auto& img : pack.images) {
@@ -77,7 +82,7 @@ std::vector<int> selectCandidateImages(const PriorMatchInput& input, const Prior
     int seed = input.seed_prior_image_id;
     if (seed < 0) {
         if (input.has_domain_pose)
-            seed = nearestPriorImageId(pack, input.Twc_domain);
+            seed = findNearestPriorImageId(pack, input.Twc_domain);
         else if (!pack.images.empty())
             seed = pack.images.front().id;
     }
@@ -178,14 +183,36 @@ bool matchDescriptorsFixture(
     return matched > 0;
 }
 
+struct ReprojGateDiagnostics {
+    int lg_matches = 0;
+    int with_track = 0;
+    int pass_live = 0;
+    int pass_prior = 0;
+    int pass_both = 0;
+    float err_live_p50 = -1.f;
+    float err_prior_p50 = -1.f;
+    float mean_abs_z_live = -1.f;
+};
+
 struct ReprojGateResult {
     int inliers = 0;
     float mean_reproj_px = 0.f;
+    std::vector<overlay::PriorSoftObservation> observations;
+    ReprojGateDiagnostics diag;
 };
+
+float percentileP50(std::vector<float> values) {
+    if (values.empty())
+        return -1.f;
+    const size_t mid = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + mid, values.end());
+    return values[mid];
+}
 
 ReprojGateResult gateWithTrackReprojection(
     const prior_pack::PriorPack& pack,
     int prior_image_id,
+    const prior_pack::ImageRecord& prior_img,
     const std::vector<int>& live_to_prior,
     const std::vector<cv::KeyPoint>& live_kpts,
     const Sophus::SE3f& Twc_domain,
@@ -199,52 +226,186 @@ ReprojGateResult gateWithTrackReprojection(
     const float fy = intrinsics[1];
     const float cx = intrinsics[2];
     const float cy = intrinsics[3];
-    const Sophus::SE3f Tcw = Twc_domain.inverse();
+    const Sophus::SE3f Tcw_live = Twc_domain.inverse();
+    const Eigen::Matrix3f R_live = Tcw_live.so3().matrix();
+    const Eigen::Vector3f t_live = Tcw_live.translation();
 
-    float reproj_sum = 0.f;
+    const Sophus::SE3f Twc_prior = poseToTwc(prior_img.pose);
+    const Sophus::SE3f Tcw_prior = Twc_prior.inverse();
+    const Eigen::Matrix3f R_prior = Tcw_prior.so3().matrix();
+    const Eigen::Vector3f t_prior = Tcw_prior.translation();
+    const float pfx = prior_img.intrinsics.fx;
+    const float pfy = prior_img.intrinsics.fy;
+    const float pcx = prior_img.intrinsics.cx;
+    const float pcy = prior_img.intrinsics.cy;
+
+    std::unordered_map<int, const prior_pack::TrackRecord*> track_by_prior_kpt;
     for (const auto& track : pack.tracks) {
-        int prior_kpt_idx = -1;
         for (const auto& obs : track.observations) {
             if (obs.image_id == prior_image_id) {
-                prior_kpt_idx = obs.keypoint_index;
+                track_by_prior_kpt[obs.keypoint_index] = &track;
                 break;
             }
-        }
-        if (prior_kpt_idx < 0)
-            continue;
-
-        int live_idx = -1;
-        for (size_t i = 0; i < live_to_prior.size(); ++i) {
-            if (live_to_prior[i] == prior_kpt_idx) {
-                live_idx = static_cast<int>(i);
-                break;
-            }
-        }
-        if (live_idx < 0 || live_idx >= static_cast<int>(live_kpts.size()))
-            continue;
-
-        const Eigen::Vector3f p_world(track.position.x, track.position.y, track.position.z);
-        const Eigen::Vector3f p_cam = Tcw * p_world;
-        if (p_cam.z() <= 1e-4f)
-            continue;
-
-        const float u = fx * p_cam.x() / p_cam.z() + cx;
-        const float v = fy * p_cam.y() / p_cam.z() + cy;
-        const cv::Point2f proj(u, v);
-        const cv::Point2f obs = live_kpts[live_idx].pt;
-        const float err = std::hypot(proj.x - obs.x, proj.y - obs.y);
-        if (err <= max_reproj_px) {
-            out.inliers++;
-            reproj_sum += err;
         }
     }
+
+    int lg_matches = 0;
+    for (const int prior_kpt_idx : live_to_prior) {
+        if (prior_kpt_idx >= 0)
+            lg_matches++;
+    }
+    out.diag.lg_matches = lg_matches;
+
+    float reproj_sum = 0.f;
+    std::vector<float> err_live_samples;
+    std::vector<float> err_prior_samples;
+    float abs_z_sum = 0.f;
+    int abs_z_count = 0;
+    for (size_t live_idx = 0; live_idx < live_to_prior.size(); ++live_idx) {
+        const int prior_kpt_idx = live_to_prior[live_idx];
+        if (prior_kpt_idx < 0 || live_idx >= live_kpts.size())
+            continue;
+        if (prior_kpt_idx >= static_cast<int>(prior_img.features.keypoints.size()))
+            continue;
+
+        const auto track_it = track_by_prior_kpt.find(prior_kpt_idx);
+        if (track_it == track_by_prior_kpt.end())
+            continue;
+
+        out.diag.with_track++;
+        const prior_pack::TrackRecord& track = *track_it->second;
+        const Eigen::Vector3f p_world(track.position.x, track.position.y, track.position.z);
+
+        const Eigen::Vector3f p_cam_live = R_live * p_world + t_live;
+        const Eigen::Vector3f p_cam_prior = R_prior * p_world + t_prior;
+        if (!p_cam_live.allFinite() || !p_cam_prior.allFinite())
+            continue;
+        if (std::abs(p_cam_live.z()) <= 1e-6f && std::abs(p_cam_prior.z()) <= 1e-6f)
+            continue;
+
+        abs_z_sum += std::abs(p_cam_live.z());
+        abs_z_count++;
+
+        const cv::Point2f live_obs = live_kpts[live_idx].pt;
+        float err_live = std::numeric_limits<float>::infinity();
+        if (std::abs(p_cam_live.z()) > 1e-6f) {
+            const float u = fx * p_cam_live.x() / p_cam_live.z() + cx;
+            const float v = fy * p_cam_live.y() / p_cam_live.z() + cy;
+            if (std::isfinite(u) && std::isfinite(v))
+                err_live = std::hypot(u - live_obs.x, v - live_obs.y);
+        }
+
+        const auto& prior_kp = prior_img.features.keypoints[static_cast<size_t>(prior_kpt_idx)];
+        const cv::Point2f prior_obs(prior_kp.first, prior_kp.second);
+        float err_prior = std::numeric_limits<float>::infinity();
+        if (std::abs(p_cam_prior.z()) > 1e-6f) {
+            const float u = pfx * p_cam_prior.x() / p_cam_prior.z() + pcx;
+            const float v = pfy * p_cam_prior.y() / p_cam_prior.z() + pcy;
+            if (std::isfinite(u) && std::isfinite(v))
+                err_prior = std::hypot(u - prior_obs.x, v - prior_obs.y);
+        }
+
+        if (std::isfinite(err_live))
+            err_live_samples.push_back(err_live);
+        if (std::isfinite(err_prior))
+            err_prior_samples.push_back(err_prior);
+
+        const bool pass_live = std::isfinite(err_live) && err_live <= max_reproj_px;
+        const bool pass_prior = std::isfinite(err_prior) && err_prior <= max_reproj_px;
+        if (pass_live)
+            out.diag.pass_live++;
+        if (pass_prior)
+            out.diag.pass_prior++;
+        if (pass_live && pass_prior)
+            out.diag.pass_both++;
+
+        if (!pass_prior || !pass_live)
+            continue;
+
+        out.inliers++;
+        reproj_sum += err_live;
+        overlay::PriorSoftObservation observation;
+        observation.p_domain = p_world;
+        observation.pixel = Eigen::Vector2f(live_obs.x, live_obs.y);
+        out.observations.push_back(observation);
+    }
+
+    out.diag.err_live_p50 = percentileP50(std::move(err_live_samples));
+    out.diag.err_prior_p50 = percentileP50(std::move(err_prior_samples));
+    if (abs_z_count > 0)
+        out.diag.mean_abs_z_live = abs_z_sum / static_cast<float>(abs_z_count);
 
     if (out.inliers > 0)
         out.mean_reproj_px = reproj_sum / static_cast<float>(out.inliers);
     return out;
 }
 
+float rotationAngleDeg(const Eigen::Matrix3f& Ra, const Eigen::Matrix3f& Rb) {
+    const Eigen::Matrix3f R = Ra * Rb.transpose();
+    const float trace = std::min(3.0f, std::max(-1.0f, R.trace()));
+    return std::acos((trace - 1.0f) * 0.5f) * (180.0f / static_cast<float>(M_PI));
+}
+
+bool disagreesWithSlamPin(const ReprojGateResult& gate,
+                          const Sophus::SE3f& Twc_domain_pinned,
+                          const std::vector<float>& intrinsics,
+                          float max_rot_deg,
+                          float max_trans_m) {
+    if (gate.observations.size() < 4 || intrinsics.size() < 4)
+        return false;
+
+    const float fx = intrinsics[0];
+    const float fy = intrinsics[1];
+    const float cx = intrinsics[2];
+    const float cy = intrinsics[3];
+    cv::Mat camera_matrix =
+        (cv::Mat_<double>(3, 3) << fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0);
+    cv::Mat dist_coeffs = cv::Mat::zeros(4, 1, CV_64F);
+
+    std::vector<cv::Point3f> object_points;
+    std::vector<cv::Point2f> image_points;
+    for (const auto& obs : gate.observations) {
+        object_points.emplace_back(obs.p_domain.x(), obs.p_domain.y(), obs.p_domain.z());
+        image_points.emplace_back(obs.pixel.x(), obs.pixel.y());
+    }
+
+    cv::Mat rvec;
+    cv::Mat tvec;
+    if (!cv::solvePnP(object_points,
+                      image_points,
+                      camera_matrix,
+                      dist_coeffs,
+                      rvec,
+                      tvec,
+                      false,
+                      cv::SOLVEPNP_ITERATIVE)) {
+        return false;
+    }
+
+    cv::Mat R_cv;
+    cv::Rodrigues(rvec, R_cv);
+    Eigen::Matrix3f R_pnp;
+    Eigen::Vector3f t_pnp;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c)
+            R_pnp(r, c) = static_cast<float>(R_cv.at<double>(r, c));
+        t_pnp(r) = static_cast<float>(tvec.at<double>(r));
+    }
+    const Sophus::SE3f Tcw_pnp(R_pnp, t_pnp);
+    const Sophus::SE3f Twc_pnp = Tcw_pnp.inverse();
+
+    const float rot_deg =
+        rotationAngleDeg(Twc_pnp.so3().matrix(), Twc_domain_pinned.so3().matrix());
+    const float trans_m = (Twc_pnp.translation() - Twc_domain_pinned.translation()).norm();
+    return rot_deg > max_rot_deg || trans_m > max_trans_m;
+}
+
 }  // namespace
+
+int PriorSoftEdgeMatcher::nearestPriorImageId(const prior_pack::PriorPack& pack,
+                                              const Sophus::SE3f& Twc_domain) {
+    return findNearestPriorImageId(pack, Twc_domain);
+}
 
 struct PriorSoftEdgeMatcher::MatcherImpl {
 #ifdef AUKI_LIGHTGLUE_AVAILABLE
@@ -274,6 +435,10 @@ PriorMatchResult PriorSoftEdgeMatcher::tryMatch(const PriorMatchInput& input) {
         result.skip_reason = "no_live_features";
         return result;
     }
+    if (input.live_desc.rows != static_cast<int>(input.live_kpts.size())) {
+        result.skip_reason = "kpt_desc_mismatch";
+        return result;
+    }
     if (!input.has_domain_pose) {
         result.skip_reason = "no_domain_pose";
         return result;
@@ -289,11 +454,20 @@ PriorMatchResult PriorSoftEdgeMatcher::tryMatch(const PriorMatchInput& input) {
         return result;
     }
 
+    const int seed_id = input.seed_prior_image_id >= 0 ? input.seed_prior_image_id : candidates.front();
+    const prior_pack::ImageRecord* seed_img = imageById(*input.pack, seed_id);
+    if (seed_img && input.has_domain_pose) {
+        result.debug_twc_seed_dist_m = poseCenterDistanceM(*seed_img, input.Twc_domain);
+        result.debug_seed_prior_image_id = seed_id;
+    }
+
     const std::vector<cv::Point2f> live_pts = keypointsToPoints(input.live_kpts);
     int best_image_id = -1;
     int best_inliers = 0;
     float best_reproj = std::numeric_limits<float>::infinity();
     overlay::PriorSoftEdgeFactor best_factor;
+    ReprojGateResult best_gate;
+    bool saw_slam_disagreement = false;
 
     for (const int prior_image_id : candidates) {
         const prior_pack::ImageRecord* prior_img = imageById(*input.pack, prior_image_id);
@@ -312,6 +486,10 @@ PriorMatchResult PriorSoftEdgeMatcher::tryMatch(const PriorMatchInput& input) {
 #ifdef AUKI_LIGHTGLUE_AVAILABLE
         if (impl_->matcher) {
             matches12.resize(input.live_kpts.size(), -1);
+            const int prior_w =
+                std::max(1, static_cast<int>(std::round(2.f * prior_img->intrinsics.cx)));
+            const int prior_h =
+                std::max(1, static_cast<int>(std::round(2.f * prior_img->intrinsics.cy)));
             const int n =
                 impl_->matcher->Match(
                     live_pts,
@@ -320,8 +498,8 @@ PriorMatchResult PriorSoftEdgeMatcher::tryMatch(const PriorMatchInput& input) {
                     prior_desc,
                     input.image_width,
                     input.image_height,
-                    input.image_width,
-                    input.image_height,
+                    prior_w,
+                    prior_h,
                     matches12);
             matched = n > 0;
         }
@@ -336,45 +514,98 @@ PriorMatchResult PriorSoftEdgeMatcher::tryMatch(const PriorMatchInput& input) {
             continue;
         }
 
+        int lg_matches = 0;
+        for (const int m : matches12) {
+            if (m >= 0)
+                lg_matches++;
+        }
+        result.debug_lg_matches = std::max(result.debug_lg_matches, lg_matches);
+
         const ReprojGateResult gate =
             gateWithTrackReprojection(
                 *input.pack,
                 prior_image_id,
+                *prior_img,
                 matches12,
                 input.live_kpts,
                 input.Twc_domain,
                 input.intrinsics,
                 config_.max_reproj_px);
 
+        result.debug_best_inliers = std::max(result.debug_best_inliers, gate.inliers);
+        if (gate.diag.with_track >= result.debug_with_track) {
+            result.debug_with_track = gate.diag.with_track;
+            result.debug_err_live_p50 = gate.diag.err_live_p50;
+            result.debug_err_prior_p50 = gate.diag.err_prior_p50;
+            result.debug_pass_live = gate.diag.pass_live;
+            result.debug_pass_prior = gate.diag.pass_prior;
+            result.debug_pass_both = gate.diag.pass_both;
+            result.debug_mean_abs_z_live = gate.diag.mean_abs_z_live;
+        }
+
         if (gate.inliers < config_.min_inliers)
             continue;
+
+        if (disagreesWithSlamPin(
+                gate,
+                input.Twc_domain,
+                input.intrinsics,
+                config_.max_disagree_rot_deg,
+                config_.max_disagree_trans_m)) {
+            saw_slam_disagreement = true;
+            continue;
+        }
 
         if (gate.inliers > best_inliers ||
             (gate.inliers == best_inliers && gate.mean_reproj_px < best_reproj)) {
             best_inliers = gate.inliers;
             best_reproj = gate.mean_reproj_px;
             best_image_id = prior_image_id;
+            best_gate = gate;
             best_factor.frame_id = input.frame_id;
             best_factor.timestamp = input.timestamp;
             best_factor.prior_image_id = prior_image_id;
             best_factor.inlier_count = gate.inliers;
             best_factor.mean_reproj_px = gate.mean_reproj_px;
-            best_factor.weight = static_cast<float>(gate.inliers);
+            best_factor.fx = input.intrinsics[0];
+            best_factor.fy = input.intrinsics[1];
+            best_factor.cx = input.intrinsics[2];
+            best_factor.cy = input.intrinsics[3];
+            best_factor.observations = gate.observations;
+            if (best_factor.observations.size() > kMaxPriorSoftObservationsPerFactor) {
+                best_factor.observations.resize(kMaxPriorSoftObservationsPerFactor);
+            }
+            best_factor.weight = kPriorSoftBaseWeight * std::sqrt(static_cast<float>(gate.inliers));
         }
     }
 
     if (best_image_id < 0) {
+        if (saw_slam_disagreement) {
+            result.skip_reason = "slam_disagreement";
+        } else {
 #ifdef AUKI_LIGHTGLUE_AVAILABLE
-        result.skip_reason = "no_gated_match";
+            result.skip_reason = "no_gated_match";
 #else
-        result.skip_reason = "lightglue_unavailable";
+            result.skip_reason = "lightglue_unavailable";
 #endif
+        }
+        return result;
+    }
+
+    if (best_gate.observations.empty()) {
+        result.skip_reason = "no_gated_match";
         return result;
     }
 
     result.accepted = true;
     result.matched_prior_image_id = best_image_id;
     result.factor = best_factor;
+    result.debug_best_inliers = best_gate.inliers;
+    result.debug_err_live_p50 = best_gate.diag.err_live_p50;
+    result.debug_err_prior_p50 = best_gate.diag.err_prior_p50;
+    result.debug_pass_live = best_gate.diag.pass_live;
+    result.debug_pass_prior = best_gate.diag.pass_prior;
+    result.debug_pass_both = best_gate.diag.pass_both;
     return result;
 }
 

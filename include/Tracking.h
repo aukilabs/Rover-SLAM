@@ -42,6 +42,8 @@
 #include "Extractors/SPextractor.h"
 #include <mutex>
 #include <unordered_set>
+#include <array>
+#include <map>
 
 namespace ORB_SLAM3
 {
@@ -370,6 +372,7 @@ protected:
 
     // CUSTOM
     std::map<double, GeometricCamera*> mFrameCameras; // Specific camera parameters for each frame (DMT)
+    std::map<std::array<int, 4>, GeometricCamera*> mQuantizedCameraCache;
 
     int initID, lastID;
 

@@ -59,7 +59,7 @@ hold = Path(sys.argv[1]); port=int(sys.argv[2]); out=Path(sys.argv[3]); q=int(sy
 url=f"http://127.0.0.1:{port}/api/v1/track"
 images=sorted(p for p in hold.iterdir() if p.is_file() and p.suffix.lower() in {".jpg",".jpeg",".png",".bmp"})
 interval=0.1
-intr="1335.984,1335.984,716.9096,963.1064"
+intr="1335.984,1335.984,963.1064,716.9096"
 counts={}
 for i,p in enumerate(images):
     t0=time.time()

@@ -13,12 +13,13 @@ Camera.type: "Rectified"
 loopClosing: 0
 
 # Camera calibration and distortion parameters (OpenCV) 
-# Picked one frame for now, TODO use recorded frame intrinsics instead.
+# Fallback only when a request carries no X-Intrinsics header (slam_server).
+# From scan ts 79219 (different scan than holdout); prefer per-frame intrinsics.
 # 79219.921417,1335.984,1335.984,963.1064,716.9096,1920,1440
 Camera1.fx: 1335.984
 Camera1.fy: 1335.984
-Camera1.cx: 716.9096
-Camera1.cy: 963.1064
+Camera1.cx: 963.1064
+Camera1.cy: 716.9096
 
 # Camera resolution
 Camera.width: 960

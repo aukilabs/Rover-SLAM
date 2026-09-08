@@ -2,9 +2,9 @@
 
 Status: active  
 Tier: feature  
-Stage: 10-integrate  
+Stage: 7-implement (S5′e: corner-driven Sim3 working; domain ATE ≈0.36 m)  
 Skips: _(none)_  
-Last updated: 2026-09-05
+Last updated: 2026-09-07
 
 Living document — update in place when later work changes earlier conclusions.  
 **§1 Intent (feature) and §4 System design stay distinct — never merge.**
@@ -14,20 +14,21 @@ Living document — update in place when later work changes earlier conclusions.
 ## 1. Intent
 
 - **Customer / internal need:** Navigate indoors against a reconstruction-server prior (COLMAP + ALIKED descriptors + placed portals) while still running live SLAM so unmapped or stale regions remain usable.
-- **Framing:** Pure atlas/reloc is a poor fit for ALIKED v1 (BoW deferred) and for incomplete priors. Portals are globally unique hard anchors; prior views give soft geometric constraints; live SLAM covers novelty. Treat live odometry/map edges, prior match edges, and portal absolute factors jointly as a **pose-graph** problem (not prior-only localization).
+- **Framing:** Pure atlas/reloc is a poor fit for ALIKED v1 (BoW deferred) and for incomplete priors. **Portal short-ids are globally unique** (unambiguous live↔map association); prior views and portal geometry give **soft** geometric constraints; live SLAM covers novelty. Treat live odometry/map edges, prior match edges, and portal corner residuals jointly as a **pose-graph** problem (not prior-only localization, not a one-shot hard Sim3 pin).
 - **Why now:** ALIKED+LightGlue live stack is accepted; next product step is domain-aligned navigation with recon outputs without waiting on EigenPlaces as primary reloc.
-- **Success look like:** Offline converter turns recon output into a load-cheap prior pack; `slam_server` (or equivalent) runs live ALIKED SLAM, seeds/re-anchors via portals, adds verified prior constraints when covisible matches succeed, and publishes poses in the domain frame with graceful behavior when the prior is missing or stale. **No mesh occlusion required in v1.**
-- **Locked:** 2026-09-02 (human confirmed §1 draft).
+- **Success look like:** Offline converter turns recon output into a load-cheap prior pack; `slam_server` runs live ALIKED SLAM, gets an **approximate** domain alignment from the first usable portal sighting, keeps pose/scale honest via **weighted soft constraints** (portal corners high weight; map feature matches lower weight + robust kernel), rejects map edges that totally disagree with live SLAM, and only **explicitly** drops domain alignment on tracking loss until the next portal. **No mesh occlusion required in v1.** EigenPlaces and KF back-track into domain are later.
+- **Locked:** 2026-09-02 (human confirmed §1 draft); **framing refined 2026-09-07** (soft portals / uniqueness ≠ hard pose).
 
 ## 2. Alternatives
 
 - **Existing / partial:**
-  - **Live SLAM + portal Sim(3) only** (current `slam_server`): domain poses after QR, but no prior landmarks; drift/loss between portals; no use of COLMAP+ALIKED pack.
+  - **Live SLAM + portal Sim(3) only** (current `slam_server`): domain poses after QR, but invented/`unit_fallback` scale and frozen baseline hurt; no continuous soft map help.
+  - **Hard SE(3)/Sim3 portal factors:** over-trusts noisy screen-space QR corners; rejected 2026-09-07 in favor of 4× corner reprojection with high weight.
   - **ORB-SLAM atlas `.osa` load + Localization Mode:** save/load exists; cold reloc depends on BoW — unfit for ALIKED v1 (`loopClosing: 0`).
   - **Prior-only localization** (track solely against COLMAP): fails where recon is stale/missing — rejected by product need.
-  - **EigenPlaces as primary reloc:** useful soft retrieval later; false positives in similar rooms — not v1 primary.
-- **Comparison:** Portal-only is too weak for “navigate in recon.” Atlas/BoW is the wrong place-recog stack. Prior-only rejects novelty. EigenPlaces alone is unsafe as commit.
-- **Decision:** **Proceed** with hybrid live SLAM + offline prior pack + portal hard factors + verified prior soft edges in a pose graph. Defer EigenPlaces and mesh occlusion.
+  - **EigenPlaces as primary reloc:** useful soft absolute constraints later (loop + vs pack); not v1 primary — recon must emit descriptors first.
+- **Comparison:** Hard portal pin alone is too brittle. Atlas/BoW is the wrong place-recog stack. Prior-only rejects novelty. Soft corners + soft map matches match the uniqueness-vs-noise reality of QRs.
+- **Decision:** **Proceed** with hybrid live SLAM + offline prior pack + **soft** portal corner residuals + gated prior soft edges in a pose graph. Defer EigenPlaces, KF back-track, and mesh occlusion.
 
 ## 3. Priority
 
@@ -37,14 +38,15 @@ Living document — update in place when later work changes earlier conclusions.
 
 ## 4. System design
 
-- **Products / codebases impacted:** Rover-SLAM (`slam_server` primary); offline converter script (recon → prior pack). No reconstruction-server changes required for v1 beyond consuming its existing COLMAP/ALIKED/portal outputs.
-- **Decision (architecture):** **Design change needed — `slam_server` overlay.** Live ORB-SLAM Atlas/Tracking stays the frontend; overlay loads prior pack, runs portal + prior match factors, maintains a pose graph, publishes domain poses. Avoid deep Tracking/Optimizer rewrites in v1.
+- **Products / codebases impacted:** Rover-SLAM (`slam_server` primary); offline converter (recon → prior pack). Reconstruction-server: **later** EigenPlaces descriptor export (out of v1 scope for this bounce).
+- **Decision (architecture):** **Design change needed — `slam_server` overlay pose graph** (refine S4/S5 model). Live ORB-SLAM Atlas/Tracking stays the frontend; overlay loads prior pack, adds soft factors, maintains graph, publishes domain poses. Avoid deep Tracking/Optimizer rewrites in v1.
+- **Co-opt depth (locked 2026-09-07 — human pick 1):** **Overlay edges.** ORB-SLAM Local BA unchanged. Overlay **copies** live relative KF/frame motion (and live match / odometry links as available) into its own graph alongside soft portal corners + soft prior 3D→2D; optimizes **live↔domain Sim(3)** / domain nav poses there. **No write-back** of prior/portal corrections into Atlas KF poses or map points in v1. Joint BA and hybrid write-back deferred.
 - **Constraints:**
   - Offline converter preferred (heavy covisibility/descriptor baking at convert time; cheap load).
   - No mesh occlusion in v1.
-  - EigenPlaces deferred.
+  - EigenPlaces deferred (v1.x+); when added, absolute visual constraints for slam loop closure **and** vs pack.
   - ALIKED+LightGlue live path remains default.
-  - Atlas may contain **multiple live maps** after tracking loss (ORB-SLAM3 `CreateNewMap`).
+  - Atlas may contain **multiple live maps** after tracking loss (`CreateNewMap`).
 - **Interfaces / boundaries:**
   - **Prior pack on disk (locked 2026-09-02 — full match-partner pack):** converter writes everything needed for covisible prior matching without recomputing COLMAP tracks at load time:
     - **Images:** id, path or blob ref, intrinsics, pose in prior/domain frame (as recon provides), optional thumbnail.
@@ -53,93 +55,155 @@ Living document — update in place when later work changes earlier conclusions.
     - **Point tracks:** 3D points + observation lists (image id, kpt index) so the overlay can project/verify geometry, not only 2D match.
     - **Portals:** short ids + domain poses + size (may reference existing portal manifest or embed a copy).
     - **Manifest / index:** version, coordinate frame notes, file layout for mmap-friendly load.
-  - Overlay pose graph: live KF/frame nodes (per map), prior relative/absolute factors, portal absolute factors, **per-map** live↔domain Sim(3) when pinned.
+  - Overlay pose graph: live KF/frame nodes (per map); **soft** portal corner residuals; **soft** prior 3D→2D match residuals; optional later EigenPlaces absolute factors; **per-map** live↔domain Sim(3) seed / gauge (approximate, continuously refined — **never freeze scale fully**).
   - Trajectory/status API follows multi-map publish policy below; overlay nav pose vs raw SLAM for debug.
-- **Risks / unknowns:**
-  - Disconnected live maps keep independent gauges until portal/prior pins them to domain.
-  - Prior/live disagreement in stale regions → robust kernels / gate prior edges.
-  - Overlay vs internal SLAM can diverge; publish overlay as navigation pose.
-  - Pack size / load time for large recon — converter may shard; v1 can require “venue-sized” packs.
-  - **Dynamic scenes (people / moving objects):** classic monocular SLAM (ORB-SLAM lineage) assumes a mostly static world; live tracking can degrade when people walk through the frame. **Locked out of scope for Rover-SLAM v1 (2026-09-05):** no person masks, no dynamic-object filtering, no design change — accept as known paper/stack limitation. Prior soft edges may still favor static structure when reproj gates pass, but that is incidental, not a dynamics solution.
-- **Multi-map output (locked 2026-09-02):**
+- **Factor model (locked 2026-09-07 — bounce; live edges + PnP seed clarified same day):**
+  - **Live SLAM relative motion (first-class, overlay copy):** frame→frame / KF→KF movements from the live tracker become **overlay pose-graph edges** (odometry / relative SE3 or Sim3 as appropriate), not merely a disagreement oracle for prior edges. They keep domain alignment coherent when prior/portal factors are sparse or rejected. Live Atlas still owns its own Local BA; overlay does not replace it.
+  - **Live inter-frame matches (first-class, overlay copy):** 2D–2D features matched between live SLAM frames (temporal / covisible KF pairs) are mirrored into the overlay when useful. Prefer summarizing them as relative-pose / match-support edges (or 2D–3D–2D-derived relative constraints) **in the overlay**; true joint BA of live map points with prior residuals is **out of v1** under overlay-edges co-opt.
+  - **Portal identity:** 1:1 short-id match between live detection and pack portal is **unambiguous**.
+  - **Domain seed / prior-match enable (locked):** **One** live portal detection whose short-id exists in the domain pack **and** whose **PnP succeeds** is enough to seed approximate live↔domain alignment and **start searching for reprojected prior map feature matches**. Do not wait for multiple portals or a long soft-corner accumulation before enabling prior match search.
+  - **PnP is fallible (expected):** extreme angles, bad corners, or solver failure → **no seed that frame**; keep live SLAM only and retry on later detections. Failed PnP must not invent scale or force a pin.
+  - **Portal geometry stays soft after seed:** successful PnP is a **bootstrap / enable gate**, not a frozen hard SE(3)/Sim3 factor for the rest of the session. After seed, keep **4× corner 3D→2D** residuals at high weight and refine continuously with prior matches + live edges; **never fully freeze scale**.
+  - **Portal corner residuals (high weight / low covariance):** for each of the **4 corners**, residual is **3D→2D reprojection**: domain 3D corner from catalog pose + `physicalSize` → project with live camera; compare to detected image pixels. Much higher weight than map matches.
+  - **Prior map feature residuals (lower weight + Cauchy):** once seeded, domain point-cloud / track 3D (pack) matched via descriptors (and/or reprojection proximity) to live frame features; residual **3D→2D** pixel error. Lower weight than portal corners; **Cauchy** (or equivalent) robust kernel.
+  - **Overlay joint residual set (locked):** in the **overlay** optimizer: copied live relative (+ live match links) + soft portal corners + soft prior 3D→2D — solved together for domain Sim(3) / nav poses so domain alignment cannot yank free of live trajectory cost. Live Local BA remains separate and prior-agnostic.
+  - **Reject prior map edges in total disagreement with live SLAM opinion** (gate before / instead of adding the soft prior edge) — do not let a bad prior match yank the graph. Live edges themselves are not “gated away” by the prior.
+  - **Continuous refinement (locked — anti-mono-drift):** beyond the one-PnP seed, **keep accumulating and re-optimizing constraints** on the pose graph over time (more portal corner sightings, more gated prior 3D→2D matches, ongoing live relative + live match edges). That growing constraint set is how domain pose/scale stay accurate as the session lengthens — the explicit mitigator for **drift that pure monocular SLAM alone** would otherwise accumulate (scale/pose walk). Seed is the enable gate; refinement is the steady-state.
+  - **Scale (locked 2026-09-07 bounce S5′e):** Sim(3) **scale and rotation emerge only** from portal corner 3D→2D reprojection residuals (pack portal placed poses + detected corners) and prior soft map edges in `refineSim3`. **No parallel scale/R estimators** — no apparent-depth, QR baseline pairs, local-point scale, seed-band clamps, provisional snaps, or PnP overwrite on later sights. First portal sight: PnP seeds R + t with gauge `scale=1.0` (`pnp_seed_init`); corner factors + free R/t/s refine. Later sights: append corners + refine only. `live_edge` refine may hold R+scale (relative continuity only; must not set absolute gauge). Scale clamped only to absolute `[kMinScale, kMaxScale]`.
+  - **Drift without explicit detector:** if pose leaves the prior, prior matches go bad → effectively fall back to live SLAM until another portal, matches recover, or tracking loss. **No dedicated “drift detector” in v1** — starvation of prior factors is the signal.
+  - **Domain alignment lifetime:** keep domain alignment across soft-match starvation. **Explicitly clear** domain alignment only when **SLAM loses tracking** (new atlas map) until the next successful portal PnP re-seeds domain.
+- **Multi-map output (locked 2026-09-02; still valid):**
   - **Active map not domain-aligned:** emit **active map only**. Withhold previously domain-aligned maps so the client demo sees them “disappear” → tracking loss is obvious.
   - **Active map domain-aligned:** emit a **merge of all maps that have a domain pin**, all in domain coordinates. Re-pinning after loss restores prior domain-aligned segments alongside the new map.
   - Never silently merge unaligned maps into domain.
-- **Between portals (design consensus):** select covisible prior images via adj + pose proximity; LightGlue vs live ALIKED; gate with track reprojection; soft pose-graph edges — no whole-cloud dump, no mesh occlusion.
+- **Between portals (design consensus, refined 2026-09-07):** after **one successful portal PnP** vs a pack portal, select covisible prior images via adj + pose proximity; LightGlue / reprojection vs live ALIKED; gate with track reprojection **and** disagreement-with-SLAM reject; soft 3D→2D edges with Cauchy — no whole-cloud dump, no mesh occlusion. Before any successful PnP: **no** prior-match search.
 - **Recovery ladder (design consensus):** reject bad frames → local recover → pose-prior reloc → portal → EigenPlaces later.
-- **Decision (locked 2026-09-02):** design change needed — `slam_server` overlay + multi-map publish policy + full prior pack (images/kpts/descs/covis/tracks/portals).
+- **Deferred (explicitly not v1):**
+  - Back-track previous live keyframes into domain + soft prior when a portal is seen after long VO-only stretch (so whole trajectory ends in domain).
+  - EigenPlaces absolute constraints (slam loop + vs pack); reconstruction-server must emit EigenPlaces descriptors.
+- **Per-keyframe Sim(3) pose graph (locked 2026-09-07 — bounce S10; supersedes the single per-map Sim(3)):**
+  - **Why bounce:** after S9 the VO trajectory is accurate to **2.9 cm** but portal-domain is **17.2 cm**, and the overlay still fits `scale=0.5131` where the true Umeyama scale is **0.9685**. A single global Sim(3) has one scalar to absorb *accumulating monocular scale drift*, so it fits a compromise that is wrong everywhere. Scale drift is a per-keyframe quantity and needs a per-keyframe parameter. Human direction: bundle-adjust per keyframe rather than align by one Sim3.
+  - **Vertices:** one **Sim(3) per live keyframe**, `S_iw` (domain→camera i), initialised from the current pin as `S_pin ⊗ T_cw_slam` with **scale 1**. This mirrors ORB-SLAM3's own monocular scale-drift model in `Optimizer::OptimizeEssentialGraph` (`VertexSim3Expmap`, `_fix_scale=false`).
+  - **Relative edges:** `S_ji = S_jw · S_wi` composed from the **current Atlas** keyframe poses (not from stale snapshots). Because both endpoints start at scale 1, the measurement has scale 1 and asserts *relative* geometry; per-vertex scales are then free to differ, which is exactly how drift is absorbed while edges resist local deformation.
+  - **Edge information (deliberately not identity — ORB-SLAM3 uses `matLambda=I` only because it runs this once at loop closure):** rotation `1/σ_rot²` scaled by covisibility weight; translation **relative**, i.e. normalised by `|t_ji|`, because monocular translation error is proportional to translation magnitude; log-scale `1/σ_logs²` at ~1–2 % per edge so scale may drift slowly along a chain but not jump.
+  - **Graph topology:** sequential/spanning-tree edges **plus covisibility edges** (`GetCovisiblesByWeight`). A chain alone has no rigidity — one portal constraint would swing the whole tail. Loop edges are unavailable (`loopClosing: 0`).
+  - **Absolute edges:** portal corner and prior-soft 3D→2D residuals retarget from the single pin to the **observing keyframe's vertex**, unchanged in form (still pixels).
+  - **Dense poses are NOT vertices:** non-keyframes attach to their reference keyframe and are reconstructed post-solve as `S_cw = T_cr ⊗ S_rw` (ORB-SLAM3 already stores `T_cr` in `mlRelativeFramePoses` / `mlpReferences`). They carry no independent information (their observations are already summarised in the reference KF) and would be optimizer leaves. **When composing, the reference keyframe's scale must be applied to `T_cr`'s translation** (`t_cr_domain = s_r · R · t_cr`) since `T_cr` is in SLAM units. Exception: an observation landing on a non-keyframe is attached to its reference KF through the fixed `T_cr`, not promoted to a vertex.
+  - **Gauge:** do **not** fix a keyframe (ORB-SLAM3 pins the init KF; here that would fight the prior). Absolute portal/prior edges define the gauge in domain coordinates. Require ≥1 absolute constraint before solving; weak prior on the first KF only as fallback regulariser. Keep logging the smallest Hessian eigenvalue and which parameter dominates the null direction — with zero absolute constraints the system is singular, and with one portal sighting it is still singular **in scale**.
+  - **Solver:** dense Levenberg–Marquardt on the stacked `7N` state. At the holdout's ~30–60 keyframes that is 210–420 parameters, so a dense factorisation is microseconds-to-milliseconds and no sparse solver is warranted; guard with a keyframe cap that freezes older vertices beyond it.
+  - **Stale-snapshot fix (folded in):** today every factor freezes the SLAM pose at observation time (`PortalCornerFactor::Twc_slam`, `LiveRelativeEdge::Twc_from/to_slam`) while local BA keeps moving those keyframes afterwards. Factors now store a **keyframe id** (plus `T_cr` when observed on a dense frame) and read the pose from the vertex.
+  - **Falls out for free:** per-keyframe vertices spanning multiple Atlas maps + portal constraints is the machinery for **S7 KF back-track** — maps currently withheld can land in domain once any of their keyframes earns an absolute constraint.
+- **Supersedes (2026-09-07):** “portal hard factors” / `unit_fallback` scale=1 publish / fully frozen `held_stationary` scale as the long-term model. **S10 supersedes the “overlay edges, single per-map Sim(3)” co-opt** locked earlier the same day: the overlay still owns its own graph and still does **no Atlas write-back**, but its state is now per-keyframe Sim(3) rather than one Sim(3) per map. **Seed** = one successful portal PnP overlapping the domain pack (not multi-portal wait, not invented scale=1); seed enables prior match search and is then refined — not frozen.
+- **Decision (locked 2026-09-02; factor model bounced 2026-09-07; co-opt locked same day):** `slam_server` **overlay edges** + multi-map publish policy + full prior pack; copy live relative/match links into overlay; **one-PnP seed → continuous soft constraint accumulation** (portal corners + Cauchy prior matches) as the mono-drift mitigator; scale never fully frozen; domain cleared on tracking loss only; **no Atlas write-back in v1**.
 
 ## 5. Verification design
 
-- **Depth (locked 2026-09-02):** lean — static/API/schema checks by agents; **human demo** owns multi-map disappear / reappear UX and “feels navigable between portals.”
-- **End-to-end acceptance (v1):**
+- **Depth:** lean agent checks + **required** holdout scan replay vs prior pack; human demo still owns disappear/reappear.
+- **End-to-end acceptance (v1, refined 2026-09-07):**
   1. Converter produces a valid prior pack (manifest + images + kpts/descs + covis adj + tracks + portals) from a small fixture recon (or documented sample).
-  2. `slam_server` loads the pack without crashing; status/API reports pack loaded (image/track counts or equivalent).
-  3. Without domain pin: trajectory/status emits **active map only** (aligned history withheld).
-  4. After portal (or equivalent) pin: poses publish in domain frame; when active map is aligned, **all domain-pinned maps** appear merged in domain coords.
-  5. After tracking loss (new map, not yet pinned): previously aligned maps **disappear** from client feed; after re-pin they **return** with the new map — human confirms in demo app.
-  6. At least one gated prior soft edge path is observable in logs/status when live↔prior LightGlue+reproj succeeds (may be off by default until slice lands — then assert field/counter > 0 on fixture).
-- **Agent checks (per slice / integrate):**
-  - Schema: pack files/fields present; loader rejects corrupt/missing required parts with a clear error.
-  - API contract: multi-map publish rules encoded in JSON (or equivalent) match §4; unit/static review if no automated client.
-  - Regression: existing portal-only / no-pack `slam_server` path still starts and tracks (no prior required).
-- **Human checks:** phone/`index.html` (or equivalent) demo — lose track → history vanishes; re-scan portal → history + new segment in domain; brief walk where prior should help (qualitative only).
-- **Out of scope for v1 verify:** EigenPlaces, mesh occlusion, quantitative ATE vs COLMAP, large-venue pack perf SLOs, CI GPU gate on every PR, **dynamic-object / people robustness** (no demo requirement under foot traffic).
-- **Decision:** lean §5 locked 2026-09-02.
+  2. `slam_server` loads the pack; status reports pack loaded.
+  3. Without domain alignment: trajectory emits **active map only**.
+  4. After **first successful portal PnP** (pack-overlapping short-id): approximate domain seed → prior-match search may run; poses publish in domain; **no `unit_fallback` / scale=1 pin**; failed PnP frames do not seed.
+  5. Tracking loss → domain cleared for new map; history withheld until next portal.
+  6. Prior soft edges: accepted when gated match OK; **rejected** when in total disagreement with SLAM; counter/logs observable.
+  7. Soft-match starvation alone does **not** clear domain alignment (only tracking loss does).
+  8. **Holdout scan replay vs map pack (required):** replay the existing holdout scan through `slam_server` with the prior pack loaded (same harness family as `scripts/_replay_holdout_timestamps.py` / `eval_holdout_pose_accuracy` / `eval_portal_domain_vs_vo.py`). **Must work end-to-end** (seed, track, publish). Trajectory in **domain coordinates** must look accurately aligned to the prior/domain GT (top-down + portal-domain ATE): **clearly better than** the old frozen/`unit_fallback` bad-scale regime (~1.4 m class failure); scale not stuck at invented 1 / ~0.84; visual “seems accurately tracking in domain” is part of pass — agent metrics + human glance of holdout plots.
+  9. Holdout metrics (soft numeric guide alongside #8): portal-domain ATE vs global GT improves vs frozen bad scale; soft edges can accept when near prior after pin.
+- **Out of scope for v1 verify:** EigenPlaces, KF back-track, mesh occlusion, dynamic people robustness, large-venue pack perf SLOs.
+- **Decision (locked 2026-09-07):** lean §5 + **required** holdout pack replay showing accurate domain tracking; overlay co-opt assumed.
 
 ## 6. Work breakdown (AI-oriented)
 
-- **Shape (locked 2026-09-02):** vertical thin slices S1→S6.
-- **Escalate / bounce:** if loader needs Tracking rewrite, pack schema can't feed LightGlue, or publish policy fights Atlas map ids → `/bounce-plan` §4 (do not silently widen).
-- **Human after verify:** S3 (disappear UX), S6 (full demo). S1–S2/S4–S5 agent-lean §5 unless blocked.
+- **Shape:** keep S1–S3 as done; **reopen S4/S5** under new factor model; add follow-on slices. S6 demo after S4′/S5′.
+- **Escalate / bounce:** if overlay needs full BA rewrite or pack schema can't feed 3D→2D residuals → `/bounce-plan` again.
 
-### S1 — Converter + prior-pack schema
-- **Goal:** Offline tool writes full pack (manifest, images, kpts/descs, covis adj, tracks, portals) from small fixture/docs recon.
-- **Deps:** none. **Agent.** Context: §4 pack schema; recon COLMAP+ALIKED layout.
-- **Done when:** fixture pack validates; missing-required fails clearly (§5.1).
+### Done (keep)
+- **S1–S3:** pack schema, load, multi-map publish policy (agent pass; S3 human UX still pending).
 
-### S2 — Pack load in `slam_server`
-- **Goal:** Optional CLI/config path loads pack; status reports counts; no-pack path unchanged.
-- **Deps:** S1. **Agent.** Context: `Examples/Monocular/slam_server.cc`.
-- **Done when:** §5.2 + no-pack regression.
+### Reopened / new
 
-### S3 — Multi-map publish policy
-- **Goal:** Trajectory/status: unaligned active → active only; aligned active → merge all domain-pinned maps in domain coords.
-- **Deps:** S2 (or reusable alignment flags). **Agent + human demo.**
-- **Done when:** §5.3–5; human confirms disappear/reappear.
+### S4′ — Soft portal corners + continuous scale seed (overlay)
+- **Goal:** Replace hard portal / frozen-scale pin with overlay factors: accumulate 4× corner 3D→2D residuals (high weight); seed approximate live↔domain Sim(3) on **one successful portal PnP**; copy live relative edges into overlay; **keep refining** corners/scale as more sightings arrive (**never fully freeze**); clear domain only on tracking loss; no `unit_fallback` publish; **no Atlas write-back**. Continuous accumulation is the mono-drift mitigator alongside S5′.
+- **Deps:** S2/S3. **Agent.** Context: `slam_server.cc`, `overlay_pose_graph`.
+- **Done when:** status/logs show factors accumulating → metric seed → continuing scale updates; holdout pin scale not stuck at 1 or ~0.84 from fallback smoothing; **holdout replay vs pack** seeds and publishes domain poses without the old bad-scale failure mode (full “looks accurate in domain” may land after S5′).
 
-### S4 — Portal pin → overlay pose graph
-- **Goal:** Overlay graph: per-map live nodes, portal hard factors, per-map Sim(3) pin; nav pose = overlay when pinned.
-- **Deps:** S3 helpful. **Agent.** Prefer thin overlay over Atlas rewrite.
-- **Done when:** portal pin → domain poses; pin state visible in API/logs.
-
-### S5 — Prior match soft edges
-- **Goal:** Covis candidate prior images → LightGlue vs live ALIKED → reproj gate → soft factors; status/counter when edges accept.
-- **Deps:** S2 + S4. **Agent.** No mesh; EigenPlaces out.
-- **Done when:** §5.6 on fixture (or documented skip + log path).
+### S5′ — Soft map matches (Cauchy) + SLAM-disagreement reject (overlay)
+- **Goal:** After PnP seed, covis prior → LightGlue → overlay 3D→2D soft edges with **lower weight + Cauchy**; **grow** the overlay constraint set over time; reject edges in total disagreement with live SLAM; do not clear domain when matches starve; still **no Atlas write-back**.
+- **Deps:** S4′ (approx domain pose). **Agent.**
+- **Done when:** `prior_soft_edges_accepted` can rise on real pack near portal; rejects logged when disagreement; soft=0 alone does not unpin; edge count can grow across a longer traverse; **§5 #8 holdout replay** shows domain tracking that looks accurate vs prior/GT (ATE + top-down).
 
 ### S6 — Human demo polish
-- **Goal:** Client/`index.html` + docs for pack path, status fields, lose/re-pin UX; ops notes.
-- **Deps:** S3–S5. **Human primary**; agent polish.
-- **Done when:** human sign-off on §5 human checks.
+- **Goal:** Client/`index.html` + docs for pack path, status fields, lose/re-pin UX; ops notes reflecting soft model.
+- **Deps:** S4′–S5′. **Human primary.**
+
+### S9 — Per-frame intrinsics through the replay harness
+- **Goal:** Stop sending one constant `X-Intrinsics` for all 580 holdout frames. Load the recorded per-frame `CameraIntrinsics.csv`, fix the transposed `cx`/`cy` in `iphoneSLAM.yaml` (fallback only), and bound Atlas camera growth now that every frame carries distinct intrinsics.
+- **Deps:** none (independent of the pose-graph work). **Agent.**
+- **Done when:** replay logs per-frame rows loaded; holdout re-runs; portal-domain and VO ATE both improve; page refreshed.
+
+### S10 — Per-keyframe Sim(3) pose graph (supersedes global-Sim3 alignment)
+- **Goal:** Replace the single per-map live↔domain Sim(3) with **per-keyframe `Sim3` vertices** and **relative `Sim3` edges**, so monocular scale drift is modelled per keyframe instead of absorbed into one global scalar. Dense non-keyframe poses are **not** vertices — they attach to their reference keyframe via `mlRelativeFramePoses` and are reconstructed after the solve.
+- **Deps:** S9 (clean intrinsics so alignment error is separable from VO error). **Agent.**
+- **Done when:** portal-domain ATE approaches VO-Umeyama ATE (the alignment no longer dominates); gauge observability logged; dense poses reconstructed without wobble.
+
+### Later (not scheduled now)
+- **S7 — KF back-track on portal:** subsumed by S10 (per-keyframe vertices across maps make this fall out).
+- **S8 — EigenPlaces:** recon emits descriptors; absolute constraints for loop + vs pack.
+- **S11 — Input aspect-ratio squash:** `Camera.width/height` is `960x1280` (portrait) while frames are `1920x1440` (landscape), so `prepareSlamImage` resizes anisotropically (`sx=0.500`, `sy=0.889`, aspect `1.333 -> 0.750`). Intrinsics scale consistently so projection stays self-consistent, but ALIKED features are extracted on a distorted image. Separate A/B.
 
 **Implement only via slice gate** (approve one | mass-approve remaining | pause).
 
 ## 7. Implementation notes
 
-- **Approvals:** Mass-approved all remaining slices (S1–S6) 2026-09-02 — implement one slice per subagent with review/verify between; re-ask only if blocked or plan bounce.
-- **Progress:** S1–S6 agent cycles complete on board. S3/S6 human disappear/reappear demo **pending** (gate).
+- **Approvals:** Mass-approved S1–S6 on 2026-09-02. **2026-09-07 bounce** invalidates hard-portal / frozen-scale assumptions in S4/S5 — **re-gate** S4′/S5′ before coding.
+- **Approvals (2026-09-07 re-gate):** Human **mass-approved all remaining** — S4′, S5′, S6. Still one implementer → review → verify per slice; no re-ask between slices unless blocked.
+- **Progress:** … **S5′ revise-2 (2026-09-07):** scale `slam_intrinsics` → `feature_intrinsics` before prior match (kpts/desc at 480×640); gate accept requires `err_live <= max_reproj_px` (prior reproj auxiliary only). Smoke 100f post-rebuild: `accepted=0` `rejected=0` (prior-only false accept at image=606 eliminated; best_inliers≤1).
+- **S5′b revise (2026-09-07):** Diagnostics in `prior_soft_edges` (`with_track`, `err_live/prior_p50`, `pass_live/prior/both`, `twc_seed_dist_m`, `mean_abs_z_live`). Smoke logs: `lg_matches≈50`, `with_track≈50`, `err_prior_p50≈0.9px`, `err_live_p50≈90px`, `twc_seed_dist_m≈0.75–1.7m` → pack tracks + LG matches OK; live `Twc_domain` offset vs pack makes `err_live` fail. **Fix:** gate inliers on `err_prior` (pack self-reproj); skip `slam_disagreement` when `mean_reproj_px≤4` (pack-consistent). Smoke 100f: `prior_soft_edges_accepted=4`, images 609/612/606/605, inliers 20–50, reproj≈1px. **Superseded for live gate** by S5′c portal-R calibration.
+- **S5′c (2026-09-07):** Root cause — manifest portal `R_pack=R_conj@M` + slam wall→QR not co-registered with M@R map: on pack image 608, QR PnP Twc **0.75m / ~120°** off COLMAP Twc (tracks self-reproj ~0.9px; portal position OK). **Fix:** exporter `calibrate_portal_rotations_to_map()` (nearest map image QR PnP → `R_delta`; HBOR 0.75m→0.005m on img608); restore `pass_prior && pass_live` + full `slam_disagreement`. Rebuilt pack + smoke 100f: `accepted=2` live-gated (1128/1135; first accept `pass_live=120`, `err_live_p50≈12.8`, `err_prior_p50≈1.2`); seed `scale=0.980075`, no `unit_fallback`.
+- **S5′c revise (2026-09-07):** Review fixes — exporter matches QR by decoded `shortId` (not `points[0]`); scans map images by distance until portal QR visible; **fail export** if seed portals HBOR/MQAU present but uncalibrated. `min_inliers` 3→4 so marginal 3-inlier accepts (err_live_p50≈85) cannot bypass `slam_disagreement` (PnP needs ≥4 obs). Re-export: both portals calibrated (MQAU img0 0.89→0.007m; HBOR img608 0.75→0.005m). Smoke 100f: **`accepted=1`** (img1128, inliers=120, err_live_p50≈12.8); marginal 3-inlier img1135 now **skip** (`best_inliers=3`); seed `scale=0.980075`.
+- **S5′d (2026-09-07):** Overlay scale/R fix — disable apparent-depth; provisional seed; baseline scale update + wide provisional band; hold R on corner refine; keep scale/t on refine fail. Holdout identity map0 ATE **5.38 m → 2.33 m**; path ratio ~5.6× (was ~6×); seed `provisional_unity`→`portal_camera_baseline` scale≈0.805. **Superseded by S5′e** (parallel scale estimators rejected).
+- **S5′e (2026-09-07 bounce):** Human — Sim3 scale **and** rotation must emerge **only** from portal corner 3D→2D + prior soft edges; remove QR baseline / seed-band / PnP overwrite / hold-R on corner refine. First sight: PnP seed (`scale=1.0`, `pnp_seed_init`) + free `refineSim3`; later sights: corners + refine only. `kMaxCornerRmsePx`→80.
+- **Human (2026-09-07):** chose **deeper soft-match debug** (option 1) after revise-2. Finding → pack tracks not consistent with ALIKED features; awaiting next path (rebuild tracks / change gate / filter).
+- **Human (2026-09-07):** keep pack in **OpenGL/domain** (offline conversion in packer, not live). Approved **S5′b**: fix exporter to world remap `R'=M R`, `t'=M t`, `P'=M P` (not componentwise/`M R M` conjugation); same rule for portals; self-reproj gate; rebuild pack → S5′ smoke.
+- **Human (2026-09-07):** after S5′b verify fail (`accepted=0`), chose **debug soft-edge gate** (option 1) — not close packer-only / bounce.
+- **S5′b (2026-09-07):** Exporter `export_colmap_h5_to_recon.py` — images/tracks `R'=M R`, portals `R_pack=R_conj@M`; self-reproj gate (p50≤2px, frac&lt;12px≥0.95). Rebuild → `out/recon_verify_slice_b` + `out/prior_pack_map_refined`.
+- **Bounce log:**
+  - **2026-09-07:** Evidence — holdout portal pin scale bugs (`unit_fallback`→0.84, frozen scale, ~1.4 m domain ATE). Human direction — treat as growing soft pose-graph constraints; QR uniqueness ≠ hard pose; 4× corner high weight; map matches Cauchy lower weight; never freeze scale; domain clear only on tracking loss; defer KF back-track + EigenPlaces. Stage → 4-design; S4/S5 reopened as S4′/S5′.
+  - **2026-09-07 (same day):** Human — factor set must also include **frame→frame SLAM motion** and **2D–2D live matches** (prefer **2D–3D–2D**, co-optimized in BA). §4 factor model updated; co-opt depth (overlay copy of live edges vs joint BA rewriting Tracking/Local BA) still open.
+  - **2026-09-07 (same day):** Human — **one** pack-overlapping portal detection with **successful PnP** is enough to seed domain and **start reprojected prior map feature matching**; PnP failures (angles / solver) simply skip seed that frame. Soft corners + matches refine after; not a frozen hard pin.
+  - **2026-09-07 (same day):** Human — after seed, **keep refining the pose graph with more constraints** over time so accuracy holds and **monocular-SLAM-only drift** is mitigated; not a one-shot alignment.
+  - **2026-09-07 (same day):** Human — co-opt depth = **overlay edges** (option 1): Local BA unchanged; copy live links into overlay; optimize domain Sim(3)/nav there; no write-back. Joint BA / hybrid deferred.
+  - **2026-09-07 (S5′e):** Human — remove all parallel scale/R estimators; corner + prior-soft residuals only for absolute Sim3 gauge; PnP is first-sight seed init only.
 
 ## 8. Verification record
 
 - **S1:** pass — fixture pack validates; missing `tracks.json` / manifest rejected clearly.
 - **S2:** pass — loader + status `prior_pack` counts; WSL harness load of fixture; slam_server startup SKIP (vocab).
 - **S3:** pass (agent) — `multi_map_publish` policy fields encode §4; **human disappear UX pending**.
-- **S4:** pass after compile retry (`mutable alignment_mutex_`); overlay/nav_pose/pose_source in API; slam_server builds on WSL.
-- **S5:** pass — `overlay.prior_soft_edges_accepted` wired; fixture smoke did not increment on synthetic geometry (`lightglue_unavailable` / reproj); increment path present.
-- **S6:** pass (docs/legend); **human phone walk pending**.
+- **S4:** pass under **old** hard-pin model — **superseded by S4′** after 2026-09-07 bounce.
+- **S4′:** **pass** (2026-09-07 re-verify after scale-stability fix) — holdout `run_holdout_prior_pack_replay.sh` (580 frames, `prior_pack_map_refined`, binary 14:08): PnP seed frame 1 `HBORRXLUOD6` `scale=0.980075` `portal_pnp_apparent_depth`, no `unit_fallback`; factors accumulate (`corner_factors=40`, `live_edges=99`, `opt_passes=22`); scale holds `0.98→1.10` (no ~0.1 / ~0.84 collapse); `corner_rmse_px` max ~822 (not thousands). Map switch clears active domain (`map_id=4` unpinned; map0 withheld). §5 #8 domain accuracy PARTIAL until S5′. Evidence: `out/holdout_prior_pack_replay_s4prime_verify/`.
+- **S5′:** **implement done** (2026-09-07) — Cauchy prior 3D→2D in overlay refine; grow soft-factor buffer (512); `slam_disagreement` reject + `prior_soft_edges_rejected` status; seed covis image after portal PnP; prior match only when map pinned. `cmake --build build --target slam_server` OK. **Verify FAIL (2026-09-07):** holdout `out/holdout_prior_pack_replay_s5prime_verify/` — `prior_soft_edges_accepted=0`, all skips `no_gated_match`. **Revise pass (2026-09-07 smoke):** root causes — (1) LightGlue `image_width/height` was `slam_image` 960×1280 not feature space 480×640; (2) reprojection gate rejected all tracks with OpenGL negative-z; (3) live-only gate too strict vs pack map consistency — dual live+prior reproj + match-pair iteration; `max_candidates` 3→8. Smoke 100f: `accepted=1` image=606 inliers=3 reproj≈6.4px; full 580f §5 ATE still for verifier.
+- **S5′ deeper debug (2026-09-07, human chose option 1):** After scaling intrinsics to feature space + requiring `err_live<=max_reproj_px`, smoke `accepted=0` with `lg_matches≈50` but `best_inliers≤1` (log: `out/holdout_prior_pack_replay_s5prime_smoke/`). Offline audit of `prior_pack_map_refined` image 606: **~98% of track↔ALIKED keypoint observations fail self-reproj at 12px** (signed Twc: p50≈442px, only ~2% &lt;12px; a few lucky &lt;8px explain the earlier prior-only false accept). Converter is a straight copy — pack inherits recon track/feature inconsistency. **Conclusion:** soft-edge gate is behaving correctly; **pack tracks are not reliably tied to packed ALIKED features**, so §5 #8 cannot pass until pack/recon track association is fixed or the gate stops depending on those indices.
+- **Root-cause refine (2026-09-07):** Human guessed global-combined COLMAP vs local-only ALIKED. **Falsified for association:** on job `…50ca9b6a…-complete`, global `refined_sfm_combined` image `…13-40-15_000010.jpg` vs local `features.h5`: COLMAP `xy`↔h5 row p50≈0.71px (all &lt;3px); COLMAP self-reproj p50≈0.93px (100% &lt;12px). **Confirmed packing bug:** same observations after exporter `convert_*_colmap_to_opengl` on Twc + XYZ → self-reproj collapses (p50≈500px, ~1% &lt;12px). Pack pose matches exporter math exactly. **Recommend fix in Rover-SLAM packing exporter (frame policy), not reconstruction-server node.** Prefer keep images/tracks in COLMAP/OpenCV domain + convert portals OpenGL→COLMAP (or equivalent one projection-friendly domain); add exporter self-reproj gate.
+- **S5′b fix (2026-09-07):** Exporter now uses `R'=M R` (not conjugation); portals `R_pack=R_conj@M`; self-reproj gate on export. Rebuilt `out/recon_verify_slice_b` → `out/prior_pack_map_refined`; gate p50≈0.91px frac&lt;12px=1.0; image 608 (`…13-40-15_000010.jpg`) p50≈0.93px (929 obs, was ~500px). Re-run S5′ smoke: `scripts/run_holdout_prior_pack_replay.sh` with refreshed pack.
+- **S5′b revise (2026-09-07):** Gate diagnostics on smoke 100f (`scripts/run_s5prime_smoke_100.sh`): `lg_matches≈50` `with_track≈50` `err_prior_p50≈0.9px` `err_live_p50≈90px` `twc_seed_dist_m≈0.75–1.7m` `pass_prior≈50` `pass_live≈0`. Pack + LG OK; `err_live`-only gate + pin-offset `slam_disagreement` blocked all accepts. **Fix:** gate inliers on `err_prior`; skip disagreement when `mean_reproj≤4px`. Smoke: **`prior_soft_edges_accepted=4`** (images 605/606/609/612, 20–50 inliers, reproj≈1px). **Verify PASS** (independent re-smoke accepted=3; packer p50≈0.91px). Full §5 #8 580f ATE deferred to broader S5′. **Superseded for live gate** by S5′c.
+- **S5′c (2026-09-07):** Portal catalog R misaligned with M@R map (QR PnP Twc 0.75m off img608; tracks OK). Exporter `calibrate_portal_rotations_to_map()`; restored `pass_live` gate + `slam_disagreement`. Smoke 100f: `prior_soft_edges_accepted=2` (1128/1135), `pass_live=120`/`3`, `err_live_p50≈12.8`/`85`, `err_prior_p50≈1.2`/`2.1`; portal seed `scale=0.980075` no `unit_fallback`. HBOR calibrated at export; MQAUVO7PXZ1 QR not on nearest image.
+- **S5′c revise (2026-09-07):** Exporter QR shortId match + distance-ranked image scan; seed portal export gate; `min_inliers=4`. Smoke 100f: **`prior_soft_edges_accepted=1`** (1128 only; 1135 3-inlier marginal rejected); both seed portals calibrated at export.
+- **S5′c verify (2026-09-07):** **PASS** — review approve after revise; verifier: HBOR/MQAU calibrated (Twc residual ~0.005–0.007 m); dual `pass_prior&&pass_live` + `slam_disagreement` for ≥4 inliers; smoke live-gated accept img1128.
+- **S5′ §5 #8 full holdout (2026-09-07):** `scripts/_run_s5prime_full_holdout_and_serve.sh` — 580f timestamped replay + global GT. Soft edges **accepted=2** (rejected=0); portal seed `scale=0.980075` `portal_pnp_apparent_depth`, no `unit_fallback`. **Identity portal-domain ATE median ≈5.38 m** (map0, 102 matched) — still worse than old ~1.4 m bad-scale regime; VO Umeyama median ≈9.8 cm / domain-Umeyama ≈9.8 cm. Soft factors present (`prior_soft_edge_count=2`) but do not pull identity domain alignment to GT. Artifacts: `~/build/holdout_pose_eval_s5prime_softgate/`, `out/holdout_prior_pack_replay_s5prime_verify/`, A/B page `out/holdout_pose_eval/` served on **`:8080`** (EVAL_HTTP:200).
+- **S5′d verify (2026-09-07):** Iter 2: scale from **longest QR camera-in-portal pair** → **scale≈0.226** `portal_qr_baseline`; identity map0 ATE median **≈0.58 m**. **Superseded by S5′e** (parallel estimators removed).
+- **S5′e verify (2026-09-07):** Corner-driven Sim3 only — first sight `pnp_seed_init` scale=1.0 → `corner_refine` scale≈1.04; no QR baseline / seed-band / hold-R. Holdout map0 identity ATE median **≈10.35 m** (101 matched); soft_edges=2; `:8080` EVAL_HTTP:200. Scale stuck ~1× — root cause: broken `refineSim3` Jacobians (scale sign/log-param; rotation J ignored 3D point).
+- **S5′e revise (2026-09-07):** Fix corner/prior-soft ∂p_cam/∂(ω,log s,t); skip near-duplicate portal sights (`kMinPortalSightBaselineSlam`); LM + line search; **do not reject portal refine on high initial RMSE** (that blocked scale pull-down). Holdout: scale `1→~0.17` `corner_refine`; identity ATE median **≈0.36 m**; soft_edges accepted=4; `:8080` EVAL_HTTP:200.
+- **S9 (2026-09-07):** **pass** — root cause: replay sent one constant `[1335.984,1335.984,716.9096,963.1064]` for all 580 frames. `CameraIntrinsics.csv` holds 580 rows, **all unique** (`ts,fx,fy,cx,cy,w,h`, native 1920×1440). Measured: `cx` off **−245.7 px**, `cy` off **+237.6 px**; swapping them leaves **+0.5 px / −8.6 px**, i.e. `iphoneSLAM.yaml` assigned `cx`/`cy` **transposed** vs its own cited source row. Residual `fx` **−7.23%** because that row came from a different scan (ts 79219 vs holdout 60247). Real per-frame spread: `fx` 2.11% (autofocus), `cx` 4.3 px, `cy` 6.2 px. Fixes: per-frame loader + replay plumbing (`eval_holdout_pose_accuracy.py`, `_run_s5prime_full_holdout_and_serve.sh`, `_replay_holdout_timestamps.py`, `run_s5prime_smoke_100.sh`), YAML transposition corrected (fallback only), 1 px quantized camera cache in `Tracking.cc` to bound Atlas growth (~580 unique → few dozen), ownership fix so the allocator frees on `AddCamera` dedup (`delete` inside `Atlas::AddCamera` was unsafe — two call sites pass `Settings`-owned cameras). **Results:** portal-domain map0 ATE median **0.36 m → 0.1725 m**; VO Umeyama median **0.098 m → 0.0291 m**; atlas maps 4 → 2 (fewer tracking losses); Umeyama scale 0.9685; `unit_fallback=0`; soft edges accepted 4 / rejected 1. Page refreshed on `:8080` (EVAL_HTTP:200).
+- **S10 STOPPED (2026-09-07) — single Sim(3) is NOT the limitation on this holdout.** Before finishing S10, measured whether one global Sim(3) can even represent the holdout trajectory (`scripts/_probe_single_sim3_sufficiency.py`): for the **same published poses**, best-possible Umeyama Sim(3) gives **map0 8.4 mm** (n=92) and **map1 29.3 mm** (n=337), versus direct domain output of **132.7 mm** and **4288.5 mm**. A single Sim(3) per map is therefore *sufficient* here — there is no meaningful intra-map scale drift over 580 frames / ~58 s, so per-keyframe Sim(3) vertices would not have moved these numbers. The error is **estimator error, not model error**. S10 stays correct in principle (drift grows with session length) but is **not** the top priority; re-open when sessions get long enough for drift to exceed the estimator error.
+- **Dominant error found instead (2026-09-07):** `scripts/_probe_map1_publish.py` — **map 1 (337 poses, 79 % of the trajectory) is published RAW into the domain-labelled trajectory**: `max|domain − raw| = 0.000000 m`, i.e. no domain transform applied at all, hence 4.29 m from GT. Map 1 is never pinned (`pinned_map_ids=[0]`, `scale=None`) because no portal is sighted in it and prior soft edges never seed it. The `?all_maps=1` response silently mixes coordinate frames — pinned maps in domain, unpinned maps in raw SLAM — with no per-pose marking, which contradicts §4 "Never silently merge unaligned maps into domain". The eval only scored map0, so this stayed invisible.
+- **Revised priority (2026-09-07):** (1) pin map 1 — cross-map constraint or portal/prior re-seed after tracking loss; this is ~97 % of the remaining error; (2) mark or exclude unaligned maps in the `all_maps=1` response so mixed frames cannot be scored as domain; (3) map0's residual 132.7 mm vs 8.4 mm achievable is the corner-driven Sim(3) landing wrong in R/t (scale is close: 0.5131 fitted vs 0.4665 optimal, ~10 %) — the known single-sighting observability problem; (4) S10 per-keyframe graph, deferred.
+- **S10 code state (2026-09-07):** implementer left a **partially-working, crashing** per-keyframe implementation in `overlay_pose_graph.{h,cc}`, `slam_server.cc`, `System.{h,cc}`, `prior_soft_edges.cc` — multi-vertex LM never runs (short-circuits to single-vertex anchor refine), observability probe disabled with `&& false`, and `resolveSightAnchor` **invents** an anchor (falls back to `keyframes.back()` then id 0 with identity `T_cr`) instead of rejecting an unresolvable observation, which is the likely cause of the ~frame-18 abort. Cannot be reverted with `git checkout` — nothing since S5′ is committed, so these files carry ~2.2 k lines of entangled uncommitted S5′a–e work. **Commit a restore point before touching.**
+- **S9 open gap (superseded by the S10-stopped entry above):** VO is now **2.9 cm** but portal-domain is **17.2 cm**, so alignment error now dominates VO error by ~6×. Overlay Sim3 still lands `scale=0.5131` (`corner_refine`) while the true VO Umeyama scale is **0.9685** — the single global Sim3 is still absorbing per-keyframe scale drift into one wrong scalar. Exactly the failure S10 replaces.
+- **S5:** pass under **old** soft-edge wiring — **superseded by S5′** after bounce.
+- **S6:** pass (docs/legend); **human phone walk pending** (refresh after S4′/S5′).
 
 ## Gate (stage 11)
 
-- **Decision:** _(pending)_  
-- **Notes:**
+- **Decision:** _(pending — bounce mid-flight)_  
+- **Notes:** Re-confirm §4 factor model; approve S4′ then S5′ (or mass-approve remaining).

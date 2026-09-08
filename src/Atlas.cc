@@ -167,6 +167,8 @@ GeometricCamera *Atlas::AddCamera(GeometricCamera *pCam)
         }
     }
 
+    // Does not take ownership on a dedup hit: some callers pass a Settings-owned
+    // camera. Callers that allocated pCam must free it when the return differs.
     if (bAlreadyInMap)
     {
         return mvpCameras[index_cam];
