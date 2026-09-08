@@ -164,14 +164,37 @@ public:
 
     json statusJson(unsigned long active_map_id) const;
 
+    /**
+     * Runtime refine knobs (holdout sweeps).
+     * age_tau_sec <= 0 disables age decay (weight=1).
+     * Otherwise w = (1 + age_sec/tau)^(-power) with age_sec = Δframe/30.
+     */
+    void setRefineBalance(float portal_sight_equivalent_soft_edges,
+                          float age_tau_sec,
+                          float age_power);
+
+    float portalSightEquivalentSoftEdges() const { return portal_sight_eq_; }
+    float ageTauSec() const { return age_tau_sec_; }
+    float agePower() const { return age_power_; }
+
 private:
     static constexpr size_t kMaxPortalCornerFactorsPerMap = 512;
     static constexpr size_t kMaxPriorSoftFactorsPerMap = 512;
     static constexpr size_t kMaxPriorSoftObservationsPerFactor = 64;
-    static constexpr float kPortalCornerBaseWeight = 10.0f;
+    /** Per-corner base at reproj_px=1; 4 corners ≈ one soft edge at ~25 inliers before sight scale. */
+    static constexpr float kPortalCornerBaseWeight = 2.5f;
     static constexpr float kPriorSoftBaseWeight = 2.0f;
+    /** Default: one portal sight ≈ this many soft edges at kPriorSoftBaseWeight*sqrt(25). */
+    static constexpr float kDefaultPortalSightEquivalentSoftEdges = 8.0f;
+    /** Default age profile ≈ prior 1/(0.5+0.5*age) shape (tau=1,power=1 → 1/(1+age)). */
+    static constexpr float kDefaultAgeTauSec = 1.0f;
+    static constexpr float kDefaultAgePower = 1.0f;
     static constexpr size_t kLiveEdgeRefineCadence = 8;
     static constexpr float kMinPortalSightBaselineSlam = 0.12f;
+
+    float portal_sight_eq_ = kDefaultPortalSightEquivalentSoftEdges;
+    float age_tau_sec_ = kDefaultAgeTauSec;
+    float age_power_ = kDefaultAgePower;
 
     struct KeyframeVertex {
         unsigned long keyframe_id = 0;
@@ -184,6 +207,8 @@ private:
         KeyframeVertex origin_vertex;
         bool has_origin_vertex = false;
         MapSim3Pin pin;
+        /** Max frame_id among portal corners and prior soft factors (for age weighting). */
+        uint64_t latest_constraint_frame_id = 0;
     };
 
     MapGraph& graphFor(unsigned long map_id);

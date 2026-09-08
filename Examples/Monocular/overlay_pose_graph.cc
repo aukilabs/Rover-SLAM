@@ -53,6 +53,19 @@ float cauchyWeightFromSqError(float sq_err, float c_sq)
     return 1.0f / (1.0f + sq_err / c_sq);
 }
 
+float ageWeightFromFrameIds(uint64_t latest_frame_id,
+                            uint64_t factor_frame_id,
+                            float age_tau_sec,
+                            float age_power)
+{
+    if (age_tau_sec <= 0.0f)
+        return 1.0f;
+    const float age =
+        std::max(0.0f, static_cast<float>(latest_frame_id - factor_frame_id) / 30.0f);
+    const float power = std::max(age_power, 1e-3f);
+    return std::pow(1.0f + age / age_tau_sec, -power);
+}
+
 Eigen::Matrix3f skewSymmetric(const Eigen::Vector3f& v)
 {
     Eigen::Matrix3f m;
@@ -184,6 +197,16 @@ OverlayPoseGraph::MapGraph& OverlayPoseGraph::graphFor(unsigned long map_id)
     return maps_[map_id];
 }
 
+void OverlayPoseGraph::setRefineBalance(float portal_sight_equivalent_soft_edges,
+                                        float age_tau_sec,
+                                        float age_power)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    portal_sight_eq_ = std::max(0.1f, portal_sight_equivalent_soft_edges);
+    age_tau_sec_ = age_tau_sec;
+    age_power_ = std::max(0.0f, age_power);
+}
+
 void OverlayPoseGraph::ensureOriginVertex(MapGraph& graph)
 {
     if (graph.has_origin_vertex || !graph.pin.seeded)
@@ -206,6 +229,16 @@ bool OverlayPoseGraph::refineMapSim3(MapGraph& graph, const char* refine_source)
     std::cerr << "[overlay] refine factors corner=" << n_corner << " prior_soft=" << n_prior
               << " source=" << (refine_source ? refine_source : "") << std::endl;
 
+    const uint64_t latest_frame_id = graph.latest_constraint_frame_id;
+    // Portal sight balance: 4 corners × base ≈ portal_sight_eq_ soft edges
+    // at soft_ref = kPriorSoftBaseWeight * sqrt(25) (typical gated inlier count).
+    const float soft_ref = OverlayPoseGraph::kPriorSoftBaseWeight * std::sqrt(25.0f);
+    const float portal_sight_scale =
+        (portal_sight_eq_ / 4.0f) * soft_ref /
+        std::max(OverlayPoseGraph::kPortalCornerBaseWeight, 1e-3f);
+    const float age_tau = age_tau_sec_;
+    const float age_pow = age_power_;
+
     MapSim3Pin& pin = graph.pin;
     float last_corner_rmse = 0.0f;
 
@@ -224,8 +257,9 @@ bool OverlayPoseGraph::refineMapSim3(MapGraph& graph, const char* refine_source)
                 continue;
             const Eigen::Vector2f residual = projected - factor.pixel;
             const float sq = residual.squaredNorm();
-            const float w = factor.weight *
-                            huberWeightFromSqError(sq, kCornerHuberDeltaSq, kCornerHuberWeightFloor);
+            const float w = factor.weight * portal_sight_scale *
+                            huberWeightFromSqError(sq, kCornerHuberDeltaSq, kCornerHuberWeightFloor) *
+                            ageWeightFromFrameIds(latest_frame_id, factor.frame_id, age_tau, age_pow);
             if (w <= 1e-8f)
                 continue;
             const Sophus::SE3f Tcw = Twc_domain.inverse();
@@ -257,7 +291,9 @@ bool OverlayPoseGraph::refineMapSim3(MapGraph& graph, const char* refine_source)
                     continue;
                 const Eigen::Vector2f residual = projected - obs_pt.pixel;
                 const float sq = residual.squaredNorm();
-                const float w = factor.weight * cauchyWeightFromSqError(sq, kPriorSoftCauchyScaleSq);
+                const float w = factor.weight *
+                                cauchyWeightFromSqError(sq, kPriorSoftCauchyScaleSq) *
+                                ageWeightFromFrameIds(latest_frame_id, factor.frame_id, age_tau, age_pow);
                 if (w <= 1e-8f)
                     continue;
                 const Sophus::SE3f Tcw = Twc_domain.inverse();
@@ -387,6 +423,9 @@ void OverlayPoseGraph::addPortalCornerFactors(unsigned long map_id, const Portal
         graph.portal_corners.push_back(factor);
     }
 
+    graph.latest_constraint_frame_id =
+        std::max(graph.latest_constraint_frame_id, sight.frame_id);
+
     if (graph.portal_corners.size() > kMaxPortalCornerFactorsPerMap) {
         const size_t overflow = graph.portal_corners.size() - kMaxPortalCornerFactorsPerMap;
         graph.portal_corners.erase(
@@ -494,6 +533,8 @@ RefineResult OverlayPoseGraph::addPriorSoftEdgeFactor(unsigned long map_id,
     stored.vertex_keyframe_id = kMapOriginVertexId;
 
     graph.prior_soft_factors.push_back(stored);
+    graph.latest_constraint_frame_id =
+        std::max(graph.latest_constraint_frame_id, stored.frame_id);
     if (graph.prior_soft_factors.size() > kMaxPriorSoftFactorsPerMap) {
         const size_t overflow = graph.prior_soft_factors.size() - kMaxPriorSoftFactorsPerMap;
         graph.prior_soft_factors.erase(
@@ -623,6 +664,12 @@ json OverlayPoseGraph::statusJson(unsigned long active_map_id) const
 
     out["prior_soft_edges_accepted"] = prior_soft_edges_accepted_;
     out["prior_soft_edges_rejected"] = prior_soft_edges_rejected_;
+    out["refine_balance"] = {
+        {"portal_sight_equivalent_soft_edges", portal_sight_eq_},
+        {"age_tau_sec", age_tau_sec_},
+        {"age_power", age_power_},
+        {"age_weight_formula", "tau<=0 -> 1; else (1 + age_sec/tau)^(-power)"},
+    };
     if (!last_prior_soft_reject_reason_.empty())
         out["prior_soft_edges_last_reject"] = last_prior_soft_reject_reason_;
     if (prior_soft_edges_accepted_ > 0) {

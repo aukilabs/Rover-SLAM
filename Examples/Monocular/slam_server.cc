@@ -270,6 +270,17 @@ bool requestParamIsFalse(const httplib::Request& req, const string& name)
     return v == "0" || v == "false" || v == "no";
 }
 
+bool requestCausalTrajectory(const httplib::Request& req)
+{
+    if (req.has_param("causal") && !requestParamIsFalse(req, "causal"))
+        return true;
+    if (req.has_param("pose_history")) {
+        const string v = lowerCopy(req.get_param_value("pose_history"));
+        return v == "causal";
+    }
+    return false;
+}
+
 bool pathIsSeparator(char c)
 {
     return c == '/' || c == '\\';
@@ -1385,6 +1396,11 @@ struct ServerConfig {
     /** Accuracy vs cost tradeoff: every 5th tracked frame (holdout uses CLI override). */
     size_t prior_match_every_nth = 5;
     float portal_max_reproj_px = 8.0f;
+    /** One portal sight ≈ this many soft edges (Sim3 refine balance). */
+    float overlay_portal_soft_eq = 8.0f;
+    /** Age decay: tau<=0 disables; else w=(1+age/tau)^(-power), age=Δframe/30. */
+    float overlay_age_tau_sec = 1.0f;
+    float overlay_age_power = 1.0f;
     double processing_timeout = 5.0; // seconds
     /** UTF-8 HTML for GET /index.html (phone camera UI); empty => 404 with hint */
     string index_html_body;
@@ -1438,6 +1454,7 @@ private:
     // Incoming frames (potentially unordered arrival); worker picks smallest timestamp when buffer policy allows.
     deque<shared_ptr<ImageRequest>> image_queue_;
     condition_variable queue_cv_;
+    chrono::steady_clock::time_point last_image_enqueue_ = chrono::steady_clock::now();
     atomic<bool> processing_active_{true};
     thread processing_thread_;
 
@@ -1691,6 +1708,18 @@ private:
     unique_ptr<prior_soft::PriorSoftEdgeMatcher> prior_soft_matcher_;
     int last_prior_seed_image_id_ = -1;
 
+    struct CausalDomainPose {
+        uint64_t frame_id = 0;
+        double timestamp = 0.0;
+        unsigned long map_id = 0;
+        Sophus::SE3f Twc_domain;
+        float scale = 1.0f;
+        bool pinned = false;
+    };
+    static constexpr size_t kMaxCausalDomainPoses = 10000;
+    deque<CausalDomainPose> causal_domain_poses_;
+    mutable mutex causal_mutex_;
+
 public:
     SLAMServer(const ServerConfig& config) : config_(config), index_html_body_(config.index_html_body) {
         default_intrinsics_ = loadDefaultIntrinsics(config_.settings_path);
@@ -1720,6 +1749,14 @@ public:
         prior_match_config_.fixture_smoke = priorSoftEdgeFixtureSmokeEnabled();
         prior_soft_matcher_ =
             make_unique<prior_soft::PriorSoftEdgeMatcher>(prior_match_config_);
+
+        overlay_graph_.setRefineBalance(
+            config_.overlay_portal_soft_eq,
+            config_.overlay_age_tau_sec,
+            config_.overlay_age_power);
+        cerr << "[overlay] refine_balance portal_soft_eq=" << config_.overlay_portal_soft_eq
+             << " age_tau_sec=" << config_.overlay_age_tau_sec
+             << " age_power=" << config_.overlay_age_power << endl;
 
         if (!config_.portal_manifest_path.empty()) {
             loadPortalManifest(config_.portal_manifest_path);
@@ -3512,6 +3549,7 @@ private:
             !overlay_graph_.isMapPinned(current_map_id)) {
             overlay_graph_.clearMapAlignment(current_map_id);
             map_alignments_.erase(current_map_id);
+            // Do not clear causal history — prior maps' live domain poses remain valid for eval.
         }
 
         const auto align_it = map_alignments_.find(current_map_id);
@@ -3573,8 +3611,41 @@ private:
         return snapshot;
     }
 
+    void clearCausalDomainPoses() {
+        lock_guard<mutex> lock(causal_mutex_);
+        causal_domain_poses_.clear();
+    }
+
+    void appendCausalDomainPose(unsigned long map_id,
+                              uint64_t frame_id,
+                              double timestamp,
+                              const Sophus::SE3f& Tcw_slam) {
+        if (!overlay_graph_.isMapPinned(map_id))
+            return;
+
+        const Sophus::SE3f Twc_slam = Tcw_slam.inverse();
+        const overlay::NavPoseResult nav = overlay_graph_.navPoseFromSlam(map_id, Twc_slam);
+        if (!nav.valid || std::strcmp(nav.pose_source, "overlay") != 0)
+            return;
+
+        const overlay::MapSim3Pin pin = overlay_graph_.mapPin(map_id);
+        CausalDomainPose entry;
+        entry.frame_id = frame_id;
+        entry.timestamp = timestamp;
+        entry.map_id = map_id;
+        entry.Twc_domain = nav.Twc;
+        entry.scale = pin.scale;
+        entry.pinned = true;
+
+        lock_guard<mutex> lock(causal_mutex_);
+        causal_domain_poses_.push_back(entry);
+        while (causal_domain_poses_.size() > kMaxCausalDomainPoses)
+            causal_domain_poses_.pop_front();
+    }
+
     void clearDomainAlignmentForMap(unsigned long map_id) {
         overlay_graph_.clearMapAlignment(map_id);
+        // Keep causal domain history — it models what a device already saw; do not wipe on loss.
         lock_guard<mutex> lock(alignment_mutex_);
         map_alignments_.erase(map_id);
         if (last_synced_map_id_ != map_id)
@@ -3937,6 +4008,7 @@ private:
                 
                 // Add to processing queue
                 image_queue_.push_back(image_req);
+                last_image_enqueue_ = chrono::steady_clock::now();
                 queue_cv_.notify_one();
             }
             detector_queued = should_queue_detector && enqueueCustomDetection(image_req);
@@ -4006,6 +4078,12 @@ private:
 
         response["overlay"] = overlay_graph_.statusJson(active_map_id);
 
+        {
+            lock_guard<mutex> lock(causal_mutex_);
+            response["causal_pose_history_count"] = causal_domain_poses_.size();
+        }
+        response["trajectory_mode"] = "final_pin";
+
         const LatestSlamFrame latest = latestSlamFrameSnapshot();
         if (latest.valid) {
             const overlay::NavPoseResult nav =
@@ -4025,6 +4103,37 @@ private:
     void handleTrajectoryRequest(const httplib::Request& req, httplib::Response& res) {
         json response;
         json trajectory_json = json::array();
+
+        const bool causal_mode = requestCausalTrajectory(req);
+        if (causal_mode) {
+            lock_guard<mutex> lock(causal_mutex_);
+            for (const auto& entry : causal_domain_poses_) {
+                json pose_json = TwcToClientJson(
+                    entry.Twc_domain, entry.timestamp, entry.frame_id, false);
+                pose_json["map_id"] = entry.map_id;
+                pose_json["scale"] = entry.scale;
+                pose_json["pinned"] = entry.pinned;
+                pose_json["pose_source"] = "overlay_causal";
+                trajectory_json.push_back(pose_json);
+            }
+            response["trajectory"] = trajectory_json;
+            response["count"] = trajectory_json.size();
+            response["trajectory_mode"] = "causal";
+            response["pose_mode"] = "live_history";
+            response["pose_source"] = "overlay_causal";
+            response["coordinate_frame"] = "domain_colmap";
+            response["source"] = "overlay_causal_pose_history";
+            response["causal"] = true;
+            if (slam_system_) {
+                lock_guard<mutex> slam_lock(slam_mutex_);
+                response["map_id"] = slam_system_->GetCurrentMapId();
+            } else {
+                response["map_id"] = 0;
+            }
+            writeDebugTrajectoryResponse(response);
+            res.set_content(response.dump(), "application/json");
+            return;
+        }
 
         const bool dense = trajectoryUseDense(req);
         const bool request_aligned = !requestParamIsFalse(req, "aligned");
@@ -4148,6 +4257,8 @@ private:
              (publish_plan.policy == "active_only" && publish_plan.active_map_domain_aligned));
         response["coordinate_frame"] = domain_output ? "domain_colmap" : "slam";
         response["pose_source"] = domain_output ? "overlay" : "slam";
+        response["trajectory_mode"] = "final_pin";
+        response["pose_mode"] = "final_pin";
         response["alignment"] = alignmentSnapshotToJson(alignment);
         response["overlay"] = overlay_graph_.statusJson(current_map_id);
         if (!active_samples.empty()) {
@@ -4200,7 +4311,7 @@ private:
             {"GET /index.html", "Phone camera stream UI (static page)"},
             {"POST /api/v1/track", "Submit image for tracking; X-Run-Detector or JSON run_detector queues full-resolution custom detection"},
             {"GET /api/v1/status", "Get server status"},
-            {"GET /api/v1/trajectory", "Trajectory (dense default; ?all_maps=1 every atlas map; ?dense=0 keyframes; ?aligned=0 raw SLAM)"},
+            {"GET /api/v1/trajectory", "Trajectory (dense default; ?causal=1 live pin history; ?all_maps=1 every atlas map; ?dense=0 keyframes; ?aligned=0 raw SLAM)"},
             {"GET /api/v1/health", "Health check"}
         };
         response["portal_alignment_enabled"] = !portals_.empty();
@@ -4353,17 +4464,25 @@ private:
     void processImages() {
         const size_t min_buf = config_.min_buffer_frames;
         cout << "Started image processing thread (min_buffer=" << min_buf
-             << ", dequeue oldest timestamp)" << endl;
+             << ", dequeue oldest timestamp; idle-drain after 2s)" << endl;
 
         while (true) {
             shared_ptr<ImageRequest> request;
 
             {
                 unique_lock<mutex> lock(queue_mutex_);
-                queue_cv_.wait(lock, [this, min_buf] {
+                // Wake periodically so a trailing <min_buf queue can idle-drain after replay.
+                queue_cv_.wait_for(lock, chrono::milliseconds(500), [this, min_buf] {
                     if (!processing_active_.load())
                         return true;
-                    return image_queue_.size() >= min_buf;
+                    if (image_queue_.size() >= min_buf)
+                        return true;
+                    if (!image_queue_.empty()) {
+                        const auto idle = chrono::steady_clock::now() - last_image_enqueue_;
+                        if (idle > chrono::seconds(2))
+                            return true;
+                    }
+                    return false;
                 });
 
                 if (image_queue_.empty()) {
@@ -4373,7 +4492,10 @@ private:
                 }
 
                 const bool shutting_down = !processing_active_.load();
-                if (!shutting_down && image_queue_.size() < min_buf)
+                const auto idle = chrono::steady_clock::now() - last_image_enqueue_;
+                const bool idle_drain =
+                    !image_queue_.empty() && idle > chrono::seconds(2);
+                if (!shutting_down && image_queue_.size() < min_buf && !idle_drain)
                     continue;
 
                 auto oldest = min_element(
@@ -4621,6 +4743,11 @@ private:
                     chrono::steady_clock::now() - t_prior0).count();
             }
 
+            if (success && overlay_graph_.isMapPinned(current_map_id)) {
+                appendCausalDomainPose(
+                    current_map_id, request->frame_id, request->timestamp, pose);
+            }
+
         } catch (const exception& e) {
             cerr << "SLAM processing error: " << e.what() << endl;
             failed_tracks_++;
@@ -4719,6 +4846,9 @@ void printUsage() {
     cout << "  --portal-manifest <path>  refined_manifest.json with portals[].pose and physicalSize (overrides pack portals)" << endl;
     cout << "  --prior-pack <path>       prior pack root; pack portals[] enable alignment when manifest unset" << endl;
     cout << "  --prior-match-every <N>   Run prior soft-edge match every N frames (default: 5)" << endl;
+    cout << "  --overlay-portal-soft-eq <N> Portal sight ≈ N soft edges in Sim3 refine (default: 8)" << endl;
+    cout << "  --overlay-age-tau <sec>   Age decay tau; <=0 disables (default: 1). w=(1+age/tau)^(-power)" << endl;
+    cout << "  --overlay-age-power <P>   Age decay power (default: 1)" << endl;
     cout << "  --portal-detect-every <N> Run portal QR detection every N accepted frames (default: 1)" << endl;
     cout << "  --portal-max-reproj-px <N> Reject portal PnP above this mean reprojection error (default: 8)" << endl;
     cout << "  --occlusion-mesh <path> OBJ mesh in domain coordinates for barcode ray placement and viewer rendering" << endl;
@@ -4768,6 +4898,12 @@ int main(int argc, char* argv[]) {
             config.prior_match_every_nth = static_cast<size_t>(stoul(argv[++i]));
             if (config.prior_match_every_nth < 1)
                 config.prior_match_every_nth = 1;
+        } else if (arg == "--overlay-portal-soft-eq" && i + 1 < argc) {
+            config.overlay_portal_soft_eq = stof(argv[++i]);
+        } else if (arg == "--overlay-age-tau" && i + 1 < argc) {
+            config.overlay_age_tau_sec = stof(argv[++i]);
+        } else if (arg == "--overlay-age-power" && i + 1 < argc) {
+            config.overlay_age_power = stof(argv[++i]);
         } else if (arg == "--portal-detect-every" && i + 1 < argc) {
             config.portal_detect_every = static_cast<size_t>(stoul(argv[++i]));
             if (config.portal_detect_every < 1)

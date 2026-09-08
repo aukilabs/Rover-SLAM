@@ -2,9 +2,9 @@
 
 Status: active  
 Tier: feature  
-Stage: 7-implement (S9-clean approved: fix Sim3 exp update; park S10; no VIO)  
+Stage: 7-implement (S9-clean landed; S10 parked; live w/wo map OK — good for now)  
 Skips: _(none)_  
-Last updated: 2026-09-08
+Last updated: 2026-09-08 (live field check: map optional; domain-3d-viewer next product UI)
 
 Living document — update in place when later work changes earlier conclusions.  
 **§1 Intent (feature) and §4 System design stay distinct — never merge.**
@@ -164,6 +164,7 @@ Living document — update in place when later work changes earlier conclusions.
 - **Approvals:** Mass-approved S1–S6 on 2026-09-02. **2026-09-07 bounce** invalidates hard-portal / frozen-scale assumptions in S4/S5 — **re-gate** S4′/S5′ before coding.
 - **Approvals (2026-09-07 re-gate):** Human **mass-approved all remaining** — S4′, S5′, S6. Still one implementer → review → verify per slice; no re-ask between slices unless blocked.
 - **Approvals (2026-09-08):** Human chose **option 1 — Approve this slice only** for **S9-clean** (fix strip Sim3 `exp` update + commit; park S10; **no VIO / accelerometer**).
+- **Live field check (2026-09-08):** Human — live tests **with and without** prior map both work well; map help unclear but **good for now**. Soft-prior / refine-balance tuning (age weights, portal↔soft eq) kept as operational knobs, not a new bounce.
 - **Commit (2026-09-08):** S9-clean baseline `7bec824` — multiplicative log-scale LM + pin source-of-truth (no Twc overwrite); holdout map0 identity ATE ~0.30 m.
 - **S9′ try (2026-09-08):** Human — emphasize soft prior edges. `kPriorSoftBaseWeight` 0.35→2.0; Cauchy scale 6→4 px. Holdout `/tmp/s9prime_soft_prior`: map0 identity ATE median **0.094 m** (n=110) vs S9-clean **0.297 m** (n=480); soft_edges=7; scale≈0.47; `last_refine_source=prior_soft`. Caveat: this run fragmented VO (3–4 maps / shorter map0), so not a pure A/B on the same trajectory length.
 - **Prior cadence (2026-09-08):** Holdout was already `--prior-match-every 10` (code default had been 30). Human — try **every frame** for accuracy. Defaults → `prior_match_every_nth=1`, `max_queue_size=100`; holdout script `--prior-match-every 1 --max-queue 600` + **queue drain before eval**. First every-1 run without drain was invalid (queue_end=410). Drained holdout `/tmp/s9prime_every1_drain`: soft_edges **76** (3 disagree); map0 identity ATE median **0.292 m** (n=569, 1 map) ≈ S9-clean 0.297 m; VO Umeyama **0.078 m**; pin scale≈0.465; no unit_fallback. More edges did not move identity ATE — scale still stuck ~0.47.

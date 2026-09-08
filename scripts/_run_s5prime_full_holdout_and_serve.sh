@@ -107,17 +107,30 @@ PY
 cd "$ROOT"
 
 echo "=== drain processing queue ==="
-# Wait until image queue is empty (prior-match-every=1 can lag 10 FPS ingest by minutes).
+# Wait until image queue is empty. Also treat "stuck below min_buffer with no
+# progress" as drained (server idle-drains after 2s, but be defensive here).
+stable=0
+prev_tracked=""
 for i in $(seq 1 900); do
   if st=$(curl -sf -m 2 "http://127.0.0.1:$PORT/api/v1/status"); then
     qs=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("queue_size", -1))' <<<"$st")
     tracked=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("successful_tracks", d.get("tracked_frames", 0)))' <<<"$st")
     echo "drain t=${i}s queue_size=$qs tracked=$tracked"
     if [[ "$qs" == "0" ]]; then
-      # brief slack so the last frame finishes overlay work
       sleep 3
       break
     fi
+    if [[ "$tracked" == "$prev_tracked" && "$qs" -gt 0 && "$qs" -lt 3 ]]; then
+      stable=$((stable + 1))
+      if [[ "$stable" -ge 5 ]]; then
+        echo "drain: queue stuck below min_buffer with no track progress — continuing"
+        sleep 3
+        break
+      fi
+    else
+      stable=0
+    fi
+    prev_tracked=$tracked
   else
     echo "drain: status not ready"
   fi
@@ -128,6 +141,7 @@ sleep 2
 curl -sf -m 10 "http://127.0.0.1:$PORT/api/v1/status" -o "$OUT/status.json"
 curl -sf -m 60 "http://127.0.0.1:$PORT/api/v1/trajectory?aligned=0&dense=1&all_maps=1" -o "$OUT/trajectory_raw.json"
 curl -sf -m 60 "http://127.0.0.1:$PORT/api/v1/trajectory?aligned=1&dense=1&all_maps=1" -o "$OUT/trajectory_domain.json"
+curl -sf -m 60 "http://127.0.0.1:$PORT/api/v1/trajectory?causal=1" -o "$OUT/trajectory_causal.json"
 cp -f "$LOG" "$OUT/rover-slam-holdout.log"
 
 echo "=== evaluate portal-domain vs VO (global GT) ==="
@@ -135,6 +149,7 @@ cd "$ROOT/scripts"
 python3 eval_portal_domain_vs_vo.py \
   --raw-traj "$OUT/trajectory_raw.json" \
   --domain-traj "$OUT/trajectory_domain.json" \
+  --causal-traj "$OUT/trajectory_causal.json" \
   --baseline-metrics "$OUT_BASE/holdout_pose_metrics.json" \
   --status "$OUT/status.json" \
   --gt-colmap "$GT" \
@@ -149,13 +164,16 @@ st=json.loads(Path("$OUT/status.json").read_text())
 cmp=json.loads(Path("$OUT/compare_summary.json").read_text())
 log=Path("$LOG").read_text(errors="replace")
 print("=== S5prime SOFTGATE RESULTS ===")
-print("map0_direct", cmp.get("portal_domain_direct_map0"))
+print("map0_final_pin", cmp.get("portal_domain_direct_map0"))
+print("map0_causal", cmp.get("portal_domain_causal_map0"))
+print("causal", cmp.get("portal_domain_causal"))
 print("overlay_direct", cmp.get("portal_domain_direct"))
 print("vo_umeyama", cmp.get("vo_umeyama"))
 ov=st.get("overlay") or {}
 al=st.get("alignment") or {}
 print("soft_edges_accepted", ov.get("prior_soft_edges_accepted"))
 print("soft_edges_rejected", ov.get("prior_soft_edges_rejected"))
+print("causal_count", st.get("causal_pose_history_count"))
 print("scale", al.get("scale"), al.get("scale_source"))
 print("pinned", ov.get("pinned_map_ids"))
 skips={}
@@ -163,7 +181,6 @@ for ln in log.splitlines():
     if "soft edge accepted" in ln:
         skips["ACCEPTED"]=skips.get("ACCEPTED",0)+1
     if "soft edge skip" in ln and ": " in ln:
-        # reason may include extra fields; keep first token after colon if present
         part=ln.split("soft edge skip",1)[-1]
         if "no_gated_match" in part: skips["no_gated_match"]=skips.get("no_gated_match",0)+1
         elif "slam_disagreement" in part: skips["slam_disagreement"]=skips.get("slam_disagreement",0)+1
@@ -173,6 +190,7 @@ PY
 
 echo "=== evidence copy ==="
 cp -f "$OUT/status.json" "$OUT/compare_summary.json" "$OUT/trajectory_raw.json" "$OUT/trajectory_domain.json" \
+  "$OUT/trajectory_causal.json" \
   "$OUT/holdout_pose_metrics.json" "$OUT/holdout_pose_topdown.png" "$OUT/holdout_pose_rot_rel.png" \
   "$OUT/rover-slam-holdout.log" "$EVIDENCE_DST/" 2>/dev/null || true
 
@@ -182,9 +200,11 @@ cp -f "$OUT_BASE/"holdout_pose_* "$DST/baseline/" 2>/dev/null || true
 cp -f "$OUT_BASE/trajectory_all_maps.json" "$DST/baseline/" 2>/dev/null || true
 cp -f "$OUT/"holdout_pose_* "$OUT/status.json" "$OUT/compare_summary.json" "$DST/new/" 2>/dev/null || true
 cp -f "$OUT/trajectory_domain.json" "$DST/new/trajectory_all_maps.json"
+cp -f "$OUT/trajectory_causal.json" "$DST/new/trajectory_causal.json" 2>/dev/null || true
 cp -f "$OUT/compare_summary.json" "$DST/"
 cp -f "$OUT/holdout_pose_metrics.json" "$OUT/holdout_pose_topdown.png" "$OUT/holdout_pose_rot_rel.png" "$DST/"
 cp -f "$OUT/trajectory_domain.json" "$DST/trajectory_all_maps.json"
+cp -f "$OUT/trajectory_causal.json" "$DST/trajectory_causal.json" 2>/dev/null || true
 cp -f "$ROOT/scripts/_holdout_portal_ab_index.html" "$DST/index.html"
 
 stop "$EVAL_PORT"
