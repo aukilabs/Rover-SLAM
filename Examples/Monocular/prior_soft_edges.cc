@@ -18,7 +18,8 @@ namespace prior_soft {
 
 namespace {
 
-constexpr float kPriorSoftBaseWeight = 0.35f;
+// Emphasize pack-consistent soft edges in Sim3 refine (still below portal corners ~10).
+constexpr float kPriorSoftBaseWeight = 2.0f;
 constexpr size_t kMaxPriorSoftObservationsPerFactor = 64;
 
 Sophus::SE3f poseToTwc(const prior_pack::Pose& pose) {

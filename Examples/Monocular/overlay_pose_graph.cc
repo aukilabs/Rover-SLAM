@@ -21,7 +21,8 @@ constexpr float kCornerHuberDeltaPx = 8.0f;
 constexpr float kMaxCornerRmsePx = 80.0f;
 constexpr float kCornerHuberDeltaSq = kCornerHuberDeltaPx * kCornerHuberDeltaPx;
 constexpr float kCornerHuberWeightFloor = 0.20f;
-constexpr float kPriorSoftCauchyScalePx = 6.0f;
+// Tighter Cauchy so gated prior inliers pull harder on the pin (S9′ soft-prior emphasis).
+constexpr float kPriorSoftCauchyScalePx = 4.0f;
 constexpr float kPriorSoftCauchyScaleSq = kPriorSoftCauchyScalePx * kPriorSoftCauchyScalePx;
 
 bool isValidScale(float scale)

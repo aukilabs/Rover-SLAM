@@ -18,7 +18,7 @@
 namespace prior_soft {
 
 struct PriorMatchConfig {
-    size_t match_every_nth_frame = 30;
+    size_t match_every_nth_frame = 5;
     size_t max_candidates = 8;
     float pose_proximity_m = 3.0f;
     float max_reproj_px = 12.0f;

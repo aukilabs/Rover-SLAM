@@ -169,7 +169,7 @@ private:
     static constexpr size_t kMaxPriorSoftFactorsPerMap = 512;
     static constexpr size_t kMaxPriorSoftObservationsPerFactor = 64;
     static constexpr float kPortalCornerBaseWeight = 10.0f;
-    static constexpr float kPriorSoftBaseWeight = 0.8f;
+    static constexpr float kPriorSoftBaseWeight = 2.0f;
     static constexpr size_t kLiveEdgeRefineCadence = 8;
     static constexpr float kMinPortalSightBaselineSlam = 0.12f;
 

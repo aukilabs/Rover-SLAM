@@ -1375,13 +1375,15 @@ struct ServerConfig {
     string occlusion_mesh_path;
     LoadedObjMesh occlusion_mesh;
     bool use_viewer = false;
-    int max_queue_size = 10;
+    /** Deep enough for prior-match-every=1 under ~10 FPS ingest without 503s. */
+    int max_queue_size = 100;
     size_t slam_interval_nth = 1;
     size_t custom_detect_every = 0;
     /** Wait until this many frames are buffered (unless shutting down); then process oldest by `timestamp`. */
     size_t min_buffer_frames = 3;
     size_t portal_detect_every = 1;
-    size_t prior_match_every_nth = 30;
+    /** Accuracy vs cost tradeoff: every 5th tracked frame (holdout uses CLI override). */
+    size_t prior_match_every_nth = 5;
     float portal_max_reproj_px = 8.0f;
     double processing_timeout = 5.0; // seconds
     /** UTF-8 HTML for GET /index.html (phone camera UI); empty => 404 with hint */
@@ -2092,12 +2094,12 @@ private:
         input.image_height = image_height;
         input.frame_id = frame_id;
         input.timestamp = timestamp;
-        input.seed_prior_image_id = last_prior_seed_image_id_;
-
         const Sophus::SE3f Twc_slam = input.Twc_slam;
         input.has_domain_pose = true;
         input.Twc_domain = overlay_graph_.applyPinToTwc(map_id, Twc_slam);
-        if (input.seed_prior_image_id < 0 && prior_pack_.loaded) {
+        // Always re-pick nearest prior image under the current pin (incl. refined scale),
+        // instead of sticking to the last accepted match's covis cluster.
+        if (prior_pack_.loaded) {
             input.seed_prior_image_id =
                 prior_soft::PriorSoftEdgeMatcher::nearestPriorImageId(prior_pack_, input.Twc_domain);
         }
@@ -2110,8 +2112,8 @@ private:
             if (refine.published) {
                 applyOverlayRefineToAlignment(map_id, refine);
             }
-            last_prior_seed_image_id_ = result.matched_prior_image_id;
             cout << "[prior] soft edge accepted image=" << result.matched_prior_image_id
+                 << " seed_img=" << input.seed_prior_image_id
                  << " inliers=" << result.factor.inlier_count
                  << " obs=" << result.factor.observations.size()
                  << " reproj_px=" << result.factor.mean_reproj_px
@@ -4710,13 +4712,13 @@ void printUsage() {
     cout << "  --port <number>        Server port (default: 8080)" << endl;
     cout << "  --output-dir <path>    Output directory (default: ./output)" << endl;
     cout << "  --debug-output <path>  Directory for latest trajectory JSON debug file (default: disabled)" << endl;
-    cout << "  --max-queue <number>   Maximum queue size (default: 10)" << endl;
+    cout << "  --max-queue <number>   Maximum queue size (default: 100)" << endl;
     cout << "  --slam-interval-nth <N> Run SLAM on one out of every N accepted frames (default: 1)" << endl;
     cout << "  --custom-detect-every <N> Run custom detection every N accepted frames (default: disabled)" << endl;
     cout << "  --min-buffer <number>  Min frames in queue before tracking; oldest timestamp first (default: 3)" << endl;
     cout << "  --portal-manifest <path>  refined_manifest.json with portals[].pose and physicalSize (overrides pack portals)" << endl;
     cout << "  --prior-pack <path>       prior pack root; pack portals[] enable alignment when manifest unset" << endl;
-    cout << "  --prior-match-every <N>   Run prior soft-edge match every N frames (default: 30)" << endl;
+    cout << "  --prior-match-every <N>   Run prior soft-edge match every N frames (default: 5)" << endl;
     cout << "  --portal-detect-every <N> Run portal QR detection every N accepted frames (default: 1)" << endl;
     cout << "  --portal-max-reproj-px <N> Reject portal PnP above this mean reprojection error (default: 8)" << endl;
     cout << "  --occlusion-mesh <path> OBJ mesh in domain coordinates for barcode ray placement and viewer rendering" << endl;
