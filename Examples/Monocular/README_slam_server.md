@@ -8,6 +8,8 @@ This is the Phase 1 implementation of the real-time SLAM server that converts th
 
 **Phone camera UI:** with the server running, open `http://<PC-LAN-IP>:<port>/index.html` on your phone (same Wi‑Fi). Source file: [index.html](index.html) (served by the binary from that path next to `slam_server`). The same page draws live **timing** and **top-down trajectory** plots from `/api/v1/status` and `/api/v1/trajectory` (restart `slam_server` after editing the HTML — it is loaded once at startup).
 
+**Domain 3D viewer:** open `http://<PC-LAN-IP>:<port>/viewer` in a browser on the same host/port — [viewer.html](viewer.html) polls map points, portals, and trajectory (restart `slam_server` after editing).
+
 **Holdout pose plots (SLAM vs GT / baseline):** separate static page via `scripts/serve_holdout_pose_eval.py` (default `0.0.0.0:8080`, dir `out/holdout_pose_eval/`).
 
 ## Features Implemented (Phase 1)

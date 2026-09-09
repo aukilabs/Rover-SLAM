@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -75,6 +76,8 @@ struct TrackRecord {
     int id = 0;
     Vec3 position;
     std::vector<TrackObservation> observations;
+    bool has_rgb = false;
+    uint8_t rgb[3] = {0, 0, 0};
 };
 
 struct PriorPack {

@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rover-SLAM domain viewer</title>
+  <style>
+    :root { --bg: #0f1115; --fg: #e8eaed; --muted: #9aa0a6; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #canvas { display: block; width: 100%; height: 100%; }
+    #hud {
+      position: fixed; left: 12px; top: 12px; max-width: min(420px, calc(100vw - 24px));
+      background: rgba(15, 17, 21, 0.82); border: 1px solid #2d3340; border-radius: 8px;
+      padding: 10px 12px; font-size: 0.78rem; line-height: 1.45; pointer-events: none;
+    }
+    #hud h1 { margin: 0 0 6px; font-size: 0.95rem; font-weight: 600; }
+    #hud p { margin: 0; color: var(--muted); }
+    #hud dl { margin: 8px 0 0; }
+    #hud dt { font-weight: 600; color: #c4c8cc; margin-top: 4px; }
+    #hud dd { margin: 0; color: var(--muted); }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="hud" aria-live="polite">
+    <h1>Domain 3D viewer</h1>
+    <p>Polls <code>/api/v1/map_points</code>, <code>/api/v1/portals</code>, <code>/api/v1/trajectory</code> (~2&nbsp;Hz). Drag to orbit, scroll to zoom.</p>
+    <dl id="stats">
+      <dt>Status</dt><dd>Loading…</dd>
+    </dl>
+  </div>
+  <script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { Line2 } from 'three/addons/lines/Line2.js';
+import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+
+(function () {
+  const canvas = document.getElementById('canvas');
+  const statsEl = document.getElementById('stats');
+  const MAP_COLORS = ['#3b82f6', '#34d399', '#fbbf24', '#f87171', '#a78bfa', '#22d3ee', '#fb7185', '#94a3b8'];
+  const POLL_MS = 500;
+  // WebGL ignores LineBasicMaterial.linewidth; Line2 needs CSS-pixel width (~3x prior intent of 2).
+  const TRAJ_LINE_WIDTH_PX = 6;
+  let cameraFitted = false;
+  const lineMaterials = [];
+
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setClearColor(0x0f1115, 1);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(55, 1, 0.01, 5000);
+  camera.position.set(4, 3, 6);
+
+  const controls = new OrbitControls(camera, canvas);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.55);
+  dir.position.set(5, 10, 7);
+  scene.add(dir);
+
+  const axes = new THREE.AxesHelper(1.0);
+  scene.add(axes);
+
+  const priorPoints = new THREE.Points(
+    new THREE.BufferGeometry(),
+    new THREE.PointsMaterial({ size: 0.04, sizeAttenuation: true, vertexColors: true })
+  );
+  const livePoints = new THREE.Points(
+    new THREE.BufferGeometry(),
+    new THREE.PointsMaterial({ size: 0.05, sizeAttenuation: true, vertexColors: true })
+  );
+  scene.add(priorPoints);
+  scene.add(livePoints);
+
+  const trajGroup = new THREE.Group();
+  scene.add(trajGroup);
+
+  const portalGroup = new THREE.Group();
+  scene.add(portalGroup);
+
+  function resize() {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    for (let i = 0; i < lineMaterials.length; i++) {
+      lineMaterials[i].resolution.set(w, h);
+    }
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function setStats(rows) {
+    statsEl.innerHTML = rows.map(function (row) {
+      return '<dt>' + row[0] + '</dt><dd>' + row[1] + '</dd>';
+    }).join('');
+  }
+
+  function disposeGeometry(mesh) {
+    if (mesh.geometry) mesh.geometry.dispose();
+  }
+
+  // COLMAP / API RGB are display-referred sRGB bytes. three.js r152+ expects
+  // vertex colors in Linear-sRGB; feeding sRGB/255 as linear makes the cloud
+  // look washed / whitish after output encoding (ColorManagement.enabled).
+  const _srgbScratch = new THREE.Color();
+  function srgbByteToLinear(r255, g255, b255) {
+    _srgbScratch.setRGB(
+      Math.max(0, Math.min(255, r255)) / 255,
+      Math.max(0, Math.min(255, g255)) / 255,
+      Math.max(0, Math.min(255, b255)) / 255,
+      THREE.SRGBColorSpace
+    );
+    return [_srgbScratch.r, _srgbScratch.g, _srgbScratch.b];
+  }
+
+  function updatePointCloud(mesh, points) {
+    disposeGeometry(mesh);
+    if (!points || !points.length) {
+      mesh.geometry = new THREE.BufferGeometry();
+      mesh.visible = false;
+      return 0;
+    }
+    const positions = new Float32Array(points.length * 3);
+    const colors = new Float32Array(points.length * 3);
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      positions[i * 3] = p.x;
+      positions[i * 3 + 1] = p.y;
+      positions[i * 3 + 2] = p.z;
+      const rgb = srgbByteToLinear(
+        p.r != null ? p.r : 140,
+        p.g != null ? p.g : 140,
+        p.b != null ? p.b : 140
+      );
+      colors[i * 3] = rgb[0];
+      colors[i * 3 + 1] = rgb[1];
+      colors[i * 3 + 2] = rgb[2];
+    }
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    mesh.geometry = geom;
+    mesh.visible = true;
+    return points.length;
+  }
+
+  function clearGroup(group, disposeLine) {
+    while (group.children.length) {
+      const child = group.children[0];
+      group.remove(child);
+      if (disposeLine && child.geometry) child.geometry.dispose();
+      if (child.material) {
+        const idx = lineMaterials.indexOf(child.material);
+        if (idx >= 0) lineMaterials.splice(idx, 1);
+        child.material.dispose();
+      }
+    }
+  }
+
+  function updateTrajectory(resp) {
+    clearGroup(trajGroup, true);
+    const frame = resp && resp.coordinate_frame;
+    // Domain prior + portals are domain_colmap. Unpinned active maps publish raw SLAM
+    // poses near the SLAM origin; with a portal at domain origin that looks like the
+    // path starts at the portal / goes under the floor. Only draw domain/overlay poses.
+    if (frame && frame !== 'domain_colmap') {
+      return { count: 0, maps: 0, frame: frame, skipped: 'slam_frame' };
+    }
+    const traj = (resp && resp.trajectory) || [];
+    const byMap = {};
+    let used = 0;
+    let skippedSlam = 0;
+    for (let i = 0; i < traj.length; i++) {
+      const src = traj[i].pose_source;
+      if (src && src !== 'overlay' && src !== 'overlay_causal') {
+        skippedSlam++;
+        continue;
+      }
+      const p = traj[i].position;
+      if (!p || p.length < 3) continue;
+      const mid = traj[i].map_id != null ? traj[i].map_id : 0;
+      if (!byMap[mid]) byMap[mid] = [];
+      byMap[mid].push(p[0], p[1], p[2]);
+      used++;
+    }
+    const mapIds = Object.keys(byMap).map(Number).sort(function (a, b) { return a - b; });
+    const res = new THREE.Vector2(window.innerWidth, window.innerHeight);
+    mapIds.forEach(function (mid, idx) {
+      const flat = byMap[mid];
+      if (flat.length < 6) return;
+      const geom = new LineGeometry();
+      geom.setPositions(flat);
+      const color = new THREE.Color(MAP_COLORS[idx % MAP_COLORS.length]);
+      const mat = new LineMaterial({
+        color: color.getHex(),
+        linewidth: TRAJ_LINE_WIDTH_PX,
+        worldUnits: false,
+        transparent: true,
+        opacity: 0.95,
+        depthTest: true
+      });
+      mat.resolution.copy(res);
+      lineMaterials.push(mat);
+      const line = new Line2(geom, mat);
+      line.computeLineDistances();
+      trajGroup.add(line);
+      const last = new THREE.Vector3(
+        flat[flat.length - 3],
+        flat[flat.length - 2],
+        flat[flat.length - 1]
+      );
+      const dot = new THREE.Mesh(
+        new THREE.SphereGeometry(0.08, 10, 10),
+        new THREE.MeshBasicMaterial({ color: color })
+      );
+      dot.position.copy(last);
+      trajGroup.add(dot);
+    });
+    return {
+      count: used,
+      maps: mapIds.length,
+      frame: frame,
+      skippedSlam: skippedSlam
+    };
+  }
+
+  function portalCorners(position, orientation, sizeM) {
+    const s = 0.5 * sizeM;
+    const local = [
+      new THREE.Vector3(-s, -s, 0),
+      new THREE.Vector3(s, -s, 0),
+      new THREE.Vector3(s, s, 0),
+      new THREE.Vector3(-s, s, 0)
+    ];
+    const q = new THREE.Quaternion(
+      orientation[1], orientation[2], orientation[3], orientation[0]
+    );
+    const t = new THREE.Vector3(position[0], position[1], position[2]);
+    return local.map(function (v) {
+      return v.clone().applyQuaternion(q).add(t);
+    });
+  }
+
+  function updatePortals(resp) {
+    clearGroup(portalGroup, true);
+    const portals = (resp && resp.portals) || [];
+    portals.forEach(function (portal) {
+      const size = portal.physical_size_m;
+      if (!size || size <= 0 || !portal.position || !portal.orientation) return;
+      const corners = portalCorners(portal.position, portal.orientation, size);
+      const loopPts = corners.concat([corners[0]]);
+      const geom = new THREE.BufferGeometry().setFromPoints(loopPts);
+      const line = new THREE.Line(
+        geom,
+        new THREE.LineBasicMaterial({ color: 0xfbbf24 })
+      );
+      portalGroup.add(line);
+      const center = corners.reduce(function (acc, c) { return acc.add(c); }, new THREE.Vector3()).multiplyScalar(0.25);
+      const dot = new THREE.Mesh(
+        new THREE.SphereGeometry(0.04, 8, 8),
+        new THREE.MeshBasicMaterial({ color: 0xfbbf24 })
+      );
+      dot.position.copy(center);
+      portalGroup.add(dot);
+    });
+    return portals.length;
+  }
+
+  function fitCameraToContent() {
+    const box = new THREE.Box3();
+    [priorPoints, livePoints].forEach(function (mesh) {
+      if (mesh.visible && mesh.geometry.attributes.position) {
+        mesh.geometry.computeBoundingBox();
+        if (mesh.geometry.boundingBox) box.union(mesh.geometry.boundingBox);
+      }
+    });
+    trajGroup.children.forEach(function (child) {
+      if (child.geometry && child.geometry.attributes.position) {
+        child.geometry.computeBoundingBox();
+        if (child.geometry.boundingBox) box.union(child.geometry.boundingBox);
+      }
+    });
+    portalGroup.children.forEach(function (child) {
+      if (child.geometry && child.geometry.attributes.position) {
+        child.geometry.computeBoundingBox();
+        if (child.geometry.boundingBox) box.union(child.geometry.boundingBox);
+      }
+    });
+    if (box.isEmpty()) return;
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const radius = Math.max(size.x, size.y, size.z, 1) * 0.6;
+    controls.target.copy(center);
+    camera.position.copy(center).add(new THREE.Vector3(radius * 1.2, radius * 0.9, radius * 1.4));
+    camera.near = Math.max(0.01, radius * 0.01);
+    camera.far = Math.max(500, radius * 20);
+    camera.updateProjectionMatrix();
+    controls.update();
+    cameraFitted = true;
+  }
+
+  function fetchJson(url) {
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
+  function poll() {
+    Promise.all([
+      fetchJson('/api/v1/map_points?source=both'),
+      fetchJson('/api/v1/portals'),
+      fetchJson('/api/v1/trajectory?dense=1')
+    ]).then(function (results) {
+      const mapData = results[0];
+      const portalData = results[1];
+      const trajData = results[2];
+      const prior = (mapData.points || []).filter(function (p) { return p.source === 'prior'; });
+      const live = (mapData.points || []).filter(function (p) { return p.source === 'live'; });
+      const priorCount = updatePointCloud(priorPoints, prior);
+      const liveCount = updatePointCloud(livePoints, live);
+      const trajInfo = updateTrajectory(trajData);
+      const portalCount = updatePortals(portalData);
+      if (!cameraFitted) fitCameraToContent();
+      setStats([
+        ['Map points', 'prior ' + priorCount + ', live ' + liveCount +
+          (mapData.live_included ? ' (pinned)' : ' (live hidden until pin)') +
+          ' · stride ' + (mapData.stride != null ? mapData.stride : 1)],
+        ['Trajectory', 'poses ' + trajInfo.count + ', maps ' + trajInfo.maps +
+          (trajInfo.frame ? ' · ' + trajInfo.frame : '') +
+          (trajInfo.skipped === 'slam_frame'
+            ? ' · hidden (waiting for domain pin)'
+            : (trajInfo.skippedSlam ? ' · skipped ' + trajInfo.skippedSlam + ' slam poses' : ''))],
+        ['Portals', String(portalCount)],
+        ['Poll', 'every ' + POLL_MS + 'ms']
+      ]);
+    }).catch(function (e) {
+      setStats([
+        ['Error', (e && e.message) ? e.message : String(e)],
+        ['Hint', 'Start slam_server with prior pack / portal manifest, then reload.']
+      ]);
+    });
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+  }
+
+  poll();
+  setInterval(poll, POLL_MS);
+  animate();
+})();
+  </script>
+</body>
+</html>

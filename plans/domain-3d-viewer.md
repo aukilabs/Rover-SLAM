@@ -2,9 +2,9 @@
 
 Status: active  
 Tier: feature  
-Stage: 6-breakdown  
+Stage: 9-verify (S1–S3 code done; awaiting human visual on /viewer)  
 Skips: _(none)_  
-Last updated: 2026-09-08 (§1–§6 locked)
+Last updated: 2026-09-08 (S3 verified live; human §5 #7 pending)
 
 Living document — update in place when later work changes earlier conclusions.  
 **§1 Intent (feature) and §4 System design stay distinct — never merge.**
@@ -84,7 +84,16 @@ Living document — update in place when later work changes earlier conclusions.
 
 ## 7. Implementation notes
 
+- **Approvals (2026-09-08):** Human mass-approved all remaining slices S1–S3 (`206efb47…`, `416e376f…`, `ff434fbb…`). Implement one slice per subagent with review/verify between; skip re-asking until blocked or done. S3 still has human visual check after verify.
+- **S1 done:** Prior RGB plumbing (format_version 2, loader has_rgb, test_prior_pack_rgb.py PASS). Board → done.
+- **S2 done:** GET /api/v1/map_points + /api/v1/portals; System::GetActiveMapMapPoints; docs. Board → done.
+- **S3 done (code + live API):** `viewer.html` + GET /viewer; rebuild `slam_server` (build_s1); curl `/viewer` 200 text/html; prior map_points RGB + portals OK. Board → done. **Human visual (§5 #7) still pending.**
+
 ## 8. Verification record
+
+- S1: `python scripts/test_prior_pack_rgb.py` OK; fixture v2 with rgb; C++ loader exposes has_rgb.
+- S2: Handlers/routes/docs match §5 #2–#5; later covered by S3 live smoke.
+- S3: Live WSL — `GET /viewer` 200 `text/html`; `map_points?source=prior` with rgb; portals `FIXTURE01`; trajectory OK. §5 #6–#7 holdout+browser deferred to human.
 
 ## Gate (stage 11)
 

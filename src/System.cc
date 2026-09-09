@@ -1688,6 +1688,19 @@ vector<MapPoint*> System::GetTrackedMapPoints()
     return mTrackedMapPoints;
 }
 
+void System::GetActiveMapMapPoints(vector<MapPoint*>& out)
+{
+    out.clear();
+    if (!mpAtlas)
+        return;
+
+    Map* pMap = mpAtlas->GetCurrentMap();
+    if (!pMap)
+        return;
+
+    out = pMap->GetAllMapPoints();
+}
+
 vector<cv::KeyPoint> System::GetTrackedKeyPointsUn()
 {
     unique_lock<mutex> lock(mMutexState);

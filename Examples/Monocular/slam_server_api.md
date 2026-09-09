@@ -427,6 +427,78 @@ orientation = quaternion(R_three) as [w, x, y, z]
 
 ---
 
+## `GET /api/v1/map_points`
+
+Domain-frame point cloud for the browser 3D viewer: prior pack tracks (backdrop) plus live Atlas map points when the active map is portal-pinned.
+
+**Query parameters**
+
+| Param | Default | Meaning |
+|--------|---------|---------|
+| `source` | `both` | `live`, `prior`, or `both`. Live points are omitted until the active map is domain-pinned (domain-only rule). |
+| `max_points` | `50000` | Cap returned points; uniform stride downsampling when `total_count` exceeds this value. |
+
+**Response:** JSON
+
+```json
+{
+  "coordinate_frame": "domain_colmap",
+  "source": "both",
+  "count": 1200,
+  "total_count": 4800,
+  "max_points": 50000,
+  "stride": 4,
+  "prior_loaded": true,
+  "live_included": true,
+  "map_id": 2,
+  "points": [
+    {"x": 1.0, "y": 0.5, "z": 2.0, "r": 180, "g": 90, "b": 40, "source": "prior"},
+    {"x": 1.1, "y": 0.6, "z": 2.1, "r": 0, "g": 200, "b": 220, "source": "live"}
+  ]
+}
+```
+
+| Field | Meaning |
+|--------|---------|
+| `points[].source` | `prior` (pack tracks) or `live` (active-map Atlas points). |
+| `points[].r/g/b` | Prior: pack RGB when present (`format_version` ≥ 2), else gray `(140,140,140)`. Live: server-side cyan→teal height colormap (high Z → cyan, low Z → teal). |
+| `live_included` | `true` when live points were emitted (active map pinned and non-empty). |
+| `stride` | Downsampling stride (`1` = no downsample). |
+
+Prior points require `--prior-pack`. Live points require portal pin on the active map (same overlay pin as trajectory domain output).
+
+---
+
+## `GET /api/v1/portals`
+
+Portal catalog from `--portal-manifest` or prior pack `portals[]` (manifest wins when both are set). Poses are in domain/COLMAP frame (same convention as portal alignment).
+
+**Response:** JSON
+
+```json
+{
+  "coordinate_frame": "domain_colmap",
+  "count": 2,
+  "prior_pack_loaded": true,
+  "portal_manifest_loaded": false,
+  "portals": [
+    {
+      "short_id": "ABCD1234",
+      "physical_size_m": 0.19,
+      "position": [1.0, 0.5, 2.0],
+      "orientation": [0.99, 0.0, 0.0, 0.01]
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|--------|---------|
+| `orientation` | Unit quaternion `[w, x, y, z]` for portal pose in `coordinate_frame`. |
+| `physical_size_m` | Metric QR edge length used for PnP / viewer squares. |
+
+---
+
 ## `GET /api/v1/health`
 
 Liveness / metadata.

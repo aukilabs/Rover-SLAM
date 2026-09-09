@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .schema import (
     FORMAT_VERSION,
+    MIN_FORMAT_VERSION,
     PriorPackError,
     REQUIRED_COUNT_KEYS,
     REQUIRED_FILE_KEYS,
@@ -16,6 +17,8 @@ from .schema import (
     REQUIRED_POSE_KEYS,
     REQUIRED_QUAT_KEYS,
     REQUIRED_VEC3_KEYS,
+    supported_format_version,
+    validate_track_rgb,
 )
 
 
@@ -130,9 +133,10 @@ def validate_prior_pack(pack_root: Path) -> Dict[str, Any]:
     _require_keys(manifest, REQUIRED_MANIFEST_KEYS, "manifest")
 
     version = manifest["format_version"]
-    if version != FORMAT_VERSION:
+    if not supported_format_version(version):
         raise PriorPackError(
-            f"unsupported format_version {version} (expected {FORMAT_VERSION})"
+            f"unsupported format_version {version} "
+            f"(expected {MIN_FORMAT_VERSION}–{FORMAT_VERSION})"
         )
 
     coord = manifest["coordinate_frame"]
@@ -296,6 +300,8 @@ def validate_prior_pack(pack_root: Path) -> Dict[str, Any]:
             raise PriorPackError(f"{label}.id must be int")
         track_ids.append(track_id)
         _require_vec3(track["position"], f"{label}.position")
+        if "rgb" in track:
+            validate_track_rgb(track["rgb"], label)
         obs = track["observations"]
         if not isinstance(obs, list) or len(obs) == 0:
             raise PriorPackError(f"{label}.observations must be a non-empty array")

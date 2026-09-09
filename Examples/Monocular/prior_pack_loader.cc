@@ -18,7 +18,8 @@ namespace prior_pack {
 
 namespace {
 
-constexpr int kFormatVersion = 1;
+constexpr int kMinFormatVersion = 1;
+constexpr int kMaxFormatVersion = 2;
 
 bool path_is_separator(char c) { return c == '/' || c == '\\'; }
 
@@ -81,6 +82,25 @@ Quat parse_quat(const json& v, const char* label) {
     out.y = v["y"].get<float>();
     out.z = v["z"].get<float>();
     return out;
+}
+
+bool parse_optional_track_rgb(const json& track, const char* label, TrackRecord& rec) {
+    if (!track.contains("rgb"))
+        return false;
+    const json& rgb = track["rgb"];
+    if (!rgb.is_array() || rgb.size() != 3)
+        throw PriorPackError(std::string(label) + ".rgb must be [r, g, b]");
+    for (size_t i = 0; i < 3; ++i) {
+        if (!rgb[i].is_number_integer())
+            throw PriorPackError(std::string(label) + ".rgb[" + std::to_string(i) + "] must be int");
+        const int channel = rgb[i].get<int>();
+        if (channel < 0 || channel > 255)
+            throw PriorPackError(
+                std::string(label) + ".rgb[" + std::to_string(i) + "] must be in 0-255");
+        rec.rgb[i] = static_cast<uint8_t>(channel);
+    }
+    rec.has_rgb = true;
+    return true;
 }
 
 Pose parse_pose(const json& v, const char* label) {
@@ -234,10 +254,10 @@ PriorPack load_prior_pack(const std::string& pack_root_path) {
         "manifest");
 
     const int version = manifest["format_version"].get<int>();
-    if (version != kFormatVersion)
+    if (version < kMinFormatVersion || version > kMaxFormatVersion)
         throw PriorPackError(
-            "unsupported format_version " + std::to_string(version) +
-            " (expected " + std::to_string(kFormatVersion) + ")");
+            "unsupported format_version " + std::to_string(version) + " (expected " +
+            std::to_string(kMinFormatVersion) + "–" + std::to_string(kMaxFormatVersion) + ")");
 
     const json& coord = manifest["coordinate_frame"];
     if (!coord.is_object() || !coord.contains("name") || !coord.contains("notes"))
@@ -410,6 +430,7 @@ PriorPack load_prior_pack(const std::string& pack_root_path) {
         TrackRecord rec;
         rec.id = track["id"].get<int>();
         rec.position = parse_vec3(track["position"], (label + ".position").c_str());
+        parse_optional_track_rgb(track, label.c_str(), rec);
         const json& obs = track["observations"];
         if (!obs.is_array() || obs.empty())
             throw PriorPackError(label + ".observations must be a non-empty array");

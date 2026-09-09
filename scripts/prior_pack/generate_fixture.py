@@ -121,11 +121,20 @@ def write_recon_fixture(recon_root: Path) -> Path:
     }
     _write_json(recon_root / "covisibility.json", covis)
 
+    track_colors = [
+        (200, 80, 60),
+        (60, 180, 90),
+        (70, 120, 220),
+        (220, 180, 40),
+        (180, 60, 200),
+    ]
+
     tracks = {
         "tracks": [
             {
                 "id": 0,
                 "position": {"x": 0.25, "y": 0.05, "z": 2.0},
+                "rgb": list(track_colors[0]),
                 "observations": [
                     {"image_id": 0, "keypoint_index": 0},
                     {"image_id": 1, "keypoint_index": 0},
@@ -134,6 +143,7 @@ def write_recon_fixture(recon_root: Path) -> Path:
             {
                 "id": 1,
                 "position": {"x": 0.35, "y": 0.06, "z": 2.1},
+                "rgb": list(track_colors[1]),
                 "observations": [
                     {"image_id": 0, "keypoint_index": 1},
                     {"image_id": 1, "keypoint_index": 1},
@@ -143,6 +153,7 @@ def write_recon_fixture(recon_root: Path) -> Path:
             {
                 "id": 2,
                 "position": {"x": 0.45, "y": 0.07, "z": 2.2},
+                "rgb": list(track_colors[2]),
                 "observations": [
                     {"image_id": 0, "keypoint_index": 2},
                     {"image_id": 1, "keypoint_index": 2},
@@ -151,6 +162,7 @@ def write_recon_fixture(recon_root: Path) -> Path:
             {
                 "id": 3,
                 "position": {"x": 0.55, "y": 0.08, "z": 2.3},
+                "rgb": list(track_colors[3]),
                 "observations": [
                     {"image_id": 1, "keypoint_index": 3},
                     {"image_id": 2, "keypoint_index": 1},

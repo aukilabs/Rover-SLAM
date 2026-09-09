@@ -1,4 +1,4 @@
-# Prior pack on-disk schema (v1)
+# Prior pack on-disk schema (v1–v2)
 
 Offline prior packs supply everything needed for covisible prior matching without
 recomputing COLMAP tracks at load time. Produced by `scripts/convert_to_prior_pack.py`.
@@ -22,7 +22,7 @@ recomputing COLMAP tracks at load time. Produced by `scripts/convert_to_prior_pa
 
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
-| `format_version` | int | yes | Must be `1` |
+| `format_version` | int | yes | `1` (legacy) or `2` (optional per-track `rgb`) |
 | `coordinate_frame` | object | yes | `name`, `notes` (human-readable frame description) |
 | `descriptor` | object | yes | `type` (`aliked`), `model` (e.g. `aliked-n16`), `dim` (128) |
 | `files` | object | yes | Relative paths: `images`, `portals`, `covisibility`, `tracks`, `features_dir` |
@@ -49,7 +49,9 @@ Same shape as `slam_server` portal manifest: `portals[]` with `shortId`, `physic
 
 ## tracks.json
 
-`tracks[]`: `{ "id": int, "position": {x,y,z}, "observations": [{ "image_id", "keypoint_index" }] }`.
+`tracks[]`: `{ "id": int, "position": {x,y,z}, "observations": [{ "image_id", "keypoint_index" }], "rgb": [r,g,b] }`.
+
+`rgb` is optional (v2 packs; may be absent on individual tracks). When present, each channel is uint8 in 0–255 (COLMAP point color). v1 packs omit `rgb` entirely; loaders treat missing color as unset (fallback applied at display time).
 
 ## features/{id}.npz
 

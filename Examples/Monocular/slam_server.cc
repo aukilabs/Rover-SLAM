@@ -281,6 +281,84 @@ bool requestCausalTrajectory(const httplib::Request& req)
     return false;
 }
 
+enum class MapPointsSource { Live, Prior, Both };
+
+MapPointsSource parseMapPointsSource(const httplib::Request& req)
+{
+    if (!req.has_param("source"))
+        return MapPointsSource::Both;
+    const string v = lowerCopy(req.get_param_value("source"));
+    if (v == "live")
+        return MapPointsSource::Live;
+    if (v == "prior")
+        return MapPointsSource::Prior;
+    return MapPointsSource::Both;
+}
+
+string mapPointsSourceLabel(MapPointsSource source)
+{
+    switch (source) {
+        case MapPointsSource::Live:
+            return "live";
+        case MapPointsSource::Prior:
+            return "prior";
+        default:
+            return "both";
+    }
+}
+
+constexpr size_t kDefaultMapPointsMax = 50000;
+
+size_t parseMaxPointsParam(const httplib::Request& req)
+{
+    if (!req.has_param("max_points"))
+        return kDefaultMapPointsMax;
+    try {
+        const long v = stol(req.get_param_value("max_points"));
+        if (v <= 0)
+            return kDefaultMapPointsMax;
+        return static_cast<size_t>(v);
+    } catch (...) {
+        return kDefaultMapPointsMax;
+    }
+}
+
+size_t computeDownsampleStride(size_t total_count, size_t max_points)
+{
+    if (max_points == 0 || total_count <= max_points)
+        return 1;
+    return (total_count + max_points - 1) / max_points;
+}
+
+struct MapPointWire {
+    float x = 0.f;
+    float y = 0.f;
+    float z = 0.f;
+    uint8_t r = 0;
+    uint8_t g = 0;
+    uint8_t b = 0;
+    string source;
+};
+
+/** Live map points: cyan (top) → teal (bottom) by domain Z. */
+void applyHeightCyanTealRgb(float z, float z_min, float z_max, uint8_t& r, uint8_t& g, uint8_t& b)
+{
+    float t = 0.5f;
+    if (z_max > z_min)
+        t = (z - z_min) / (z_max - z_min);
+    t = std::max(0.f, std::min(1.f, t));
+    r = 0;
+    g = static_cast<uint8_t>(128.f + t * 127.f);
+    b = static_cast<uint8_t>(128.f + t * 127.f);
+}
+
+Eigen::Vector3f applyPinToSlamPoint(const overlay::MapSim3Pin& pin, const Eigen::Vector3f& p_slam)
+{
+    if (!pin.pinned)
+        return p_slam;
+    return pin.scale * (pin.R_domain_slam * p_slam) + pin.t_domain_slam;
+}
+
 bool pathIsSeparator(char c)
 {
     return c == '/' || c == '\\';
@@ -1404,6 +1482,8 @@ struct ServerConfig {
     double processing_timeout = 5.0; // seconds
     /** UTF-8 HTML for GET /index.html (phone camera UI); empty => 404 with hint */
     string index_html_body;
+    /** UTF-8 HTML for GET /viewer (domain 3D viewer); empty => 404 with hint */
+    string viewer_html_body;
 };
 
 // Image request structure
@@ -1688,6 +1768,7 @@ private:
     };
     mutable StageTimingStats stage_timing_;
     string index_html_body_;
+    string viewer_html_body_;
     atomic<bool> shutdown_done_{false};
     vector<float> default_intrinsics_;
     cv::Size slam_input_size_;
@@ -1721,7 +1802,10 @@ private:
     mutable mutex causal_mutex_;
 
 public:
-    SLAMServer(const ServerConfig& config) : config_(config), index_html_body_(config.index_html_body) {
+    SLAMServer(const ServerConfig& config)
+        : config_(config),
+          index_html_body_(config.index_html_body),
+          viewer_html_body_(config.viewer_html_body) {
         default_intrinsics_ = loadDefaultIntrinsics(config_.settings_path);
         slam_input_size_ = loadConfiguredInputSize(config_.settings_path);
         feature_image_size_ = loadFeatureImageSize(config_.settings_path);
@@ -1847,6 +1931,8 @@ public:
             cout << "Detection overlay output directory: " << config_.output_dir << endl;
         if (!index_html_body_.empty())
             cout << "Phone stream UI: http://<this-host>:" << config_.port << "/index.html" << endl;
+        if (!viewer_html_body_.empty())
+            cout << "Domain 3D viewer: http://<this-host>:" << config_.port << "/viewer" << endl;
     }
     
     ~SLAMServer() {
@@ -3889,6 +3975,19 @@ private:
             res.set_content(index_html_body_, "text/html; charset=utf-8");
         });
 
+        http_server_->Get("/viewer", [this](const httplib::Request&, httplib::Response& res) {
+            if (viewer_html_body_.empty()) {
+                res.status = 404;
+                res.set_content(
+                    "viewer.html not found. Place viewer.html next to the slam_server executable "
+                    "(same folder as Examples/Monocular/slam_server when using default CMake output).",
+                    "text/plain; charset=utf-8");
+                return;
+            }
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(viewer_html_body_, "text/html; charset=utf-8");
+        });
+
         // Main tracking endpoint
         http_server_->Post("/api/v1/track", [this](const httplib::Request& req, httplib::Response& res) {
             handleTrackRequest(req, res);
@@ -3902,6 +4001,14 @@ private:
         // Trajectory endpoint
         http_server_->Get("/api/v1/trajectory", [this](const httplib::Request& req, httplib::Response& res) {
             handleTrajectoryRequest(req, res);
+        });
+
+        http_server_->Get("/api/v1/map_points", [this](const httplib::Request& req, httplib::Response& res) {
+            handleMapPointsRequest(req, res);
+        });
+
+        http_server_->Get("/api/v1/portals", [this](const httplib::Request& req, httplib::Response& res) {
+            handlePortalsRequest(req, res);
         });
         
         // Health check endpoint
@@ -4291,6 +4398,126 @@ private:
         writeDebugTrajectoryResponse(response);
         res.set_content(response.dump(), "application/json");
     }
+
+    void handleMapPointsRequest(const httplib::Request& req, httplib::Response& res) {
+        const MapPointsSource source_filter = parseMapPointsSource(req);
+        const size_t max_points = parseMaxPointsParam(req);
+
+        vector<MapPointWire> collected;
+        bool live_included = false;
+        unsigned long current_map_id = 0;
+
+        if ((source_filter == MapPointsSource::Prior || source_filter == MapPointsSource::Both) &&
+            prior_pack_.loaded) {
+            for (const auto& track : prior_pack_.tracks) {
+                MapPointWire pt;
+                pt.x = track.position.x;
+                pt.y = track.position.y;
+                pt.z = track.position.z;
+                if (track.has_rgb) {
+                    pt.r = track.rgb[0];
+                    pt.g = track.rgb[1];
+                    pt.b = track.rgb[2];
+                } else {
+                    pt.r = pt.g = pt.b = 140;
+                }
+                pt.source = "prior";
+                collected.push_back(pt);
+            }
+        }
+
+        if (source_filter == MapPointsSource::Live || source_filter == MapPointsSource::Both) {
+            vector<Eigen::Vector3f> live_domain_positions;
+            if (slam_system_) {
+                lock_guard<mutex> slam_lock(slam_mutex_);
+                current_map_id = slam_system_->GetCurrentMapId();
+                syncActiveMapAlignmentState(current_map_id);
+
+                if (overlay_graph_.isMapPinned(current_map_id)) {
+                    const overlay::MapSim3Pin pin = overlay_graph_.mapPin(current_map_id);
+                    vector<ORB_SLAM3::MapPoint*> map_points;
+                    slam_system_->GetActiveMapMapPoints(map_points);
+                    for (ORB_SLAM3::MapPoint* mp : map_points) {
+                        if (!mp || mp->isBad())
+                            continue;
+                        live_domain_positions.push_back(
+                            applyPinToSlamPoint(pin, mp->GetWorldPos()));
+                    }
+                }
+            }
+
+            if (!live_domain_positions.empty()) {
+                float z_min = numeric_limits<float>::max();
+                float z_max = -numeric_limits<float>::max();
+                for (const auto& p : live_domain_positions) {
+                    z_min = min(z_min, p.z());
+                    z_max = max(z_max, p.z());
+                }
+                for (const auto& p : live_domain_positions) {
+                    MapPointWire pt;
+                    pt.x = p.x();
+                    pt.y = p.y();
+                    pt.z = p.z();
+                    applyHeightCyanTealRgb(p.z(), z_min, z_max, pt.r, pt.g, pt.b);
+                    pt.source = "live";
+                    collected.push_back(pt);
+                }
+                live_included = true;
+            }
+        }
+
+        const size_t total_count = collected.size();
+        const size_t stride = computeDownsampleStride(total_count, max_points);
+
+        json points_json = json::array();
+        for (size_t i = 0; i < total_count; i += stride) {
+            const MapPointWire& pt = collected[i];
+            points_json.push_back({{"x", pt.x},
+                                   {"y", pt.y},
+                                   {"z", pt.z},
+                                   {"r", pt.r},
+                                   {"g", pt.g},
+                                   {"b", pt.b},
+                                   {"source", pt.source}});
+        }
+
+        json response;
+        response["coordinate_frame"] = "domain_colmap";
+        response["source"] = mapPointsSourceLabel(source_filter);
+        response["count"] = points_json.size();
+        response["total_count"] = total_count;
+        response["max_points"] = max_points;
+        response["stride"] = stride;
+        response["points"] = points_json;
+        response["prior_loaded"] = prior_pack_.loaded;
+        response["live_included"] = live_included;
+        if (slam_system_)
+            response["map_id"] = current_map_id;
+
+        res.set_content(response.dump(), "application/json");
+    }
+
+    void handlePortalsRequest(const httplib::Request& req, httplib::Response& res) {
+        json portals_json = json::array();
+        for (const auto& kv : portals_) {
+            const PortalDefinition& portal = kv.second;
+            const Eigen::Vector3f t = portal.T_domain_portal.translation();
+            const Eigen::Quaternionf q(portal.T_domain_portal.so3().matrix());
+            portals_json.push_back({{"short_id", portal.short_id},
+                                    {"physical_size_m", portal.physical_size_m},
+                                    {"position", {t.x(), t.y(), t.z()}},
+                                    {"orientation", {q.w(), q.x(), q.y(), q.z()}}});
+        }
+
+        json response;
+        response["coordinate_frame"] = "domain_colmap";
+        response["count"] = portals_json.size();
+        response["portals"] = portals_json;
+        response["prior_pack_loaded"] = prior_pack_.loaded;
+        response["portal_manifest_loaded"] = !config_.portal_manifest_path.empty();
+
+        res.set_content(response.dump(), "application/json");
+    }
     
     void handleHealthRequest(const httplib::Request& req, httplib::Response& res) {
         json response;
@@ -4309,9 +4536,12 @@ private:
         response["version"] = "1.0.0";
         response["endpoints"] = {
             {"GET /index.html", "Phone camera stream UI (static page)"},
+            {"GET /viewer", "Domain 3D viewer (Three.js; map points, portals, trajectory)"},
             {"POST /api/v1/track", "Submit image for tracking; X-Run-Detector or JSON run_detector queues full-resolution custom detection"},
             {"GET /api/v1/status", "Get server status"},
             {"GET /api/v1/trajectory", "Trajectory (dense default; ?causal=1 live pin history; ?all_maps=1 every atlas map; ?dense=0 keyframes; ?aligned=0 raw SLAM)"},
+            {"GET /api/v1/map_points", "Domain map point cloud (?source=live|prior|both default both; ?max_points downsample stride)"},
+            {"GET /api/v1/portals", "Portal catalog (short_id, domain pose, physical_size_m)"},
             {"GET /api/v1/health", "Health check"}
         };
         response["portal_alignment_enabled"] = !portals_.empty();
@@ -4808,21 +5038,31 @@ static string exe_parent_dir(const char* argv0) {
     return p.substr(0, pos);
 }
 
-static string load_index_html_body(const char* argv0) {
+static string load_static_html_body(const char* argv0, const char* filename, const char* label) {
     const string d = exe_parent_dir(argv0);
-    vector<string> paths = {d + "/index.html", d + "\\index.html", string("Examples/Monocular/index.html")};
+    vector<string> paths = {
+        d + "/" + filename, d + "\\" + filename, string("Examples/Monocular/") + filename};
     for (const auto& path : paths) {
         ifstream f(path, ios::binary);
         if (f.good()) {
             string s((istreambuf_iterator<char>(f)), istreambuf_iterator<char>());
             if (!s.empty()) {
-                cout << "Loaded stream UI from " << path << " (" << s.size() << " bytes)" << endl;
+                cout << "Loaded " << label << " from " << path << " (" << s.size() << " bytes)" << endl;
                 return s;
             }
         }
     }
-    cerr << "Warning: index.html not found; GET /index.html returns 404 (checked next to slam_server and Examples/Monocular/index.html)." << endl;
+    cerr << "Warning: " << filename << " not found; GET route returns 404 (checked next to slam_server and Examples/Monocular/"
+         << filename << ")." << endl;
     return {};
+}
+
+static string load_index_html_body(const char* argv0) {
+    return load_static_html_body(argv0, "index.html", "stream UI");
+}
+
+static string load_viewer_html_body(const char* argv0) {
+    return load_static_html_body(argv0, "viewer.html", "domain 3D viewer");
 }
 
 // Plain function for signal(); must not capture (signal() needs a C function pointer).
@@ -4937,6 +5177,7 @@ int main(int argc, char* argv[]) {
     }
 
     config.index_html_body = load_index_html_body(argv[0]);
+    config.viewer_html_body = load_viewer_html_body(argv[0]);
     
     try {
         cout << "Initializing SLAM Server..." << endl;

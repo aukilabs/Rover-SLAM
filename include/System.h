@@ -213,6 +213,8 @@ public:
     void ClearViewerTopographyMesh();
 
     std::vector<MapPoint*> GetTrackedMapPoints();
+    /** All MapPoints on the active atlas map (caller filters isBad). */
+    void GetActiveMapMapPoints(std::vector<MapPoint*>& out);
     std::vector<cv::KeyPoint> GetTrackedKeyPointsUn();
     cv::Mat GetCurrentFrameDescriptors();
 
