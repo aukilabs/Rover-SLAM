@@ -66,6 +66,7 @@
 
 #include <System.h>
 #include <MapPoint.h>
+#include <PortalObservationStore.h>
 
 // HTTP server library - cpp-httplib (header-only)
 #include "../../include/third_party/httplib.h"
@@ -1206,6 +1207,71 @@ bool isValidScale(float scale)
     return std::isfinite(scale) && scale >= kMinScale && scale <= kMaxScale;
 }
 
+bool portalSeedTransformIsFinite(const Eigen::Matrix3f& R_domain_slam,
+                                   const Eigen::Vector3f& t_domain_slam,
+                                   float scale)
+{
+    return R_domain_slam.allFinite() && t_domain_slam.allFinite() && isValidScale(scale);
+}
+
+/** Pooled-sight domainize gate (slice H): observability at seed pin, residual at solved pin. */
+bool pooledSolvePassesDomainizeGate(
+    const ORB_SLAM3::PooledSim3ObservabilityReport& report,
+    float max_reproj_px)
+{
+    if (report.solve_gauge != "absolute")
+        return false;
+
+    const ORB_SLAM3::Sim3HessianObservability& seed_h = report.seed_pin.hessian;
+    if (!seed_h.valid || seed_h.null_dominant_param == "log_scale")
+        return false;
+
+    const float pooled_reproj = report.solved_pin.mean_reproj_px;
+    if (!std::isfinite(pooled_reproj) || pooled_reproj > max_reproj_px)
+        return false;
+
+    const Eigen::Matrix3f& R = report.solved_pin.R_domain_slam;
+    const Eigen::Vector3f& t = report.solved_pin.t_domain_slam;
+    return portalSeedTransformIsFinite(R, t, report.solved_pin.scale);
+}
+
+/** Live incremental correction gate (slice J): operating-point observability + solved reproj. */
+prior_soft::AlignmentUncertainty alignmentUncertaintyFromPooled(
+    const ORB_SLAM3::PooledSim3ObservabilityReport& report)
+{
+    prior_soft::AlignmentUncertainty unc;
+    const ORB_SLAM3::Sim3HessianObservability& h = report.seed_pin.hessian;
+    unc.has_report =
+        report.portal_sight_count > 0 || report.prior_soft_sight_count > 0;
+    unc.valid = h.valid;
+    unc.null_dominant_param = h.null_dominant_param;
+    unc.sigma_log_s = h.sigma_log_s;
+    unc.sigma_params = h.sigma_params;
+    unc.solve_gauge = report.solve_gauge;
+    unc.seed_reproj_px = report.seed_pin.mean_reproj_px;
+    return unc;
+}
+
+bool pooledSolvePassesLiveScaleGate(
+    const ORB_SLAM3::PooledSim3ObservabilityReport& report,
+    float max_reproj_px)
+{
+    if (report.solve_gauge != "incremental")
+        return false;
+
+    const ORB_SLAM3::Sim3HessianObservability& op_h = report.seed_pin.hessian;
+    if (!op_h.valid || op_h.null_dominant_param == "log_scale")
+        return false;
+
+    const float pooled_reproj = report.solved_pin.mean_reproj_px;
+    if (!std::isfinite(pooled_reproj) || pooled_reproj > max_reproj_px)
+        return false;
+
+    const Eigen::Matrix3f& R = report.solved_pin.R_domain_slam;
+    const Eigen::Vector3f& t = report.solved_pin.t_domain_slam;
+    return portalSeedTransformIsFinite(R, t, report.solved_pin.scale);
+}
+
 float smoothScale(float previous, float target, float alpha)
 {
     if (!isValidScale(previous))
@@ -1388,6 +1454,37 @@ json alignmentSnapshotToJson(const AlignmentSnapshot& alignment)
     out["last_portal_short_id"] = alignment.last_portal_short_id;
     out["last_reprojection_error_px"] = alignment.last_reproj_px;
     out["last_local_points_used"] = alignment.last_local_points_used;
+    return out;
+}
+
+json hessianObservabilityToJson(const ORB_SLAM3::Sim3HessianObservability& h)
+{
+    json out;
+    out["valid"] = h.valid;
+    out["residual_count"] = h.residual_count;
+    out["min_eigenvalue"] = h.min_eigenvalue;
+    out["condition_number"] = h.condition_number;
+    out["null_dominant_param"] = h.null_dominant_param;
+    if (std::isnan(h.sigma_log_s))
+        out["sigma_log_s"] = nullptr;
+    else
+        out["sigma_log_s"] = h.sigma_log_s;
+    out["eigenvalues"] = json::array();
+    for (float ev : h.eigenvalues)
+        out["eigenvalues"].push_back(ev);
+    out["null_direction_loadings"] = json::array();
+    for (float loading : h.null_direction_loadings)
+        out["null_direction_loadings"].push_back(loading);
+    return out;
+}
+
+json pooledPinDiagnosticsToJson(
+    const ORB_SLAM3::PooledSim3ObservabilityReport::PinDiagnostics& pin)
+{
+    json out;
+    out["scale"] = pin.scale;
+    out["mean_reproj_px"] = pin.mean_reproj_px;
+    out["hessian"] = hessianObservabilityToJson(pin.hessian);
     return out;
 }
 
@@ -2192,10 +2289,90 @@ private:
                (frame_id % config_.prior_match_every_nth) == 0;
     }
 
+    void runPooledSolveAndMaybeDomainize(unsigned long map_id) {
+        if (!slam_system_)
+            return;
+
+        auto& portal_store = ORB_SLAM3::PortalObservationStore::Instance();
+        ORB_SLAM3::PortalKeyframePoseResolver resolve_pose;
+        ORB_SLAM3::PooledSim3SolveOptions solve_opts;
+        {
+            lock_guard<mutex> slam_lock(slam_mutex_);
+            solve_opts = slam_system_->PooledSolveOptionsForMap(map_id);
+            resolve_pose = [this, map_id](unsigned long kf_id,
+                                          Eigen::Matrix3f& R_wc,
+                                          Eigen::Vector3f& t_wc) {
+                lock_guard<mutex> slam_lock(slam_mutex_);
+                return slam_system_->ResolveMapKeyframeTwc(map_id, kf_id, R_wc, t_wc);
+            };
+        }
+
+        const ORB_SLAM3::PooledSim3ObservabilityReport pooled_report =
+            portal_store.solvePooledSim3Diagnostics(map_id, resolve_pose, solve_opts);
+
+        const Eigen::Matrix3f& R_pin = pooled_report.solved_pin.R_domain_slam;
+        const Eigen::Vector3f& t_pin = pooled_report.solved_pin.t_domain_slam;
+        const float pin_scale = pooled_report.solved_pin.scale;
+        const size_t pooled_sight_count = pooled_report.sight_count;
+        const float max_reproj = config_.portal_max_reproj_px;
+
+        bool atlas_domainized_now = false;
+        {
+            lock_guard<mutex> slam_lock(slam_mutex_);
+            if (!slam_system_->IsMapDomainized(map_id) &&
+                pooledSolvePassesDomainizeGate(pooled_report, max_reproj) &&
+                slam_system_->TryDomainizeMap(
+                    map_id, R_pin, t_pin, pin_scale, pooled_sight_count)) {
+                overlay_graph_.setAtlasDomainized(map_id, true);
+                atlas_domainized_now = true;
+                cout << "[domainize] map " << map_id
+                     << " domainized via pooled solve (portal+prior-soft)"
+                     << " gauge=" << pooled_report.solve_gauge
+                     << " sights=" << pooled_sight_count
+                     << " portal_sights=" << pooled_report.portal_sight_count
+                     << " prior_soft_sights=" << pooled_report.prior_soft_sight_count
+                     << " prior_soft_residuals=" << pooled_report.prior_soft_residual_count
+                     << " pooled_reproj_px=" << pooled_report.solved_pin.mean_reproj_px
+                     << " seed_valid=" << (pooled_report.seed_pin.hessian.valid ? 1 : 0)
+                     << " seed_null=" << pooled_report.seed_pin.hessian.null_dominant_param
+                     << " seed_sigma_log_s=";
+                if (std::isnan(pooled_report.seed_pin.hessian.sigma_log_s))
+                    cout << "nan";
+                else
+                    cout << pooled_report.seed_pin.hessian.sigma_log_s;
+                cout << " scale=" << pin_scale << endl;
+            } else if (slam_system_->IsMapDomainized(map_id) &&
+                       pooledSolvePassesLiveScaleGate(pooled_report, max_reproj) &&
+                       slam_system_->TryApplyLiveScaleCorrection(
+                           map_id,
+                           R_pin,
+                           t_pin,
+                           pin_scale,
+                           pooled_report.seed_pin.hessian,
+                           pooled_sight_count)) {
+                cout << "[live_scale] map " << map_id
+                     << " incremental correction sights=" << pooled_sight_count
+                     << " prior_soft_sights=" << pooled_report.prior_soft_sight_count
+                     << " pooled_reproj_px=" << pooled_report.solved_pin.mean_reproj_px
+                     << " incremental_scale=" << pin_scale << endl;
+            }
+        }
+        if (atlas_domainized_now) {
+            lock_guard<mutex> lock(alignment_mutex_);
+            setAlignmentIdentityAtlasDomainized(map_id);
+            if (slam_system_) {
+                lock_guard<mutex> slam_lock(slam_mutex_);
+                slam_system_->SetViewerAlignment(
+                    Eigen::Matrix3f::Identity(), Eigen::Vector3f::Zero(), 1.0f);
+            }
+        }
+    }
+
     void tryPriorSoftEdgesAfterTrack(unsigned long map_id,
                                      uint64_t frame_id,
                                      double timestamp,
                                      const Sophus::SE3f& Tcw_slam,
+                                     unsigned long ref_kf_id,
                                      const vector<cv::KeyPoint>& live_kpts,
                                      const cv::Mat& live_desc,
                                      const vector<float>& intrinsics,
@@ -2227,6 +2404,10 @@ private:
                 prior_soft::PriorSoftEdgeMatcher::nearestPriorImageId(prior_pack_, input.Twc_domain);
         }
 
+        const ORB_SLAM3::PooledSim3ObservabilityReport pooled_unc_report =
+            ORB_SLAM3::PortalObservationStore::Instance().pooledObservability(map_id);
+        input.alignment_uncertainty = alignmentUncertaintyFromPooled(pooled_unc_report);
+
         const prior_soft::PriorMatchResult result = prior_soft_matcher_->tryMatch(input);
         if (result.accepted) {
             overlay::PriorSoftEdgeFactor factor = result.factor;
@@ -2235,6 +2416,61 @@ private:
             if (refine.published) {
                 applyOverlayRefineToAlignment(map_id, refine);
             }
+
+            if (ref_kf_id != ORB_SLAM3::kUnresolvedPortalKeyframeId &&
+                !factor.observations.empty() && intrinsics.size() >= 4) {
+                const overlay::MapSim3Pin pin = overlay_graph_.mapPin(map_id);
+                ORB_SLAM3::PriorSoftSight store_sight;
+                store_sight.map_id = map_id;
+                store_sight.kf_id = ref_kf_id;
+                store_sight.prior_image_id = result.matched_prior_image_id;
+                store_sight.fx = intrinsics[0];
+                store_sight.fy = intrinsics[1];
+                store_sight.cx = intrinsics[2];
+                store_sight.cy = intrinsics[3];
+                store_sight.weight = ORB_SLAM3::portalCornerWeightFromReproj(
+                    factor.mean_reproj_px) *
+                                     0.25f;
+                store_sight.frame_id = frame_id;
+                store_sight.timestamp = timestamp;
+                store_sight.reproj_px = factor.mean_reproj_px;
+                store_sight.R_wc_slam = input.Twc_slam.so3().matrix();
+                store_sight.t_wc_slam = input.Twc_slam.translation();
+                {
+                    lock_guard<mutex> slam_lock(slam_mutex_);
+                    store_sight.pose_in_domain_gauge =
+                        slam_system_ && slam_system_->IsMapDomainized(map_id);
+                }
+                store_sight.R_domain_slam = pin.R_domain_slam;
+                store_sight.t_domain_slam_seed =
+                    input.Twc_domain.translation() -
+                    pin.R_domain_slam * input.Twc_slam.translation();
+                store_sight.observations.reserve(factor.observations.size());
+                for (const auto& obs : factor.observations) {
+                    ORB_SLAM3::PriorSoftObservation3D2D stored;
+                    stored.p_domain = obs.p_domain;
+                    stored.pixel = obs.pixel;
+                    store_sight.observations.push_back(stored);
+                }
+                auto& portal_store = ORB_SLAM3::PortalObservationStore::Instance();
+                const float prior_p50 =
+                    result.debug_err_prior_p50 > 0.f ? result.debug_err_prior_p50 : 1.5f;
+                const float live_p50_cap =
+                    result.debug_bypass_live_gate
+                        ? std::max(8.0f * config_.portal_max_reproj_px, 20.0f * prior_p50)
+                        : (result.debug_live_max_reproj_px > 0.f
+                               ? result.debug_live_max_reproj_px
+                               : config_.portal_max_reproj_px);
+                const bool live_p50_ok =
+                    result.debug_err_live_p50 < 0.0f ||
+                    result.debug_err_live_p50 <= live_p50_cap;
+                if (factor.mean_reproj_px <= config_.portal_max_reproj_px &&
+                    (result.debug_bypass_live_gate || live_p50_ok) &&
+                    portal_store.tryAppendPriorSoft(store_sight) > 0) {
+                    runPooledSolveAndMaybeDomainize(map_id);
+                }
+            }
+
             cout << "[prior] soft edge accepted image=" << result.matched_prior_image_id
                  << " seed_img=" << input.seed_prior_image_id
                  << " inliers=" << result.factor.inlier_count
@@ -3623,7 +3859,72 @@ private:
         return estimate;
     }
 
-    void syncActiveMapAlignmentState(unsigned long current_map_id) {
+    void resetAlignmentToPortalWaiting() {
+        alignment_.enabled = !portals_.empty();
+        alignment_.has_transform = false;
+        alignment_.R_domain_slam = Eigen::Matrix3f::Identity();
+        alignment_.t_domain_slam = Eigen::Vector3f::Zero();
+        alignment_.scale = 0.0f;
+        alignment_.has_scale_update_observation = false;
+        alignment_.last_scale_update_p_slam = Eigen::Vector3f::Zero();
+        alignment_.last_scale_update_p_domain = Eigen::Vector3f::Zero();
+        alignment_.scale_source = "none";
+        alignment_.last_portal_short_id.clear();
+        alignment_.last_reproj_px = 0.0f;
+        alignment_.last_local_points_used = 0;
+        alignment_.portal_observations = 0;
+        alignment_.status = portals_.empty()
+            ? "disabled"
+            : "portal_manifest_loaded_waiting_for_detection";
+    }
+
+    void setAlignmentIdentityAtlasDomainized(unsigned long map_id) {
+        alignment_.enabled = !portals_.empty();
+        alignment_.has_transform = true;
+        alignment_.R_domain_slam = Eigen::Matrix3f::Identity();
+        alignment_.t_domain_slam = Eigen::Vector3f::Zero();
+        alignment_.scale = 1.0f;
+        alignment_.scale_source = "atlas_domainized";
+        alignment_.status = "atlas_domainized";
+        map_alignments_[map_id] = alignment_;
+    }
+
+    // Keep overlay atlas_domainized in sync with Map::IsDomainized (e.g. after Map::clear).
+    // When slam_already_locked is true, caller must already hold slam_mutex_.
+    void syncAtlasDomainizedState(unsigned long map_id, bool slam_already_locked = false) {
+        if (!slam_system_)
+            return;
+
+        bool atlas_domainized = false;
+        if (slam_already_locked) {
+            atlas_domainized = slam_system_->IsMapDomainized(map_id);
+        } else {
+            lock_guard<mutex> slam_lock(slam_mutex_);
+            atlas_domainized = slam_system_->IsMapDomainized(map_id);
+        }
+
+        const bool overlay_domainized = overlay_graph_.isAtlasDomainized(map_id);
+        if (!atlas_domainized && overlay_domainized) {
+            overlay_graph_.clearMapAlignment(map_id);
+            ORB_SLAM3::PortalObservationStore::Instance().clearMap(map_id);
+            lock_guard<mutex> lock(alignment_mutex_);
+            map_alignments_.erase(map_id);
+            if (last_synced_map_id_ == map_id)
+                resetAlignmentToPortalWaiting();
+            return;
+        }
+
+        if (atlas_domainized && !overlay_domainized) {
+            overlay_graph_.setAtlasDomainized(map_id, true);
+            lock_guard<mutex> lock(alignment_mutex_);
+            setAlignmentIdentityAtlasDomainized(map_id);
+        }
+    }
+
+    void syncActiveMapAlignmentState(unsigned long current_map_id,
+                                     bool slam_already_locked = false) {
+        syncAtlasDomainizedState(current_map_id, slam_already_locked);
+
         lock_guard<mutex> lock(alignment_mutex_);
         if (last_synced_map_id_ == current_map_id)
             return;
@@ -3665,22 +3966,10 @@ private:
             return;
         }
 
-        alignment_.enabled = !portals_.empty();
-        alignment_.has_transform = false;
-        alignment_.R_domain_slam = Eigen::Matrix3f::Identity();
-        alignment_.t_domain_slam = Eigen::Vector3f::Zero();
-        alignment_.scale = 0.0f;
-        alignment_.has_scale_update_observation = false;
-        alignment_.last_scale_update_p_slam = Eigen::Vector3f::Zero();
-        alignment_.last_scale_update_p_domain = Eigen::Vector3f::Zero();
-        alignment_.scale_source = "none";
-        alignment_.last_portal_short_id.clear();
-        alignment_.last_reproj_px = 0.0f;
-        alignment_.last_local_points_used = 0;
-        alignment_.portal_observations = 0;
-        alignment_.status = portals_.empty()
-            ? "disabled"
-            : "portal_manifest_loaded_waiting_for_detection";
+        resetAlignmentToPortalWaiting();
+
+        if (slam_system_ && slam_system_->IsMapDomainized(current_map_id))
+            setAlignmentIdentityAtlasDomainized(current_map_id);
     }
 
     AlignmentSnapshot mapAlignmentSnapshot(unsigned long map_id, bool request_aligned) const {
@@ -3729,13 +4018,38 @@ private:
             causal_domain_poses_.pop_front();
     }
 
-    void clearDomainAlignmentForMap(unsigned long map_id) {
+    // Returns true when Atlas map geometry is still domainized (flags preserved).
+    bool clearDomainAlignmentForMap(unsigned long map_id) {
+        bool atlas_still_domainized = false;
+        if (slam_system_) {
+            lock_guard<mutex> slam_lock(slam_mutex_);
+            atlas_still_domainized = slam_system_->IsMapDomainized(map_id);
+        }
+
+        // mbDomainized clears only in Map::clear (e.g. ResetActiveMap). Do not clear
+        // overlay/atlas flags on transient tracking loss while geometry stays domainized.
+        if (atlas_still_domainized) {
+            lock_guard<mutex> lock(alignment_mutex_);
+            if (last_synced_map_id_ == map_id) {
+                alignment_.enabled = !portals_.empty();
+                alignment_.has_transform = true;
+                alignment_.R_domain_slam = Eigen::Matrix3f::Identity();
+                alignment_.t_domain_slam = Eigen::Vector3f::Zero();
+                alignment_.scale = 1.0f;
+                alignment_.scale_source = "atlas_domainized";
+                alignment_.status = "tracking_lost_atlas_domainized";
+                map_alignments_[map_id] = alignment_;
+            }
+            return true;
+        }
+
         overlay_graph_.clearMapAlignment(map_id);
+        ORB_SLAM3::PortalObservationStore::Instance().clearMap(map_id);
         // Keep causal domain history — it models what a device already saw; do not wipe on loss.
         lock_guard<mutex> lock(alignment_mutex_);
         map_alignments_.erase(map_id);
         if (last_synced_map_id_ != map_id)
-            return;
+            return false;
 
         alignment_.enabled = !portals_.empty();
         alignment_.has_transform = false;
@@ -3752,13 +4066,25 @@ private:
         alignment_.portal_observations = 0;
         alignment_.status = portals_.empty()
             ? "disabled"
-            : "tracking_lost_domain_cleared";
+            : "tracking_lost_alignment_cleared";
+        return false;
     }
 
     void applyOverlayRefineToAlignment(unsigned long map_id,
                                        const overlay::RefineResult& refine) {
         if (!refine.published)
             return;
+
+        if (overlay_graph_.isAtlasDomainized(map_id) ||
+            (slam_system_ && slam_system_->IsMapDomainized(map_id))) {
+            lock_guard<mutex> lock(alignment_mutex_);
+            setAlignmentIdentityAtlasDomainized(map_id);
+            if (slam_system_) {
+                slam_system_->SetViewerAlignment(
+                    Eigen::Matrix3f::Identity(), Eigen::Vector3f::Zero(), 1.0f);
+            }
+            return;
+        }
 
         lock_guard<mutex> lock(alignment_mutex_);
         alignment_.enabled = !portals_.empty();
@@ -3815,6 +4141,7 @@ private:
                                uint64_t frame_id,
                                double timestamp,
                                unsigned long map_id,
+                               unsigned long ref_kf_id,
                                const vector<float>& intrinsics) {
         syncActiveMapAlignmentState(map_id);
 
@@ -3865,6 +4192,103 @@ private:
 
         overlay::RefineResult refine = overlay_graph_.ingestPortalSight(map_id, sight);
 
+        ORB_SLAM3::PooledSim3ObservabilityReport pooled_report;
+        bool pooled_report_ready = false;
+        if (refine.portal_corners_added) {
+            if (ref_kf_id == ORB_SLAM3::kUnresolvedPortalKeyframeId) {
+                cout << "[portal_store] reject unbound map=" << map_id
+                     << " frame=" << frame_id
+                     << " id=" << sight.short_id
+                     << " reason=no_observing_keyframe" << endl;
+            } else {
+                ORB_SLAM3::PortalCornerSight store_sight;
+                store_sight.map_id = map_id;
+                store_sight.kf_id = ref_kf_id;
+                store_sight.short_id = sight.short_id;
+                store_sight.corners_domain = sight.corners_domain;
+                store_sight.corners_pixel = sight.corners_pixel;
+                store_sight.fx = sight.fx;
+                store_sight.fy = sight.fy;
+                store_sight.cx = sight.cx;
+                store_sight.cy = sight.cy;
+                store_sight.weight =
+                    ORB_SLAM3::portalCornerWeightFromReproj(sight.reproj_px);
+                store_sight.frame_id = sight.frame_id;
+                store_sight.timestamp = sight.timestamp;
+                store_sight.reproj_px = sight.reproj_px;
+                store_sight.R_wc_slam = sight.Twc_slam.so3().matrix();
+                store_sight.t_wc_slam = sight.Twc_slam.translation();
+                store_sight.R_domain_slam = sight.R_domain_slam;
+                store_sight.t_domain_slam_seed =
+                    sight.Twc_domain.translation() -
+                    sight.R_domain_slam * sight.Twc_slam.translation();
+                auto& portal_store = ORB_SLAM3::PortalObservationStore::Instance();
+                if (portal_store.tryAppend(store_sight) > 0) {
+                    portal_store.purgeUnboundSights(map_id);
+                    ORB_SLAM3::PortalKeyframePoseResolver resolve_pose;
+                    ORB_SLAM3::PooledSim3SolveOptions solve_opts;
+                    if (slam_system_) {
+                        lock_guard<mutex> slam_lock(slam_mutex_);
+                        solve_opts = slam_system_->PooledSolveOptionsForMap(map_id);
+                        resolve_pose =
+                            [this, map_id](unsigned long kf_id,
+                                           Eigen::Matrix3f& R_wc,
+                                           Eigen::Vector3f& t_wc) {
+                                lock_guard<mutex> slam_lock(slam_mutex_);
+                                return slam_system_->ResolveMapKeyframeTwc(
+                                    map_id, kf_id, R_wc, t_wc);
+                            };
+                    }
+                    pooled_report = portal_store.solvePooledSim3Diagnostics(
+                        map_id, resolve_pose, solve_opts);
+                    pooled_report_ready = true;
+                }
+            }
+        }
+
+        bool atlas_domainized_now = false;
+        if (slam_system_ && pooled_report_ready) {
+            const Eigen::Matrix3f& R_pin = pooled_report.solved_pin.R_domain_slam;
+            const Eigen::Vector3f& t_pin = pooled_report.solved_pin.t_domain_slam;
+            const float pin_scale = pooled_report.solved_pin.scale;
+            const size_t pooled_sight_count = pooled_report.sight_count;
+            const float max_reproj = config_.portal_max_reproj_px;
+
+            lock_guard<mutex> slam_lock(slam_mutex_);
+            if (!slam_system_->IsMapDomainized(map_id) &&
+                pooledSolvePassesDomainizeGate(pooled_report, max_reproj) &&
+                slam_system_->TryDomainizeMap(
+                    map_id, R_pin, t_pin, pin_scale, pooled_sight_count)) {
+                overlay_graph_.setAtlasDomainized(map_id, true);
+                atlas_domainized_now = true;
+                cout << "[domainize] map " << map_id << " domainized via pooled portal solve"
+                     << " gauge=" << pooled_report.solve_gauge
+                     << " sights=" << pooled_sight_count
+                     << " pooled_reproj_px=" << pooled_report.solved_pin.mean_reproj_px
+                     << " seed_valid=" << (pooled_report.seed_pin.hessian.valid ? 1 : 0)
+                     << " seed_null=" << pooled_report.seed_pin.hessian.null_dominant_param
+                     << " scale=" << pin_scale << endl;
+            } else if (slam_system_->IsMapDomainized(map_id) &&
+                       pooledSolvePassesLiveScaleGate(pooled_report, max_reproj) &&
+                       slam_system_->TryApplyLiveScaleCorrection(
+                           map_id,
+                           R_pin,
+                           t_pin,
+                           pin_scale,
+                           pooled_report.seed_pin.hessian,
+                           pooled_sight_count)) {
+                cout << "[live_scale] map " << map_id
+                     << " incremental correction sights=" << pooled_sight_count
+                     << " pooled_reproj_px=" << pooled_report.solved_pin.mean_reproj_px
+                     << " incremental_scale=" << pin_scale << endl;
+            }
+        }
+        if (slam_system_) {
+            lock_guard<mutex> slam_lock(slam_mutex_);
+            atlas_domainized_now =
+                atlas_domainized_now || slam_system_->IsMapDomainized(map_id);
+        }
+
         bool publish_viewer_alignment = false;
         Eigen::Matrix3f viewer_R_domain_slam = Eigen::Matrix3f::Identity();
         Eigen::Vector3f viewer_t_domain_slam = Eigen::Vector3f::Zero();
@@ -3889,6 +4313,11 @@ private:
                      << " live_edges=" << refine.pin.live_relative_edge_count
                      << " status=" << refine.status
                      << " scale_update=" << refine.scale_update_status << endl;
+            } else if (atlas_domainized_now) {
+                setAlignmentIdentityAtlasDomainized(map_id);
+                cout << "[portal] overlay " << refine.status << " via " << sight.short_id
+                     << " reproj_px=" << sight.reproj_px
+                     << " atlas_domainized alignment=identity" << endl;
             } else {
                 alignment_.has_transform = true;
                 alignment_.R_domain_slam = refine.pin.R_domain_slam;
@@ -3929,9 +4358,14 @@ private:
             }
         }
 
-        if (publish_viewer_alignment && slam_system_) {
-            slam_system_->SetViewerAlignment(
-                viewer_R_domain_slam, viewer_t_domain_slam, viewer_scale);
+        if (slam_system_) {
+            if (atlas_domainized_now) {
+                slam_system_->SetViewerAlignment(
+                    Eigen::Matrix3f::Identity(), Eigen::Vector3f::Zero(), 1.0f);
+            } else if (publish_viewer_alignment) {
+                slam_system_->SetViewerAlignment(
+                    viewer_R_domain_slam, viewer_t_domain_slam, viewer_scale);
+            }
         }
     }
 
@@ -4174,16 +4608,88 @@ private:
         response["alignment"] = alignmentSnapshotToJson(getAlignmentSnapshot(true));
 
         unsigned long active_map_id = 0;
+        bool active_map_domainized = false;
+        uint64_t active_map_portal_ba_edges = 0;
         if (slam_system_) {
             lock_guard<mutex> slam_lock(slam_mutex_);
             active_map_id = slam_system_->GetCurrentMapId();
-            syncActiveMapAlignmentState(active_map_id);
+            syncActiveMapAlignmentState(active_map_id, true);
+            active_map_domainized = slam_system_->IsMapDomainized(active_map_id);
+            active_map_portal_ba_edges =
+                slam_system_->GetMapPortalBaEdgesAdded(active_map_id);
             response["multi_map_publish"] = multiMapPublishToJson(
                 buildMultiMapPublishPlan(active_map_id));
             response["map_id"] = active_map_id;
+            response["domainized"] = active_map_domainized;
+            response["portal_ba_edges"] = {
+                {"map", active_map_portal_ba_edges}
+            };
         }
 
         response["overlay"] = overlay_graph_.statusJson(active_map_id);
+
+        {
+            const ORB_SLAM3::PortalObservationStore& portal_store =
+                ORB_SLAM3::PortalObservationStore::Instance();
+            ORB_SLAM3::PortalSightResolvability resolvability =
+                portal_store.lastResolvability(active_map_id);
+            const float last_solved_reproj_px = resolvability.solved_reproj_px;
+            if (slam_system_) {
+                ORB_SLAM3::PortalKeyframePoseResolver resolve_pose =
+                    [this, active_map_id](unsigned long kf_id,
+                                          Eigen::Matrix3f& R_wc,
+                                          Eigen::Vector3f& t_wc) {
+                        lock_guard<mutex> slam_lock(slam_mutex_);
+                        return slam_system_->ResolveMapKeyframeTwc(
+                            active_map_id, kf_id, R_wc, t_wc);
+                    };
+                resolvability = portal_store.countResolvableSights(
+                    active_map_id,
+                    resolve_pose,
+                    slam_system_->PooledSolveOptionsForMap(active_map_id));
+                resolvability.solved_reproj_px = last_solved_reproj_px;
+            }
+            const ORB_SLAM3::PooledSim3ObservabilityReport pooled_status =
+                portal_store.pooledObservability(active_map_id);
+            const float solved_reproj =
+                resolvability.solved_reproj_px >= 0.0f
+                    ? resolvability.solved_reproj_px
+                    : pooled_status.solved_pin.mean_reproj_px;
+            response["portal_ba_store"] = {
+                {"total", portal_store.count()},
+                {"map", portal_store.countByMap(active_map_id)},
+                {"resolvable", resolvability.resolvable},
+                {"resolvable_map", resolvability.resolvable},
+                {"solved_reproj_px", solved_reproj}
+            };
+            const ORB_SLAM3::PooledSim3ObservabilityReport pooled = pooled_status;
+            json pooled_json;
+            pooled_json["methodology"] =
+                "Weighted LM solve uses per-sight reproj weights; Hessians use unit pixel "
+                "weights (sigma_px=1.0) per scripts/_probe_sim3_conditioning.py. Top-level "
+                "fields mirror seed_pin (pre-LM, scale=1) — primary gate for slice H.";
+            pooled_json["valid"] = pooled.valid;
+            pooled_json["sight_count"] = pooled.sight_count;
+            pooled_json["seed_pin"] = pooledPinDiagnosticsToJson(pooled.seed_pin);
+            pooled_json["solved_pin"] = pooledPinDiagnosticsToJson(pooled.solved_pin);
+            // Backward-compatible aliases of seed_pin gate signal.
+            pooled_json["residual_count"] = pooled.residual_count;
+            pooled_json["condition_number"] = pooled.condition_number;
+            pooled_json["null_dominant_param"] = pooled.null_dominant_param;
+            if (std::isnan(pooled.sigma_log_s))
+                pooled_json["sigma_log_s"] = nullptr;
+            else
+                pooled_json["sigma_log_s"] = pooled.sigma_log_s;
+            pooled_json["scale"] = pooled.scale;
+            pooled_json["mean_reproj_px"] = pooled.mean_reproj_px;
+            pooled_json["hessian_eigenvalues"] = json::array();
+            for (float ev : pooled.hessian_eigenvalues)
+                pooled_json["hessian_eigenvalues"].push_back(ev);
+            pooled_json["null_direction_loadings"] = json::array();
+            for (float loading : pooled.null_direction_loadings)
+                pooled_json["null_direction_loadings"].push_back(loading);
+            response["portal_pooled_sim3"] = pooled_json;
+        }
 
         {
             lock_guard<mutex> lock(causal_mutex_);
@@ -4251,11 +4757,13 @@ private:
         MultiMapPublishPlan publish_plan;
         vector<ORB_SLAM3::System::TrajectorySample> active_samples;
         unordered_map<uint64_t, Sophus::SE3f> Twc_raw_by_frame;
+        bool active_map_domainized = false;
+        uint64_t active_map_portal_ba_edges = 0;
 
         if (slam_system_) {
             lock_guard<mutex> slam_lock(slam_mutex_);
             current_map_id = slam_system_->GetCurrentMapId();
-            syncActiveMapAlignmentState(current_map_id);
+            syncActiveMapAlignmentState(current_map_id, true);
             publish_plan = buildMultiMapPublishPlan(current_map_id);
 
             vector<unsigned long> map_ids = publish_plan.included_map_ids;
@@ -4281,25 +4789,28 @@ private:
 
                 const AlignmentSnapshot map_alignment =
                     request_aligned ? mapAlignmentSnapshot(map_id, true) : mapAlignmentSnapshot(map_id, false);
+                const bool map_atlas_domainized = slam_system_->IsMapDomainized(map_id);
 
                 for (const auto& sample : samples) {
                     if (is_active)
                         Twc_raw_by_frame[sample.id] = sample.Twc;
 
-                    // all_maps=1 is an eval export: apply each map's pin when present.
-                    // Live publish policy still withholds unpinned maps unless active_only.
-                    const bool apply_domain =
-                        request_aligned && mapAlignmentIsDomainPinned(map_alignment) &&
+                    // Atlas domainized: poses are already in domain_colmap (identity overlay).
+                    // Otherwise apply overlay Sim(3) when publish policy requests domain output.
+                    const bool apply_overlay_pin =
+                        request_aligned && !map_atlas_domainized &&
+                        mapAlignmentIsDomainPinned(map_alignment) &&
                         (all_maps || publish_plan.policy == "domain_pinned_merge" ||
                          (publish_plan.policy == "active_only" && is_active));
-                    const Sophus::SE3f Twc = apply_domain
+                    const Sophus::SE3f Twc = apply_overlay_pin
                         ? overlay_graph_.applyPinToTwc(map_id, sample.Twc)
                         : sample.Twc;
 
                     json pose_json = TwcToClientJson(
                         Twc, sample.timestamp, sample.id, sample.is_keyframe);
                     pose_json["map_id"] = map_id;
-                    pose_json["pose_source"] = apply_domain ? "overlay" : "slam";
+                    pose_json["pose_source"] =
+                        map_atlas_domainized ? "slam" : (apply_overlay_pin ? "overlay" : "slam");
                     trajectory_json.push_back(pose_json);
                 }
             }
@@ -4312,6 +4823,10 @@ private:
                 for (const auto& sample : active_samples)
                     Twc_raw_by_frame[sample.id] = sample.Twc;
             }
+
+            active_map_domainized = slam_system_->IsMapDomainized(current_map_id);
+            active_map_portal_ba_edges =
+                slam_system_->GetMapPortalBaEdgesAdded(current_map_id);
         }
 
         const AlignmentSnapshot alignment = getAlignmentSnapshot(request_aligned);
@@ -4360,10 +4875,16 @@ private:
         }
         const bool domain_output =
             request_aligned &&
-            (publish_plan.policy == "domain_pinned_merge" ||
+            (active_map_domainized ||
+             publish_plan.policy == "domain_pinned_merge" ||
              (publish_plan.policy == "active_only" && publish_plan.active_map_domain_aligned));
         response["coordinate_frame"] = domain_output ? "domain_colmap" : "slam";
-        response["pose_source"] = domain_output ? "overlay" : "slam";
+        response["pose_source"] =
+            domain_output ? (active_map_domainized ? "slam" : "overlay") : "slam";
+        response["domainized"] = active_map_domainized;
+        response["portal_ba_edges"] = {
+            {"map", active_map_portal_ba_edges}
+        };
         response["trajectory_mode"] = "final_pin";
         response["pose_mode"] = "final_pin";
         response["alignment"] = alignmentSnapshotToJson(alignment);
@@ -4431,9 +4952,10 @@ private:
             if (slam_system_) {
                 lock_guard<mutex> slam_lock(slam_mutex_);
                 current_map_id = slam_system_->GetCurrentMapId();
-                syncActiveMapAlignmentState(current_map_id);
+                syncActiveMapAlignmentState(current_map_id, true);
 
-                if (overlay_graph_.isMapPinned(current_map_id)) {
+                const bool atlas_domainized = slam_system_->IsMapDomainized(current_map_id);
+                if (atlas_domainized || overlay_graph_.isMapPinned(current_map_id)) {
                     const overlay::MapSim3Pin pin = overlay_graph_.mapPin(current_map_id);
                     vector<ORB_SLAM3::MapPoint*> map_points;
                     slam_system_->GetActiveMapMapPoints(map_points);
@@ -4441,7 +4963,8 @@ private:
                         if (!mp || mp->isBad())
                             continue;
                         live_domain_positions.push_back(
-                            applyPinToSlamPoint(pin, mp->GetWorldPos()));
+                            atlas_domainized ? mp->GetWorldPos()
+                                             : applyPinToSlamPoint(pin, mp->GetWorldPos()));
                     }
                 }
             }
@@ -4832,6 +5355,7 @@ private:
         vector<cv::KeyPoint> prior_match_kpts;
         cv::Mat prior_match_desc;
         unsigned long current_map_id = 0;
+        unsigned long ref_kf_id = ORB_SLAM3::kUnresolvedPortalKeyframeId;
         ORB_SLAM3::FrameTimingMs vo_timing;
         double portal_ms = 0.0;
         double prior_ms = 0.0;
@@ -4852,7 +5376,10 @@ private:
                 if (success) {
                     successful_tracks_++;
                     current_map_id = slam_system_->GetCurrentMapId();
-                    syncActiveMapAlignmentState(current_map_id);
+                    ref_kf_id = slam_system_->GetCurrentReferenceKeyFrameId();
+                    if (ref_kf_id == ORB_SLAM3::kUnresolvedPortalKeyframeId)
+                        ref_kf_id = slam_system_->GetLastKeyFrameId();
+                    syncActiveMapAlignmentState(current_map_id, true);
                     const overlay::RefineResult live_refine = overlay_graph_.recordLivePose(
                         current_map_id,
                         request->frame_id,
@@ -4885,9 +5412,13 @@ private:
                 } else {
                     failed_tracks_++;
                     const unsigned long lost_map_id = slam_system_->GetCurrentMapId();
-                    clearDomainAlignmentForMap(lost_map_id);
-                    cout << "[overlay] tracking lost — cleared domain alignment for map "
-                         << lost_map_id << endl;
+                    const bool preserved_domainized =
+                        clearDomainAlignmentForMap(lost_map_id);
+                    cout << "[overlay] tracking lost — "
+                         << (preserved_domainized
+                                 ? "preserved atlas domainized state"
+                                 : "cleared alignment")
+                         << " for map " << lost_map_id << endl;
                 }
             }
 
@@ -4942,6 +5473,7 @@ private:
                             request->frame_id,
                             request->timestamp,
                             current_map_id,
+                            ref_kf_id,
                             portal_detect_intrinsics);
                         refreshViewerPortalSquares();
                         refreshViewerCustomPoints();
@@ -4964,6 +5496,7 @@ private:
                     request->frame_id,
                     request->timestamp,
                     pose,
+                    ref_kf_id,
                     prior_match_kpts,
                     prior_match_desc,
                     feature_intrinsics,

@@ -75,10 +75,71 @@ int findNearestPriorImageId(const prior_pack::PriorPack& pack, const Sophus::SE3
     return best_id;
 }
 
+float effectivePoseProximityM(const PriorMatchConfig& config,
+                              const AlignmentUncertainty& unc) {
+    float prox = config.pose_proximity_m;
+    if (!unc.has_report || !unc.valid || unc.null_dominant_param == "log_scale")
+        return prox + 15.0f;
+    const float sigma_t = std::max(
+        {unc.sigma_params[4], unc.sigma_params[5], unc.sigma_params[6]});
+    if (std::isfinite(sigma_t))
+        prox += 5.0f * sigma_t;
+    return prox;
+}
+
+size_t effectiveMaxCandidates(const PriorMatchConfig& config,
+                              const AlignmentUncertainty& unc) {
+    size_t n = config.max_candidates;
+    if (!unc.has_report || !unc.valid || unc.null_dominant_param == "log_scale")
+        n = std::max(n, static_cast<size_t>(24));
+    return n;
+}
+
+struct LiveGatePolicy {
+    float live_max_reproj_px = 12.0f;
+    bool bypass_live_gate = false;
+    bool bypass_slam_disagreement = false;
+};
+
+LiveGatePolicy liveGatePolicy(float base_max_reproj_px,
+                              const AlignmentUncertainty& unc,
+                              float fx,
+                              float mean_abs_z) {
+    LiveGatePolicy policy;
+    const bool seed_loose =
+        unc.has_report && std::isfinite(unc.seed_reproj_px) &&
+        unc.seed_reproj_px > base_max_reproj_px;
+    policy.bypass_live_gate = !unc.has_report || !unc.valid ||
+                              unc.null_dominant_param == "log_scale" || seed_loose;
+    if (policy.bypass_live_gate) {
+        policy.live_max_reproj_px = std::numeric_limits<float>::infinity();
+        policy.bypass_slam_disagreement = true;
+        return policy;
+    }
+
+    const float z = std::max(0.5f, mean_abs_z > 0.f ? mean_abs_z : 2.0f);
+    const float sigma_rot = std::max(
+        {unc.sigma_params[0], unc.sigma_params[1], unc.sigma_params[2]});
+    const float sigma_t = std::max(
+        {unc.sigma_params[4], unc.sigma_params[5], unc.sigma_params[6]});
+    const float trans_px =
+        std::isfinite(sigma_t) ? (3.0f * fx * sigma_t / z) : 0.0f;
+    const float rot_px = std::isfinite(sigma_rot) ? (3.0f * fx * sigma_rot) : 0.0f;
+    const float slack = trans_px + rot_px;
+    policy.live_max_reproj_px = std::max(base_max_reproj_px, base_max_reproj_px + slack);
+    policy.bypass_slam_disagreement = policy.live_max_reproj_px > 4.0f * base_max_reproj_px;
+    return policy;
+}
+
 std::vector<int> selectCandidateImages(const PriorMatchInput& input, const PriorMatchConfig& config) {
     const prior_pack::PriorPack& pack = *input.pack;
     if (pack.images.empty())
         return {};
+
+    const float pose_proximity_m =
+        effectivePoseProximityM(config, input.alignment_uncertainty);
+    const size_t max_candidates =
+        effectiveMaxCandidates(config, input.alignment_uncertainty);
 
     int seed = input.seed_prior_image_id;
     if (seed < 0) {
@@ -102,19 +163,19 @@ std::vector<int> selectCandidateImages(const PriorMatchInput& input, const Prior
             const prior_pack::ImageRecord* img = imageById(pack, neighbor);
             if (!img)
                 continue;
-            if (poseCenterDistanceM(*img, input.Twc_domain) > config.pose_proximity_m)
+            if (poseCenterDistanceM(*img, input.Twc_domain) > pose_proximity_m)
                 continue;
         }
         candidates.push_back(neighbor);
         seen.insert(neighbor);
-        if (candidates.size() >= config.max_candidates)
+        if (candidates.size() >= max_candidates)
             break;
     }
 
     if (input.has_domain_pose && candidates.size() > 1) {
         const prior_pack::ImageRecord* seed_img = imageById(pack, seed);
         if (seed_img &&
-            poseCenterDistanceM(*seed_img, input.Twc_domain) > config.pose_proximity_m) {
+            poseCenterDistanceM(*seed_img, input.Twc_domain) > pose_proximity_m) {
             candidates.erase(candidates.begin());
         }
     }
@@ -218,7 +279,8 @@ ReprojGateResult gateWithTrackReprojection(
     const std::vector<cv::KeyPoint>& live_kpts,
     const Sophus::SE3f& Twc_domain,
     const std::vector<float>& intrinsics,
-    float max_reproj_px) {
+    float max_reproj_px,
+    const LiveGatePolicy& live_gate) {
     ReprojGateResult out;
     if (intrinsics.size() < 4)
         return out;
@@ -311,9 +373,13 @@ ReprojGateResult gateWithTrackReprojection(
         if (std::isfinite(err_prior))
             err_prior_samples.push_back(err_prior);
 
-        const bool pass_live = std::isfinite(err_live) && err_live <= max_reproj_px;
         const bool pass_prior = std::isfinite(err_prior) && err_prior <= max_reproj_px;
-        if (pass_live)
+        const bool pass_live_strict =
+            std::isfinite(err_live) && err_live <= max_reproj_px;
+        const bool pass_live =
+            std::isfinite(err_live) &&
+            (live_gate.bypass_live_gate || err_live <= live_gate.live_max_reproj_px);
+        if (pass_live_strict)
             out.diag.pass_live++;
         if (pass_prior)
             out.diag.pass_prior++;
@@ -324,7 +390,7 @@ ReprojGateResult gateWithTrackReprojection(
             continue;
 
         out.inliers++;
-        reproj_sum += err_live;
+        reproj_sum += live_gate.bypass_live_gate ? err_prior : err_live;
         overlay::PriorSoftObservation observation;
         observation.p_domain = p_world;
         observation.pixel = Eigen::Vector2f(live_obs.x, live_obs.y);
@@ -522,6 +588,12 @@ PriorMatchResult PriorSoftEdgeMatcher::tryMatch(const PriorMatchInput& input) {
         }
         result.debug_lg_matches = std::max(result.debug_lg_matches, lg_matches);
 
+        const LiveGatePolicy live_gate = liveGatePolicy(
+            config_.max_reproj_px,
+            input.alignment_uncertainty,
+            input.intrinsics.empty() ? 1000.0f : input.intrinsics[0],
+            result.debug_mean_abs_z_live);
+
         const ReprojGateResult gate =
             gateWithTrackReprojection(
                 *input.pack,
@@ -531,7 +603,8 @@ PriorMatchResult PriorSoftEdgeMatcher::tryMatch(const PriorMatchInput& input) {
                 input.live_kpts,
                 input.Twc_domain,
                 input.intrinsics,
-                config_.max_reproj_px);
+                config_.max_reproj_px,
+                live_gate);
 
         result.debug_best_inliers = std::max(result.debug_best_inliers, gate.inliers);
         if (gate.diag.with_track >= result.debug_with_track) {
@@ -547,7 +620,8 @@ PriorMatchResult PriorSoftEdgeMatcher::tryMatch(const PriorMatchInput& input) {
         if (gate.inliers < config_.min_inliers)
             continue;
 
-        if (disagreesWithSlamPin(
+        if (!live_gate.bypass_slam_disagreement &&
+            disagreesWithSlamPin(
                 gate,
                 input.Twc_domain,
                 input.intrinsics,
@@ -609,6 +683,15 @@ PriorMatchResult PriorSoftEdgeMatcher::tryMatch(const PriorMatchInput& input) {
     result.debug_pass_live = best_gate.diag.pass_live;
     result.debug_pass_prior = best_gate.diag.pass_prior;
     result.debug_pass_both = best_gate.diag.pass_both;
+    {
+        const LiveGatePolicy accept_gate = liveGatePolicy(
+            config_.max_reproj_px,
+            input.alignment_uncertainty,
+            input.intrinsics.empty() ? 1000.0f : input.intrinsics[0],
+            best_gate.diag.mean_abs_z_live);
+        result.debug_bypass_live_gate = accept_gate.bypass_live_gate;
+        result.debug_live_max_reproj_px = accept_gate.live_max_reproj_px;
+    }
     return result;
 }
 

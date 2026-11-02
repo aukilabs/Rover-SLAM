@@ -47,7 +47,7 @@ Submit an image for SLAM tracking.
 ```
 
 #### `GET /api/v1/status`
-Get current server status and statistics (queue, tracker, portal alignment, **prior pack**, **multi-map publish**, **overlay**, **nav_pose**, **pose_source**). See **[slam_server_api.md](slam_server_api.md)** for the full schema.
+Get current server status and statistics (queue, tracker, portal alignment, **domainized** / **portal_ba_edges**, **prior pack**, **multi-map publish**, **overlay**, **nav_pose**, **pose_source**). See **[slam_server_api.md](slam_server_api.md)** for the full schema.
 
 **Response Format (core fields):**
 ```json

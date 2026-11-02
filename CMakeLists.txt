@@ -117,6 +117,7 @@ src/Atlas.cc
 src/Map.cc
 src/MapDrawer.cc
 src/Optimizer.cc
+src/PortalObservationStore.cc
 src/Frame.cc
 src/KeyFrameDatabase.cc
 src/Sim3Solver.cc
@@ -154,6 +155,7 @@ include/Atlas.h
 include/Map.h
 include/MapDrawer.h
 include/Optimizer.h
+include/PortalObservationStore.h
 include/Frame.h
 include/KeyFrameDatabase.h
 include/Sim3Solver.h

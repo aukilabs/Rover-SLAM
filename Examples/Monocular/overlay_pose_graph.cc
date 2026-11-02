@@ -190,6 +190,17 @@ Sophus::SE3f applyPinFormula(const MapSim3Pin& pin, const Sophus::SE3f& Twc_slam
     return Sophus::SE3f(R, t);
 }
 
+void applyIdentityAtlasPin(MapSim3Pin& pin)
+{
+    pin.R_domain_slam = Eigen::Matrix3f::Identity();
+    pin.t_domain_slam = Eigen::Vector3f::Zero();
+    pin.scale = 1.0f;
+    pin.seed_scale = 1.0f;
+    pin.scale_source = "atlas_domainized";
+    pin.seeded = true;
+    pin.pinned = true;
+}
+
 }  // namespace
 
 OverlayPoseGraph::MapGraph& OverlayPoseGraph::graphFor(unsigned long map_id)
@@ -358,7 +369,7 @@ RefineResult OverlayPoseGraph::recordLivePose(unsigned long map_id,
     MapSim3Pin& pin = graph.pin;
 
     const bool should_refine =
-        pin.pinned && pin.seeded && !graph.portal_corners.empty() &&
+        !graph.atlas_domainized && pin.pinned && pin.seeded && !graph.portal_corners.empty() &&
         pin.last_corner_rmse_px <= kMaxCornerRmsePx &&
         is_keyframe && (frame_id % kLiveEdgeRefineCadence == 0);
     if (should_refine) {
@@ -466,10 +477,24 @@ RefineResult OverlayPoseGraph::ingestPortalSight(unsigned long map_id, const Por
     const size_t corners_before = graph.portal_corners.size();
     addPortalCornerFactors(map_id, sight);
     const bool added_corners = graph.portal_corners.size() > corners_before;
+    result.portal_corners_added = added_corners;
 
     MapSim3Pin& pin = graph.pin;
     pin.last_portal_short_id = sight.short_id;
     pin.last_reproj_px = sight.reproj_px;
+
+    if (graph.atlas_domainized) {
+        applyIdentityAtlasPin(pin);
+        graph.has_origin_vertex = false;
+        ensureOriginVertex(graph);
+        updatePinCounts(pin, graph);
+        result.seeded_or_refined = added_corners;
+        result.published = true;
+        result.pin = pin;
+        result.status = "atlas_domainized";
+        result.scale_update_status = "skipped";
+        return result;
+    }
 
     const bool had_pin = pin.seeded && pin.pinned;
     const Eigen::Vector3f p_slam = sight.Twc_slam.translation();
@@ -515,6 +540,26 @@ void OverlayPoseGraph::clearMapAlignment(unsigned long map_id)
     maps_.erase(map_id);
 }
 
+void OverlayPoseGraph::setAtlasDomainized(unsigned long map_id, bool domainized)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    MapGraph& graph = graphFor(map_id);
+    graph.atlas_domainized = domainized;
+    if (domainized) {
+        applyIdentityAtlasPin(graph.pin);
+        graph.has_origin_vertex = false;
+        ensureOriginVertex(graph);
+        updatePinCounts(graph.pin, graph);
+    }
+}
+
+bool OverlayPoseGraph::isAtlasDomainized(unsigned long map_id) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = maps_.find(map_id);
+    return it != maps_.end() && it->second.atlas_domainized;
+}
+
 RefineResult OverlayPoseGraph::addPriorSoftEdgeFactor(unsigned long map_id,
                                                       const PriorSoftEdgeFactor& factor)
 {
@@ -545,7 +590,7 @@ RefineResult OverlayPoseGraph::addPriorSoftEdgeFactor(unsigned long map_id,
     last_prior_soft_edge_ = stored;
 
     MapSim3Pin& pin = graph.pin;
-    if (pin.seeded && !graph.portal_corners.empty()) {
+    if (!graph.atlas_domainized && pin.seeded && !graph.portal_corners.empty()) {
         if (refineMapSim3(graph, "prior_soft")) {
             updatePinCounts(pin, graph);
             result.seeded_or_refined = true;
@@ -638,6 +683,11 @@ NavPoseResult OverlayPoseGraph::navPoseFromSlam(unsigned long map_id,
     if (it == maps_.end() || !it->second.pin.pinned)
         return out;
 
+    if (it->second.atlas_domainized) {
+        out.pose_source = "slam";
+        return out;
+    }
+
     out.Twc = applyPinFormula(it->second.pin, Twc_slam);
     out.pose_source = "overlay";
     return out;
@@ -661,6 +711,8 @@ json OverlayPoseGraph::statusJson(unsigned long active_map_id) const
 
     const auto active_it = maps_.find(active_map_id);
     out["active_map_pinned"] = active_it != maps_.end() && active_it->second.pin.pinned;
+    out["active_map_atlas_domainized"] =
+        active_it != maps_.end() && active_it->second.atlas_domainized;
 
     out["prior_soft_edges_accepted"] = prior_soft_edges_accepted_;
     out["prior_soft_edges_rejected"] = prior_soft_edges_rejected_;
@@ -690,6 +742,7 @@ json OverlayPoseGraph::statusJson(unsigned long active_map_id) const
         const MapSim3Pin& pin = graph.pin;
         json row;
         row["map_id"] = map_id;
+        row["atlas_domainized"] = graph.atlas_domainized;
         row["pinned"] = pin.pinned;
         row["seeded"] = pin.seeded;
         row["keyframe_vertex_count"] = pin.keyframe_vertex_count;

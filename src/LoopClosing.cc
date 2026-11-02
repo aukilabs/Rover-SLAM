@@ -95,6 +95,21 @@ void LoopClosing::SetLocalMapper(LocalMapping *pLocalMapper)
     mpLocalMapper=pLocalMapper;
 }
 
+void LoopClosing::RequestAbortGlobalBA()
+{
+    if (!isRunningGBA())
+        return;
+    unique_lock<mutex> lock(mMutexGBA);
+    mbStopGBA = true;
+    mnFullBAIdx++;
+    if (mpThreadGBA)
+    {
+        mpThreadGBA->detach();
+        delete mpThreadGBA;
+        mpThreadGBA = nullptr;
+    }
+}
+
 /**
  * @brief 回环线程主函数
  */

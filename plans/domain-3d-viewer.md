@@ -1,6 +1,7 @@
 # Initiative: domain-3d-viewer
 
-Status: active  
+Status: done  
+
 Tier: feature  
 Stage: 9-verify (S1–S3 code done; awaiting human visual on /viewer)  
 Skips: _(none)_  
@@ -87,15 +88,18 @@ Living document — update in place when later work changes earlier conclusions.
 - **Approvals (2026-09-08):** Human mass-approved all remaining slices S1–S3 (`206efb47…`, `416e376f…`, `ff434fbb…`). Implement one slice per subagent with review/verify between; skip re-asking until blocked or done. S3 still has human visual check after verify.
 - **S1 done:** Prior RGB plumbing (format_version 2, loader has_rgb, test_prior_pack_rgb.py PASS). Board → done.
 - **S2 done:** GET /api/v1/map_points + /api/v1/portals; System::GetActiveMapMapPoints; docs. Board → done.
-- **S3 done (code + live API):** `viewer.html` + GET /viewer; rebuild `slam_server` (build_s1); curl `/viewer` 200 text/html; prior map_points RGB + portals OK. Board → done. **Human visual (§5 #7) still pending.**
+- **S3 done (code + live API):** `viewer.html` + GET /viewer; rebuild `slam_server` (build_s1); curl `/viewer` 200 text/html; prior map_points RGB + portals OK. Board → done.
+- **Post-S3 polish (committed `475cbc2`):** sRGB prior colors, thicker traj, domain-only traj until pin, 500 ms poll; holdout `/viewer` used live.
+- **MM KF-retry experiment:** A/B showed no robustness win vs outer `TrackReferenceKeyFrame`; not shipped (working tree reverted to HEAD).
 
 ## 8. Verification record
 
 - S1: `python scripts/test_prior_pack_rgb.py` OK; fixture v2 with rgb; C++ loader exposes has_rgb.
 - S2: Handlers/routes/docs match §5 #2–#5; later covered by S3 live smoke.
-- S3: Live WSL — `GET /viewer` 200 `text/html`; `map_points?source=prior` with rgb; portals `FIXTURE01`; trajectory OK. §5 #6–#7 holdout+browser deferred to human.
+- S3: Live WSL — `GET /viewer` 200 `text/html`; `map_points?source=prior` with rgb; portals `FIXTURE01`; trajectory OK.
+- Human visual (§5 #6–#7): accepted 2026-09-09 — holdout replay on `/viewer` (ngrok/8082) with RGB prior + portals + traj.
 
 ## Gate (stage 11)
 
-- **Decision:**  
-- **Notes:**
+- **Decision:** accept  
+- **Notes:** Human approved 2026-09-09. Intent met (domain 3D PC viewer). Design respected. §5 agent checks + human visual pass. Initiative → done.

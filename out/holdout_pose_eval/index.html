@@ -101,11 +101,11 @@
 </head>
 <body>
   <main>
-    <h1>Holdout: VO vs portal hard alignment</h1>
+    <h1>Holdout: live domain vs final pin</h1>
     <p class="sub">
-      GT = <strong>global</strong> refined SfM (<code>refined_sfm_combined</code>, holdout scan images).
-      Baseline = VO Umeyama (sync/noretry) · New = prior-pack portal-domain poses
-      (identity — no Umeyama). Soft edges use <code>Twc_domain</code> from the portal pin.
+      GT = <strong>global</strong> refined SfM. Plots show VO Umeyama,
+      <strong style="color:#c45c26">live/causal domain</strong> (device-view history after pin),
+      and <strong style="color:#0f7b3a">final-pin retcon</strong> (last Sim3 × full SLAM traj).
     </p>
 
     <div class="warn" id="hypothesis">
@@ -124,7 +124,7 @@
           <img src="baseline/holdout_pose_topdown.png" alt="Baseline top-down" />
         </div>
         <div class="col new">
-          <h3>New: VO Umeyama + portal domain overlay</h3>
+          <h3>New: VO + final-pin + live/causal domain</h3>
           <img src="new/holdout_pose_topdown.png" alt="New top-down" />
         </div>
       </div>
@@ -138,13 +138,13 @@
           <img src="baseline/holdout_pose_rot_rel.png" alt="Baseline rot rel" />
         </div>
         <div class="col new">
-          <h3>Portal-domain position error vs GLOBAL GT</h3>
+          <h3>Domain ATE: live/causal vs final-pin</h3>
           <img src="new/holdout_pose_rot_rel.png" alt="Domain ATE series" />
         </div>
       </div>
       <p class="note">
-        Right plot: identity match of domain API poses to global OpenGL camera centers for the
-        holdout scan. This is the hard-pin quality metric (same frame as prior pack / portals).
+        Orange = causal live history (what a device trusting the latest pose would accumulate after pin).
+        Green = final Sim3 applied to the entire SLAM trajectory after the run.
       </p>
     </section>
 
@@ -205,6 +205,8 @@
       const pinReproj = pinnedMaps[0] && pinnedMaps[0].last_reprojection_error_px;
       const direct = neu.portal_domain_direct || (cmp && cmp.portal_domain_direct) || {};
       const map0 = neu.portal_domain_direct_map0 || (cmp && cmp.portal_domain_direct_map0) || {};
+      const causal = neu.portal_domain_causal || (cmp && cmp.portal_domain_causal) || {};
+      const map0c = neu.portal_domain_causal_map0 || (cmp && cmp.portal_domain_causal_map0) || {};
       const voNew = neu.vo_umeyama || (cmp && cmp.vo_umeyama) || {};
       const domU = neu.portal_domain_umeyama || (cmp && cmp.portal_domain_umeyama) || {};
 
@@ -213,29 +215,28 @@
         `<strong>Pin / soft edges:</strong> pinned maps=[${esc(pinned)}] · soft_edges_accepted=${esc(soft)} · ` +
         `portal scale=${esc(pinScale != null ? Number(pinScale).toFixed(3) : "—")} · ` +
         `portal reproj=${esc(pinReproj != null ? Number(pinReproj).toFixed(2) + " px" : "—")}<br/>` +
-        `Map0 overlay direct ATE median=${esc(cm(map0.ate_median_m))} · ` +
-        `all-overlay direct ATE median=${esc(cm(direct.ate_median_m))} · ` +
-        `domain Umeyama ATE median=${esc(cm(domU.ate_median_m))} · ` +
-        `same-run VO Umeyama ATE median=${esc(cm(voNew.ate_median_m))}`;
+        `<strong style="color:#c45c26">Live/causal</strong> map0 ATE median=${esc(cm(map0c.ate_median_m))} (n=${esc(map0c.matched ?? "—")}) · ` +
+        `<strong style="color:#0f7b3a">Final-pin</strong> map0 ATE median=${esc(cm(map0.ate_median_m))} (n=${esc(map0.matched ?? "—")}) · ` +
+        `VO Umeyama=${esc(cm(voNew.ate_median_m))}`;
 
       const cards = [
         ["Baseline ATE median", bo.ate_median_m != null ? cm(bo.ate_median_m) : "—"],
-        ["Map0 portal direct ATE", map0.ate_median_m != null ? cm(map0.ate_median_m) : "—"],
-        ["Overlay direct ATE", direct.ate_median_m != null ? cm(direct.ate_median_m) : "—"],
+        ["Live/causal map0 ATE", map0c.ate_median_m != null ? cm(map0c.ate_median_m) : "—"],
+        ["Final-pin map0 ATE", map0.ate_median_m != null ? cm(map0.ate_median_m) : "—"],
         ["Same-run VO Umeyama ATE", voNew.ate_median_m != null ? cm(voNew.ate_median_m) : "—"],
         ["Soft edges accepted", soft != null ? String(soft) : "—"],
-        ["Map0 matched", map0.matched ?? "—"],
+        ["Causal matched", map0c.matched ?? causal.matched ?? "—"],
       ];
       document.getElementById("summary").innerHTML = cards.map(([k, v]) =>
         `<div class="stat"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`
       ).join("");
 
       const rows = [
-        ["Metric", "Baseline VO", "Map0 portal direct", "All overlay direct", "Same-run VO"],
-        ["matched", bo.matched, map0.matched, direct.matched, voNew.matched],
-        ["ATE median", cm(bo.ate_median_m), cm(map0.ate_median_m), cm(direct.ate_median_m), cm(voNew.ate_median_m)],
-        ["ATE RMSE", cm(bo.ate_rmse_m), cm(map0.ate_rmse_m), cm(direct.ate_rmse_m), cm(voNew.ate_rmse_m)],
-        ["Rot rel median", deg(rotMed(bo)), "—", "—", "—"],
+        ["Metric", "Baseline VO", "Live/causal map0", "Final-pin map0", "Same-run VO"],
+        ["matched", bo.matched, map0c.matched, map0.matched, voNew.matched],
+        ["ATE median", cm(bo.ate_median_m), cm(map0c.ate_median_m), cm(map0.ate_median_m), cm(voNew.ate_median_m)],
+        ["ATE RMSE", cm(bo.ate_rmse_m), cm(map0c.ate_rmse_m), cm(map0.ate_rmse_m), cm(voNew.ate_rmse_m)],
+        ["All-maps causal / final", "—", cm(causal.ate_median_m), cm(direct.ate_median_m), "—"],
       ];
       const head = rows[0];
       const body = rows.slice(1);

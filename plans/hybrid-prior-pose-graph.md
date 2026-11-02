@@ -1,10 +1,10 @@
 # Initiative: Hybrid prior map + pose graph
 
-Status: active  
+Status: done  
 Tier: feature  
-Stage: 7-implement (S9-clean landed; S10 parked; live w/wo map OK — good for now)  
+Stage: 11-release (accepted — no per-keyframe pose graph)  
 Skips: _(none)_  
-Last updated: 2026-09-08 (live field check: map optional; domain-3d-viewer next product UI)
+Last updated: 2026-09-08 (human accept: done without S10 keyframe Sim3 graph)
 
 Living document — update in place when later work changes earlier conclusions.  
 **§1 Intent (feature) and §4 System design stay distinct — never merge.**
@@ -226,5 +226,5 @@ Living document — update in place when later work changes earlier conclusions.
 
 ## Gate (stage 11)
 
-- **Decision:** _(pending — bounce mid-flight)_  
-- **Notes:** Re-confirm §4 factor model; approve S4′ then S5′ (or mass-approve remaining).
+- **Decision:** **accept** (2026-09-08 — human)  
+- **Notes:** v1 closed **without** per-keyframe Sim3 pose graph (S10 not shipped; stays deferred). Live tests with and without prior map OK. Soft-map help unclear but good enough. Deferred: S10, EigenPlaces, KF back-track, S6 phone polish if still wanted later.

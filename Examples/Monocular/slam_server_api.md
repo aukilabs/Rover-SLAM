@@ -169,6 +169,10 @@ X-Run-Detector: 1
 | `tracking_state` | ORB-SLAM3 tracking state (when SLAM is initialized). |
 | `is_lost` | Whether the tracker reports lost (when SLAM is initialized). |
 | `map_id` | Current atlas active map id (same as `multi_map_publish.active_map_id` when SLAM is initialized). |
+| `domainized` | `true` when the active Atlas map has been bulk-rewritten into the domain/COLMAP frame (`Map::IsDomainized`). After domainize, trajectory uses raw Atlas poses (identity overlay); portal constraints enter Atlas BA instead of overlay Sim(3) refine. |
+| `portal_ba_edges` | `{ "map": N }` — cumulative portal corner edges injected into Atlas Local/Global BA for the active map (`Map::GetPortalBaEdgesAdded`). |
+| `portal_ba_store` | `{ "total", "map" }` — accepted portal corner sights queued for Atlas BA (`PortalObservationStore`). |
+| `portal_pooled_sim3` | Pooled-sight Sim(3) observability (diagnostic only — not applied to Atlas). **Methodology:** the weighted LM `solved_pin` uses per-sight reproj weights (`kPortalCornerBaseWeight / reproj_px`); both `seed_pin` and `solved_pin` Hessians use **unit pixel weights** with `sigma_px = 1.0`, matching `scripts/_probe_sim3_conditioning.py`. **Primary gate** (top-level `valid`, `sigma_log_s`, …) mirrors `seed_pin`: Hessian at scale=1 PnP seed **before** LM. `sigma_log_s` is `null` when scale is unobservable (`log_scale` in null space, `residual_count < 7`, or rank-deficient H). `solved_pin` reports post-LM curvature separately. Updated after each accepted portal sight append. |
 | `alignment` | Portal alignment status (same object as `GET /api/v1/trajectory`). |
 | `multi_map_publish` | Multi-map trajectory publish policy — see [Multi-map publish policy](#multi-map-publish-policy-multi_map_publish). Present when SLAM is initialized. |
 | `overlay` | Overlay pose-graph status (portal pins, prior soft edges). See [Overlay (`overlay`)](#overlay-overlay). |
@@ -184,6 +188,35 @@ X-Run-Detector: 1
   "queue_size": 0,
   "is_lost": false,
   "map_id": 2,
+  "domainized": true,
+  "portal_ba_edges": { "map": 12 },
+  "portal_ba_store": { "total": 3, "map": 3 },
+  "portal_pooled_sim3": {
+    "methodology": "Weighted LM solve uses per-sight reproj weights; Hessians use unit pixel weights (sigma_px=1.0). Top-level fields mirror seed_pin (pre-LM, scale=1).",
+    "valid": false,
+    "sight_count": 3,
+    "seed_pin": {
+      "scale": 1.0,
+      "mean_reproj_px": 4.8,
+      "hessian": {
+        "valid": false,
+        "residual_count": 12,
+        "condition_number": 1.2e18,
+        "null_dominant_param": "log_scale",
+        "sigma_log_s": null,
+        "eigenvalues": [1e-6, 0.01, 0.5, 1.2, 3.4, 8.1, 1.2e6]
+      }
+    },
+    "solved_pin": {
+      "scale": 0.465,
+      "mean_reproj_px": 2.1,
+      "hessian": { "valid": true, "sigma_log_s": 0.0046, "null_dominant_param": "omega_z" }
+    },
+    "sigma_log_s": null,
+    "null_dominant_param": "log_scale",
+    "scale": 1.0,
+    "mean_reproj_px": 4.8
+  },
   "multi_map_publish": {
     "policy": "active_only",
     "active_map_id": 2,
@@ -224,16 +257,17 @@ Present on `GET /api/v1/status` and `GET /api/v1/trajectory`.
 | `active_map_id` | Atlas map id passed to the overlay. |
 | `pinned_map_ids` | Maps with a stored portal `Sim(3)` pin to domain. |
 | `active_map_pinned` | Whether the **active** map is domain-pinned. |
+| `active_map_atlas_domainized` | Whether the **active** map uses Atlas domainize (overlay Sim(3) refine retired; identity pin for publish). |
 | `prior_soft_edges_accepted` | Count of gated prior-match soft edges accepted into the overlay graph. **Demo:** watch this increment when live↔prior LightGlue + reprojection succeeds (or set `ROVER_PRIOR_SOFT_EDGE_FIXTURE_SMOKE=1` at startup for fixture smoke). |
 | `prior_soft_edges_last` | When `prior_soft_edges_accepted` > 0: last edge `frame_id`, `prior_image_id`, `inlier_count`, `mean_reproj_px`, `weight`. |
-| `maps` | Per-map rows: `map_id`, `pinned`, `live_node_count`, `portal_factor_count`, `prior_soft_edge_count`, and when pinned `scale`, `scale_source`, `last_portal_short_id`, `last_reprojection_error_px`. |
+| `maps` | Per-map rows: `map_id`, `atlas_domainized`, `pinned`, `live_node_count`, `portal_factor_count`, `prior_soft_edge_count`, and when pinned `scale`, `scale_source`, `last_portal_short_id`, `last_reprojection_error_px`. When `atlas_domainized` is true, overlay Sim(3) refine and live-edge KF BA are skipped. |
 
 ### `nav_pose` and `pose_source`
 
 - **`nav_pose`:** Same pose JSON shape as `trajectory[]` entries (`position`, `orientation`, `frame_id`, …). Emitted when a recent SLAM pose exists.
 - **`pose_source`:** Top-level on status/trajectory responses.
-  - `slam` — raw ORB-SLAM coordinates (or active unpinned map).
-  - `overlay` — domain navigation pose after portal pin / overlay `Sim(3)` (and trajectory merge policy when domain-aligned).
+  - `slam` — raw ORB-SLAM coordinates (or active unpinned map). Also used when `domainized` is true: Atlas poses are already in `domain_colmap` with identity overlay.
+  - `overlay` — domain navigation pose after portal pin / overlay `Sim(3)` (and trajectory merge policy when domain-aligned, pre-domainize).
 
 Per-pose `trajectory[].pose_source` mirrors the transform applied to that sample.
 
@@ -291,6 +325,8 @@ If the server was started with `--debug-output <dir>`, every trajectory response
     }
   ],
   "map_id": 0,
+  "domainized": true,
+  "portal_ba_edges": { "map": 8 },
   "multi_map_publish": {
     "policy": "domain_pinned_merge",
     "active_map_id": 2,

@@ -249,6 +249,9 @@ void Map::clear()
     mvpKeyFrameOrigins.clear();
     mbIMU_BA1 = false;
     mbIMU_BA2 = false;
+    mbDomainized = false;
+    mAppliedDomainPin = DomainAppliedPin{};
+    mnPortalBaEdgesAdded = 0;
 }
 
 bool Map::IsInUse()
@@ -264,6 +267,55 @@ void Map::SetBad()
 bool Map::IsBad()
 {
     return mbBad;
+}
+
+bool Map::IsDomainized()
+{
+    unique_lock<mutex> lock(mMutexMap);
+    return mbDomainized;
+}
+
+void Map::SetDomainized(bool domainized)
+{
+    unique_lock<mutex> lock(mMutexMap);
+    mbDomainized = domainized;
+}
+
+void Map::ClearDomainized()
+{
+    unique_lock<mutex> lock(mMutexMap);
+    mbDomainized = false;
+    mAppliedDomainPin = DomainAppliedPin{};
+}
+
+void Map::SetAppliedDomainPin(const DomainAppliedPin& pin)
+{
+    unique_lock<mutex> lock(mMutexMap);
+    mAppliedDomainPin = pin;
+}
+
+Map::DomainAppliedPin Map::GetAppliedDomainPin()
+{
+    unique_lock<mutex> lock(mMutexMap);
+    return mAppliedDomainPin;
+}
+
+void Map::ClearAppliedDomainPin()
+{
+    unique_lock<mutex> lock(mMutexMap);
+    mAppliedDomainPin = DomainAppliedPin{};
+}
+
+void Map::AddPortalBaEdges(uint64_t n)
+{
+    unique_lock<mutex> lock(mMutexMap);
+    mnPortalBaEdgesAdded += n;
+}
+
+uint64_t Map::GetPortalBaEdgesAdded()
+{
+    unique_lock<mutex> lock(mMutexMap);
+    return mnPortalBaEdgesAdded;
 }
 
 // 恢复尺度及重力方向

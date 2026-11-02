@@ -119,6 +119,32 @@ public:
 
     void ApplyScaledRotation(const Sophus::SE3f &T, const float s, const bool bScaledVel=false);
 
+    /** True after portal seed Sim(3) bulk rewrite (fuse-prior-into-ba domainize-once). */
+    bool IsDomainized();
+    void SetDomainized(bool domainized);
+    void ClearDomainized();
+
+    /** Pins for domainize + live incremental corrections (slice J). */
+    struct DomainAppliedPin {
+        /** Absolute SLAM→domain from initial domainize only. */
+        Eigen::Matrix3f R_domain_slam = Eigen::Matrix3f::Identity();
+        Eigen::Vector3f t_domain_slam = Eigen::Vector3f::Zero();
+        float scale = 1.0f;
+        bool valid = false;
+        /** Cumulative incremental Δ in domain frame since domainize (identity at domainize). */
+        Eigen::Matrix3f R_live_incremental = Eigen::Matrix3f::Identity();
+        Eigen::Vector3f t_live_incremental = Eigen::Vector3f::Zero();
+        float scale_live_incremental = 1.0f;
+        size_t last_live_apply_sight_count = 0;
+    };
+    void SetAppliedDomainPin(const DomainAppliedPin& pin);
+    DomainAppliedPin GetAppliedDomainPin();
+    void ClearAppliedDomainPin();
+
+    /** Cumulative portal corner edges injected into Local/Global BA (fuse-prior slice C). */
+    void AddPortalBaEdges(uint64_t n);
+    uint64_t GetPortalBaEdgesAdded();
+
     void SetAtlas(Atlas* pAtlas);
 
     void SetInertialSensor();
@@ -203,6 +229,9 @@ protected:
     bool mbIsInertial;
     bool mbIMU_BA1;
     bool mbIMU_BA2;
+    bool mbDomainized = false;
+    DomainAppliedPin mAppliedDomainPin;
+    uint64_t mnPortalBaEdgesAdded = 0;
 
     // Mutex
     std::mutex mMutexMap;

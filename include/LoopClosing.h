@@ -73,6 +73,8 @@ public:
         unique_lock<std::mutex> lock(mMutexGBA);
         return mbRunningGBA;
     }
+    /** Abort an in-flight global BA (same as CorrectLoop). */
+    void RequestAbortGlobalBA();
     bool isFinishedGBA(){
         unique_lock<std::mutex> lock(mMutexGBA);
         return mbFinishedGBA;

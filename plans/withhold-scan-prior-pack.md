@@ -1,15 +1,15 @@
 # Initiative: Withhold-scan prior pack → slam_server
 
-Status: active  
+Status: done  
 Tier: feature  
-Stage: 7-implement  
+Stage: 11-release  
 Skips: _(none)_  
-Last updated: 2026-09-06
+Last updated: 2026-09-08 (human: fully done)
 
 ```yaml
 h2k:
   initiative: withhold-scan-prior-pack
-  phase: building
+  phase: done
   awaiting_human: false
   plan: plans/withhold-scan-prior-pack.md
 ```
@@ -232,5 +232,5 @@ _Locked 2026-09-06 (mass-approved A–E):_
 
 ## Gate (stage 11)
 
-- **Decision:** _(pending)_  
-- **Notes:**
+- **Decision:** **accept** (2026-09-08 — human: fully done)  
+- **Notes:** Prior-pack → slam_server path delivered; further work lived under hybrid (also accepted). No remaining open slices.

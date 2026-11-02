@@ -24,6 +24,7 @@
 #include "Optimizer.h"
 #include "Converter.h"
 #include "GeometricTools.h"
+#include "PortalObservationStore.h"
 #include <opencv2/core/eigen.hpp>
 #include<mutex>
 #include<chrono>
@@ -1616,6 +1617,11 @@ void LocalMapping::KeyFrameCulling()
         // Step 4：该关键帧90%以上的有效地图点被判断为冗余的，则删除该关键帧
         if(nRedundantObservations>redundant_th*nMPs)
         {
+            Map* pMap = pKF->GetMap();
+            if (pMap && PortalObservationStore::Instance().isKeyframeAntiCulled(
+                    pMap->GetId(), pKF->mnId))
+                continue;
+
             // imu模式下需要更改前后关键帧的连续性，且预积分要叠加起来
             if (mbInertial)
             {

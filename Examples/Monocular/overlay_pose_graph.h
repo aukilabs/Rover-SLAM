@@ -123,6 +123,7 @@ struct PortalSightInput {
 struct RefineResult {
     bool seeded_or_refined = false;
     bool published = false;
+    bool portal_corners_added = false;
     MapSim3Pin pin;
     std::string status;
     std::string scale_update_status;
@@ -145,6 +146,10 @@ public:
     RefineResult ingestPortalSight(unsigned long map_id, const PortalSightInput& sight);
 
     void clearMapAlignment(unsigned long map_id);
+
+    /** Atlas owns domain frame; overlay Sim(3) stays identity and refine is skipped. */
+    void setAtlasDomainized(unsigned long map_id, bool domainized);
+    bool isAtlasDomainized(unsigned long map_id) const;
 
     uint64_t priorSoftEdgesAccepted() const;
 
@@ -207,6 +212,7 @@ private:
         KeyframeVertex origin_vertex;
         bool has_origin_vertex = false;
         MapSim3Pin pin;
+        bool atlas_domainized = false;
         /** Max frame_id among portal corners and prior soft factors (for age weighting). */
         uint64_t latest_constraint_frame_id = 0;
     };

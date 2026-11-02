@@ -37,11 +37,168 @@
 #include "Converter.h"
 
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "OptimizableTypes.h"
+#include "PortalObservationStore.h"
 
 namespace ORB_SLAM3
 {
+namespace
+{
+
+constexpr float kPriorSoftBaCauchyDeltaPx = 4.0f;
+constexpr float kPriorSoftBaBaseWeight = 0.35f;
+
+/** Gated prior-pack track → KF pose edges (Cauchy, lower weight than portal corners). */
+int AddPriorSoftBaEdges(
+    g2o::SparseOptimizer& optimizer,
+    Map* pMap,
+    const std::unordered_set<unsigned long>& kf_ids,
+    const std::unordered_map<unsigned long, KeyFrame*>& kf_by_id)
+{
+    if (pMap == nullptr || !pMap->IsDomainized())
+        return 0;
+
+    const unsigned long map_id = pMap->GetId();
+    const std::vector<PriorSoftSight> sights =
+        PortalObservationStore::Instance().queryPriorSoftByMapAndKeyframeIds(map_id, kf_ids);
+
+    int n_added = 0;
+    for (const PriorSoftSight& sight : sights)
+    {
+        if (sight.kf_id == kUnresolvedPortalKeyframeId || sight.observations.empty())
+            continue;
+
+        const Sophus::SE3f Twc_obs(sight.R_wc_slam, sight.t_wc_slam);
+        KeyFrame* pKFi = nullptr;
+        g2o::OptimizableGraph::Vertex* v_kf = nullptr;
+        float best_pose_gap_m = std::numeric_limits<float>::infinity();
+        for (unsigned long kf_id : kf_ids)
+        {
+            const auto kf_it = kf_by_id.find(kf_id);
+            if (kf_it == kf_by_id.end())
+                continue;
+            KeyFrame* pKF = kf_it->second;
+            if (pKF == nullptr || pKF->isBad() || pKF->mpCamera == nullptr)
+                continue;
+            g2o::OptimizableGraph::Vertex* v = optimizer.vertex(kf_id);
+            if (v == nullptr)
+                continue;
+            const float gap = (pKF->GetPoseInverse().translation() - Twc_obs.translation()).norm();
+            if (gap < best_pose_gap_m)
+            {
+                best_pose_gap_m = gap;
+                pKFi = pKF;
+                v_kf = v;
+            }
+        }
+        if (pKFi == nullptr || v_kf == nullptr || best_pose_gap_m > 0.25f)
+            continue;
+
+        const float base_w = sight.weight > 0.f ? sight.weight : kPriorSoftBaBaseWeight;
+        const Sophus::SE3f Twc_kf = pKFi->GetPoseInverse();
+        const Eigen::Matrix3f R_cw = Twc_kf.so3().inverse().matrix();
+        const Eigen::Vector3f t_cw = Twc_kf.inverse().translation();
+        const float fx = pKFi->fx;
+        const float fy = pKFi->fy;
+        const float cx = pKFi->cx;
+        const float cy = pKFi->cy;
+        for (const PriorSoftObservation3D2D& obs : sight.observations)
+        {
+            const Eigen::Vector3f p_cam = R_cw * obs.p_domain + t_cw;
+            const float z = p_cam.z();
+            if (!p_cam.allFinite() || z <= 1e-4f)
+                continue;
+            const float u = fx * p_cam.x() / z + cx;
+            const float v = fy * p_cam.y() / z + cy;
+            const float reproj = std::hypot(u - obs.pixel.x(), v - obs.pixel.y());
+            if (!std::isfinite(reproj) || reproj > 12.0f)
+                continue;
+
+            ORB_SLAM3::EdgeSE3ProjectXYZOnlyPose* e = new ORB_SLAM3::EdgeSE3ProjectXYZOnlyPose();
+            e->setVertex(0, static_cast<g2o::VertexSE3Expmap*>(v_kf));
+            e->Xw = obs.p_domain.cast<double>();
+            Eigen::Matrix<double, 2, 1> measurement;
+            measurement << obs.pixel.x(), obs.pixel.y();
+            e->setMeasurement(measurement);
+            e->setInformation(Eigen::Matrix2d::Identity() * static_cast<double>(base_w));
+            e->pCamera = pKFi->mpCamera;
+            g2o::RobustKernelCauchy* rk = new g2o::RobustKernelCauchy();
+            rk->setDelta(kPriorSoftBaCauchyDeltaPx);
+            e->setRobustKernel(rk);
+            optimizer.addEdge(e);
+            ++n_added;
+        }
+    }
+
+    if (n_added > 0)
+        pMap->AddPortalBaEdges(static_cast<uint64_t>(n_added));
+
+    return n_added;
+}
+
+/** Fixed domain corner → KF pose monocular edges (high weight, no Cauchy). */
+int AddPortalCornerBaEdges(
+    g2o::SparseOptimizer& optimizer,
+    Map* pMap,
+    const std::unordered_set<unsigned long>& kf_ids,
+    const std::unordered_map<unsigned long, KeyFrame*>& kf_by_id)
+{
+    if (pMap == nullptr || !pMap->IsDomainized())
+        return 0;
+
+    const unsigned long map_id = pMap->GetId();
+    const std::vector<PortalCornerSight> sights =
+        PortalObservationStore::Instance().queryByMapAndKeyframeIds(map_id, kf_ids);
+
+    int n_added = 0;
+    for (const PortalCornerSight& sight : sights)
+    {
+        // kf_id is the reference KF from TrackMonocular; skip dense-only / unresolved.
+        if (sight.kf_id == kUnresolvedPortalKeyframeId)
+            continue;
+
+        const auto kf_it = kf_by_id.find(sight.kf_id);
+        if (kf_it == kf_by_id.end())
+            continue;
+
+        KeyFrame* pKFi = kf_it->second;
+        if (pKFi == nullptr || pKFi->isBad() || pKFi->mpCamera == nullptr)
+            continue;
+
+        g2o::OptimizableGraph::Vertex* v_kf = optimizer.vertex(sight.kf_id);
+        if (v_kf == nullptr)
+            continue;
+
+        const float weight = sight.weight > 0.f ? sight.weight
+                                                : portalCornerWeightFromReproj(sight.reproj_px);
+        if (weight <= 0.f)
+            continue;
+
+        for (int c = 0; c < 4; ++c)
+        {
+            ORB_SLAM3::EdgeSE3ProjectXYZOnlyPose* e = new ORB_SLAM3::EdgeSE3ProjectXYZOnlyPose();
+            e->setVertex(0, static_cast<g2o::VertexSE3Expmap*>(v_kf));
+            e->Xw = sight.corners_domain[c].cast<double>();
+            Eigen::Matrix<double, 2, 1> obs;
+            obs << sight.corners_pixel[c].x(), sight.corners_pixel[c].y();
+            e->setMeasurement(obs);
+            e->setInformation(Eigen::Matrix2d::Identity() * static_cast<double>(weight));
+            e->pCamera = pKFi->mpCamera;
+            optimizer.addEdge(e);
+            ++n_added;
+        }
+    }
+
+    if (n_added > 0)
+        pMap->AddPortalBaEdges(static_cast<uint64_t>(n_added));
+
+    return n_added;
+}
+
+} // namespace
 bool sortByVal(const pair<MapPoint *, int> &a, const pair<MapPoint *, int> &b)
 {
     return (a.second < b.second);
@@ -2090,6 +2247,24 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool *pbStopFlag, Map *pMap
             }
         }
     }
+
+    std::unordered_set<unsigned long> baKfIds;
+    std::unordered_map<unsigned long, KeyFrame*> kfById;
+    for (list<KeyFrame *>::iterator lit = lLocalKeyFrames.begin(), lend = lLocalKeyFrames.end(); lit != lend; lit++)
+    {
+        KeyFrame *pKFi = *lit;
+        baKfIds.insert(pKFi->mnId);
+        kfById[pKFi->mnId] = pKFi;
+    }
+    for (list<KeyFrame *>::iterator lit = lFixedCameras.begin(), lend = lFixedCameras.end(); lit != lend; lit++)
+    {
+        KeyFrame *pKFi = *lit;
+        baKfIds.insert(pKFi->mnId);
+        kfById[pKFi->mnId] = pKFi;
+    }
+    nEdges += AddPortalCornerBaEdges(optimizer, pCurrentMap, baKfIds, kfById);
+    nEdges += AddPriorSoftBaEdges(optimizer, pCurrentMap, baKfIds, kfById);
+
     num_edges = nEdges;
 
     if (pbStopFlag)
@@ -3098,6 +3273,19 @@ void Optimizer::BundleAdjustment(
             vbNotIncludedMP[i] = false;
         }
     }
+
+    std::unordered_set<unsigned long> baKfIds;
+    std::unordered_map<unsigned long, KeyFrame*> kfById;
+    for (size_t i = 0; i < vpKFs.size(); i++)
+    {
+        KeyFrame *pKF = vpKFs[i];
+        if (pKF->isBad())
+            continue;
+        baKfIds.insert(pKF->mnId);
+        kfById[pKF->mnId] = pKF;
+    }
+    AddPortalCornerBaEdges(optimizer, pMap, baKfIds, kfById);
+    AddPriorSoftBaEdges(optimizer, pMap, baKfIds, kfById);
 
     // Optimize!
     // Step 4：开始优化

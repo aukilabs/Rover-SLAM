@@ -4,7 +4,9 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -16,6 +18,19 @@
 #include "prior_pack_loader.h"
 
 namespace prior_soft {
+
+/** Slice G pooled-pin uncertainty passed from slam_server (no PortalObservationStore dep). */
+struct AlignmentUncertainty {
+    bool has_report = false;
+    bool valid = false;
+    std::string null_dominant_param;
+    float sigma_log_s = std::numeric_limits<float>::quiet_NaN();
+    std::array<float, 7> sigma_params{};
+    /** "absolute" or "incremental" from last pooled solve. */
+    std::string solve_gauge;
+    /** seed_pin.mean_reproj_px from last pooled solve (gauge-labelled). */
+    float seed_reproj_px = -1.0f;
+};
 
 struct PriorMatchConfig {
     size_t match_every_nth_frame = 5;
@@ -43,6 +58,7 @@ struct PriorMatchInput {
     uint64_t frame_id = 0;
     double timestamp = 0.0;
     int seed_prior_image_id = -1;
+    AlignmentUncertainty alignment_uncertainty;
 };
 
 struct PriorMatchResult {
@@ -63,6 +79,8 @@ struct PriorMatchResult {
     float debug_twc_seed_dist_m = -1.f;
     float debug_mean_abs_z_live = -1.f;
     int debug_seed_prior_image_id = -1;
+    bool debug_bypass_live_gate = false;
+    float debug_live_max_reproj_px = -1.f;
 };
 
 class PriorSoftEdgeMatcher {

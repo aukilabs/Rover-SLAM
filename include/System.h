@@ -43,6 +43,7 @@
 #include "Viewer.h"
 #include "ImuTypes.h"
 #include "Settings.h"
+#include "PortalObservationStore.h"
 
 
 namespace ORB_SLAM3
@@ -182,6 +183,10 @@ public:
     int GetTrackingState();
     /** Atlas active map id (0 if none). */
     unsigned long int GetCurrentMapId();
+    /** Reference keyframe mnId for the last tracked frame, or kUnresolvedPortalKeyframeId. */
+    unsigned long int GetCurrentReferenceKeyFrameId();
+    /** Last created keyframe mnId when reference is unavailable (e.g. pre-init portal). */
+    unsigned long int GetLastKeyFrameId();
 
     /** One pose sample for GET /api/v1/trajectory (same frames as MapDrawer / SaveKeyFrameTrajectoryTUM). */
     struct TrajectorySample {
@@ -200,6 +205,31 @@ public:
     void GetMapKeyFrameTrajectory(unsigned long map_id, std::vector<TrajectorySample>& out);
     /** Per-frame path for a specific atlas map (same logic as active-map dense, filtered by map KFs). */
     void GetMapDenseTrajectory(unsigned long map_id, std::vector<TrajectorySample>& out);
+    /** Portal seed Sim(3) bulk rewrite once per map (fuse-prior-into-ba slice B). */
+    bool IsMapDomainized(unsigned long map_id) const;
+    bool TryDomainizeMap(unsigned long map_id,
+                         const Eigen::Matrix3f& R_domain_slam,
+                         const Eigen::Vector3f& t_domain_slam,
+                         float scale,
+                         size_t sight_count = 0);
+    /** Bulk Sim(3) delta when pooled solve moves beyond uncertainty (slice J). */
+    bool TryApplyLiveScaleCorrection(unsigned long map_id,
+                                     const Eigen::Matrix3f& R_incremental,
+                                     const Eigen::Vector3f& t_incremental,
+                                     float scale_incremental,
+                                     const Sim3HessianObservability& operating_hessian,
+                                     size_t sight_count);
+    Map::DomainAppliedPin GetMapDomainAppliedPin(unsigned long map_id) const;
+    PooledSim3SolveOptions PooledSolveOptionsForMap(unsigned long map_id) const;
+    /** Current Twc for portal sight kf_id; false if missing or bad. */
+    bool ResolveMapKeyframeTwc(unsigned long map_id,
+                               unsigned long kf_id,
+                               Eigen::Matrix3f& R_wc,
+                               Eigen::Vector3f& t_wc) const;
+    void ClearMapDomainized(unsigned long map_id);
+    /** Cumulative portal corner edges injected into Atlas BA for this map. */
+    uint64_t GetMapPortalBaEdgesAdded(unsigned long map_id) const;
+
     /** Viewer-only domain-from-SLAM Sim3; does not mutate the active SLAM map. */
     void SetViewerAlignment(const Eigen::Matrix3f& R_domain_slam, const Eigen::Vector3f& t_domain_slam, float scale);
     void ClearViewerAlignment();

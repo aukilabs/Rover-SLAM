@@ -20,8 +20,11 @@
 
 #include "System.h"
 #include "Converter.h"
+#include "PortalObservationStore.h"
+#include <cmath>
 #include <thread>
 #include <unordered_set>
+#include <sophus/sim3.hpp>
 #include <pangolin/pangolin.h>
 #include <iomanip>
 #include <openssl/md5.h>
@@ -1422,6 +1425,28 @@ unsigned long int System::GetCurrentMapId()
     return pMap->GetId();
 }
 
+unsigned long int System::GetCurrentReferenceKeyFrameId()
+{
+    unique_lock<mutex> lock(mMutexState);
+    if (!mpTracker)
+        return kUnresolvedPortalKeyframeId;
+    KeyFrame *pKF = mpTracker->mCurrentFrame.mpReferenceKF;
+    if (!pKF || pKF->isBad())
+        return kUnresolvedPortalKeyframeId;
+    return pKF->mnId;
+}
+
+unsigned long int System::GetLastKeyFrameId()
+{
+    unique_lock<mutex> lock(mMutexState);
+    if (!mpTracker)
+        return kUnresolvedPortalKeyframeId;
+    KeyFrame *pKF = mpTracker->GetLastKeyFrame();
+    if (!pKF || pKF->isBad())
+        return kUnresolvedPortalKeyframeId;
+    return pKF->mnId;
+}
+
 std::vector<unsigned long> System::GetAtlasMapIds()
 {
     std::vector<unsigned long> ids;
@@ -1620,6 +1645,315 @@ void System::GetActiveMapDenseTrajectory(std::vector<TrajectorySample> &out)
         return;
 
     GetMapDenseTrajectory(pMap->GetId(), out);
+}
+
+namespace {
+
+Map *FindAtlasMap(Atlas *pAtlas, unsigned long map_id)
+{
+    if (!pAtlas)
+        return nullptr;
+    for (Map *candidate : pAtlas->GetAllMaps())
+    {
+        if (candidate && !candidate->IsBad() && candidate->GetId() == map_id)
+            return candidate;
+    }
+    return nullptr;
+}
+
+bool portalSeedScaleIsValid(float scale)
+{
+    return std::isfinite(scale) && scale >= 0.01f && scale <= 100.0f;
+}
+
+Sophus::SE3f TransformTcwUnderScaledRotation(const Sophus::SE3f &Tcw,
+                                             const Sophus::SE3f &Tyw,
+                                             float s)
+{
+    Sophus::SE3f Twc = Tcw.inverse();
+    Twc.translation() *= s;
+    const Sophus::SE3f Tyc = Tyw * Twc;
+    return Tyc.inverse();
+}
+
+Sophus::Sim3f Sim3FromDomainPin(const Eigen::Matrix3f &R_domain_slam,
+                                const Eigen::Vector3f &t_domain_slam,
+                                float scale)
+{
+    return Sophus::Sim3f(Sophus::RxSO3f(scale, Sophus::SO3f(R_domain_slam)), t_domain_slam);
+}
+
+constexpr float kLiveScaleHysteresis = 2.0f;
+
+bool liveScaleDeltaExceedsUncertainty(const Sophus::Sim3f &S_delta,
+                                      const Sim3HessianObservability &seed_hessian)
+{
+    const Eigen::Matrix<float, 7, 1> delta = S_delta.log();
+    if (!delta.allFinite())
+        return false;
+
+    for (int i = 0; i < 7; ++i)
+    {
+        const float sigma = seed_hessian.sigma_params[i];
+        if (!std::isfinite(sigma) || sigma <= 0.0f)
+            continue;
+        if (std::abs(delta(i)) > kLiveScaleHysteresis * sigma)
+            return true;
+    }
+    return false;
+}
+
+void storeDomainizePin(Map *pMap,
+                       const Eigen::Matrix3f &R_domain_slam,
+                       const Eigen::Vector3f &t_domain_slam,
+                       float scale,
+                       size_t sight_count)
+{
+    Map::DomainAppliedPin applied;
+    applied.R_domain_slam = R_domain_slam;
+    applied.t_domain_slam = t_domain_slam;
+    applied.scale = scale;
+    applied.valid = true;
+    applied.R_live_incremental = Eigen::Matrix3f::Identity();
+    applied.t_live_incremental = Eigen::Vector3f::Zero();
+    applied.scale_live_incremental = 1.0f;
+    applied.last_live_apply_sight_count = sight_count;
+    pMap->SetAppliedDomainPin(applied);
+}
+
+constexpr int kMapRewriteStopTimeoutMs = 5000;
+
+bool waitLocalMapperStopped(LocalMapping *pLocalMapper)
+{
+    int waited_ms = 0;
+    while (!pLocalMapper->isStopped())
+    {
+        if (waited_ms >= kMapRewriteStopTimeoutMs)
+        {
+            cout << "[map_rewrite] LocalMapping stop timeout after "
+                 << kMapRewriteStopTimeoutMs << " ms" << endl;
+            return false;
+        }
+        usleep(1000);
+        waited_ms += 1;
+    }
+    return true;
+}
+
+bool prepareMapRewrite(LocalMapping *pLocalMapper, LoopClosing *pLoopCloser)
+{
+    if (!pLocalMapper)
+        return false;
+    pLocalMapper->RequestStop();
+    pLocalMapper->EmptyQueue();
+    if (pLoopCloser)
+        pLoopCloser->RequestAbortGlobalBA();
+    return waitLocalMapperStopped(pLocalMapper);
+}
+
+} // namespace
+
+bool System::IsMapDomainized(unsigned long map_id) const
+{
+    if (!mpAtlas)
+        return false;
+    Map *pMap = FindAtlasMap(mpAtlas, map_id);
+    return pMap && pMap->IsDomainized();
+}
+
+bool System::TryDomainizeMap(unsigned long map_id,
+                             const Eigen::Matrix3f &R_domain_slam,
+                             const Eigen::Vector3f &t_domain_slam,
+                             float scale,
+                             size_t sight_count)
+{
+    if (!mpAtlas || !mpLocalMapper || !portalSeedScaleIsValid(scale))
+        return false;
+    if (!R_domain_slam.allFinite() || !t_domain_slam.allFinite())
+        return false;
+
+    Map *pMap = FindAtlasMap(mpAtlas, map_id);
+    if (!pMap || pMap->IsBad() || pMap->IsDomainized())
+        return false;
+
+    const Sophus::SE3f Tyw(R_domain_slam, t_domain_slam);
+
+    if (!prepareMapRewrite(mpLocalMapper, mpLoopCloser))
+    {
+        mpLocalMapper->Release();
+        return false;
+    }
+
+    {
+        unique_lock<mutex> lock(pMap->mMutexMapUpdate);
+        pMap->ApplyScaledRotation(Tyw, scale, false);
+        pMap->SetDomainized(true);
+    }
+
+    if (mpTracker && mpAtlas->GetCurrentMap() == pMap)
+    {
+        unique_lock<mutex> lock(mMutexState);
+        mpTracker->mCurrentFrame.SetPose(
+            TransformTcwUnderScaledRotation(mpTracker->mCurrentFrame.GetPose(), Tyw, scale));
+        mpTracker->mLastFrame.SetPose(
+            TransformTcwUnderScaledRotation(mpTracker->mLastFrame.GetPose(), Tyw, scale));
+    }
+
+    storeDomainizePin(pMap, R_domain_slam, t_domain_slam, scale, sight_count);
+    PortalObservationStore::Instance().applyScaledRotationToSightPoses(
+        map_id, R_domain_slam, t_domain_slam, scale);
+
+    mpLocalMapper->Release();
+    return true;
+}
+
+Map::DomainAppliedPin System::GetMapDomainAppliedPin(unsigned long map_id) const
+{
+    if (!mpAtlas)
+        return Map::DomainAppliedPin{};
+    Map *pMap = FindAtlasMap(mpAtlas, map_id);
+    return pMap ? pMap->GetAppliedDomainPin() : Map::DomainAppliedPin{};
+}
+
+PooledSim3SolveOptions System::PooledSolveOptionsForMap(unsigned long map_id) const
+{
+    PooledSim3SolveOptions options;
+    if (!mpAtlas)
+        return options;
+    Map *pMap = FindAtlasMap(mpAtlas, map_id);
+    if (!pMap || !pMap->IsDomainized())
+        return options;
+
+    const Map::DomainAppliedPin applied = pMap->GetAppliedDomainPin();
+    options.gauge = PooledSim3SolveOptions::Gauge::IncrementalDomain;
+    options.operating_R = applied.R_live_incremental;
+    options.operating_t = applied.t_live_incremental;
+    options.operating_scale = applied.scale_live_incremental;
+    return options;
+}
+
+bool System::ResolveMapKeyframeTwc(unsigned long map_id,
+                                   unsigned long kf_id,
+                                   Eigen::Matrix3f &R_wc,
+                                   Eigen::Vector3f &t_wc) const
+{
+    if (!mpAtlas || kf_id == kUnresolvedPortalKeyframeId)
+        return false;
+
+    Map *pMap = FindAtlasMap(mpAtlas, map_id);
+    if (!pMap)
+        return false;
+
+    const vector<KeyFrame *> vpKFs = pMap->GetAllKeyFrames();
+    for (KeyFrame *pKF : vpKFs)
+    {
+        if (!pKF || pKF->isBad() || pKF->mnId != kf_id)
+            continue;
+        const Sophus::SE3f Twc = pKF->GetPoseInverse();
+        R_wc = Twc.so3().matrix();
+        t_wc = Twc.translation();
+        return R_wc.allFinite() && t_wc.allFinite();
+    }
+    return false;
+}
+
+bool System::TryApplyLiveScaleCorrection(unsigned long map_id,
+                                         const Eigen::Matrix3f &R_incremental,
+                                         const Eigen::Vector3f &t_incremental,
+                                         float scale_incremental,
+                                         const Sim3HessianObservability &operating_hessian,
+                                         size_t sight_count)
+{
+    if (!mpAtlas || !mpLocalMapper || !portalSeedScaleIsValid(scale_incremental))
+        return false;
+    if (!R_incremental.allFinite() || !t_incremental.allFinite())
+        return false;
+
+    Map *pMap = FindAtlasMap(mpAtlas, map_id);
+    if (!pMap || pMap->IsBad() || !pMap->IsDomainized())
+        return false;
+
+    Map::DomainAppliedPin applied = pMap->GetAppliedDomainPin();
+    if (!applied.valid)
+        return false;
+    if (sight_count <= applied.last_live_apply_sight_count)
+        return false;
+
+    const Sophus::Sim3f S_cumulative =
+        Sim3FromDomainPin(applied.R_live_incremental,
+                          applied.t_live_incremental,
+                          applied.scale_live_incremental);
+    const Sophus::Sim3f S_solved =
+        Sim3FromDomainPin(R_incremental, t_incremental, scale_incremental);
+    const Sophus::Sim3f S_delta = S_solved * S_cumulative.inverse();
+    if (!liveScaleDeltaExceedsUncertainty(S_delta, operating_hessian))
+        return false;
+
+    const float s_delta = S_delta.scale();
+    const Eigen::Matrix3f R_delta = S_delta.rxso3().rotationMatrix();
+    const Eigen::Vector3f t_delta = S_delta.translation();
+    const Sophus::SE3f Tyw(R_delta, t_delta);
+
+    if (!prepareMapRewrite(mpLocalMapper, mpLoopCloser))
+    {
+        mpLocalMapper->Release();
+        return false;
+    }
+
+    {
+        unique_lock<mutex> lock(pMap->mMutexMapUpdate);
+        pMap->ApplyScaledRotation(Tyw, s_delta, false);
+    }
+
+    if (mpTracker && mpAtlas->GetCurrentMap() == pMap)
+    {
+        unique_lock<mutex> lock(mMutexState);
+        mpTracker->mCurrentFrame.SetPose(
+            TransformTcwUnderScaledRotation(mpTracker->mCurrentFrame.GetPose(), Tyw, s_delta));
+        mpTracker->mLastFrame.SetPose(
+            TransformTcwUnderScaledRotation(mpTracker->mLastFrame.GetPose(), Tyw, s_delta));
+    }
+
+    applied.R_live_incremental = R_incremental;
+    applied.t_live_incremental = t_incremental;
+    applied.scale_live_incremental = scale_incremental;
+    applied.last_live_apply_sight_count = sight_count;
+    pMap->SetAppliedDomainPin(applied);
+    PortalObservationStore::Instance().applyScaledRotationToSightPoses(
+        map_id, R_delta, t_delta, s_delta);
+
+    const Eigen::Matrix<float, 7, 1> delta_log = S_delta.log();
+    cout << "[live_scale] map " << map_id << " applied incremental correction"
+         << " sights=" << sight_count
+         << " delta_log_s=" << delta_log(3)
+         << " delta_scale=" << s_delta
+         << " solved_incremental_scale=" << scale_incremental
+         << " operating_sigma_log_s=";
+    if (std::isnan(operating_hessian.sigma_log_s))
+        cout << "nan";
+    else
+        cout << operating_hessian.sigma_log_s;
+    cout << endl;
+
+    mpLocalMapper->Release();
+    return true;
+}
+
+void System::ClearMapDomainized(unsigned long map_id)
+{
+    if (!mpAtlas)
+        return;
+    Map *pMap = FindAtlasMap(mpAtlas, map_id);
+    if (pMap)
+        pMap->ClearDomainized();
+}
+
+uint64_t System::GetMapPortalBaEdgesAdded(unsigned long map_id) const
+{
+    if (!mpAtlas)
+        return 0;
+    Map *pMap = FindAtlasMap(mpAtlas, map_id);
+    return pMap ? pMap->GetPortalBaEdgesAdded() : 0;
 }
 
 void System::SetViewerAlignment(const Eigen::Matrix3f& R_domain_slam, const Eigen::Vector3f& t_domain_slam, float scale)
